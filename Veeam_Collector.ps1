@@ -28,11 +28,19 @@
 
 .NOTES
     Usage notes:
-      - Run this script in Windows PowerShell on a Veeam Backup & Replication server
-        or a host with the Veeam console/PowerShell components installed.
+      - Run this script in PowerShell on a Veeam Backup & Replication server or a host
+        with the Veeam console/PowerShell components installed.
       - The script tries Veeam.Backup.PowerShell first, then VeeamPSSnapIn fallback.
       - It attempts to include internal/background sessions (for example SOBR/capacity-tier
         offload) via broader session cmdlets and core backup session fallback.
+
+    PowerShell version requirements:
+      - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
+      - Windows PowerShell 5.1 (Desktop edition): the modern module manifest declares a
+        minimum PS version of 7.0 and cannot be loaded by PS 5.1. The script catches that
+        failure and automatically falls back to the legacy VeeamPSSnapIn snap-in.
+        Ensure VeeamPSSnapIn is registered (it is included with Veeam Backup & Replication
+        console components) when running under Windows PowerShell 5.1.
 
     Run requirements:
     Run in an elevated PowerShell session on the Veeam Backup & Replication server or a host
@@ -60,9 +68,20 @@ function Import-VeeamPowerShell {
 
     $loaded = $false
 
+    # Try the modern Veeam.Backup.PowerShell module first.
+    # On Windows PowerShell 5.1 the module manifest may declare a minimum PS version of
+    # 7.0, which causes Import-Module to throw.  Catch that failure and fall through to
+    # the legacy VeeamPSSnapIn snap-in below.
     if (Get-Module -ListAvailable -Name 'Veeam.Backup.PowerShell' -ErrorAction SilentlyContinue) {
-        Import-Module 'Veeam.Backup.PowerShell' -ErrorAction Stop
-        $loaded = $true
+        try {
+            Import-Module 'Veeam.Backup.PowerShell' -ErrorAction Stop
+            $loaded = $true
+        }
+        catch {
+            Write-Warning (("Could not import Veeam.Backup.PowerShell module: {0}  " +
+                "Falling back to VeeamPSSnapIn (required on Windows PowerShell 5.1).") `
+                -f $_.Exception.Message)
+        }
     }
 
     if (-not $loaded) {
@@ -74,7 +93,13 @@ function Import-VeeamPowerShell {
     }
 
     if (-not $loaded) {
-        throw 'Unable to load Veeam PowerShell. Install the Veeam Backup & Replication console/PowerShell components, then run this script on a VBR server or console machine.'
+        throw (
+            'Unable to load Veeam PowerShell components. ' +
+            'PowerShell 7.0 or later can import the modern Veeam.Backup.PowerShell module. ' +
+            'Windows PowerShell 5.1 requires the legacy VeeamPSSnapIn snap-in to be registered ' +
+            '(included with the Veeam Backup & Replication console/PowerShell components). ' +
+            'Install the Veeam console components and re-run this script on a VBR server or console machine.'
+        )
     }
 }
 
