@@ -1,58 +1,65 @@
 <#
 .SYNOPSIS
-    Prints Veeam Backup & Replication session log records from the last N hours.
+    Exports Veeam Backup & Replication logs for the last N hours using Export-VBRLogs.
 
 .DESCRIPTION
-    Uses the Veeam Backup PowerShell module/snap-in to enumerate recent sessions for:
-      - all backup jobs returned by Get-VBRJob
-      - VBR sessions returned by Get-VBRSession (called per-job with -Job when the cmdlet
-        exposes a Job parameter; this avoids interactive prompts on Veeam versions where
-        Get-VBRSession cannot be safely called without a job)
-      - backup sessions returned by Get-VBRBackupSession
-      - internal/core sessions returned through Veeam.Backup.Core.CBackupSession, when available
+    Uses the Veeam Backup PowerShell module/snap-in to call Export-VBRLogs, which
+    produces an archive/bundle of Veeam log files for the selected time window.
 
-    Progress and status messages are printed throughout so you can see what the script is
-    doing while it runs.  In default (human-readable) mode these go to standard output
-    interleaved with log records.  In -Json mode they are sent to the Warning stream so
-    that standard output remains pure JSON Lines.
+    The exported log bundle is written to -OutputPath (or a timestamped temporary
+    directory when -OutputPath is not specified).  The script prints the path to
+    the exported logs so you know exactly where to find them.
 
-    This intentionally writes log records to standard output only.
-    Redirect stdout if you want a file.
+    Progress and status messages are printed throughout so you can see what the
+    script is doing while it runs.  In default (human-readable) mode these go to
+    standard output.  In -Json mode they are sent to the Warning stream so that
+    standard output remains a parseable JSON object describing the export result.
+
+    The script inspects Export-VBRLogs parameter metadata at runtime and binds
+    the appropriate time-window parameters (e.g. -From/-To, -StartTime/-EndTime,
+    or a duration-style parameter such as -Last/-Hours) depending on what the
+    installed Veeam PowerShell version exposes.
 
 .PARAMETER Hours
-    Time window (in hours) to collect sessions/log records from. Default is 24.
+    Time window (in hours) to export logs for. Default is 24 (last 24 hours).
+
+.PARAMETER OutputPath
+    Directory where the exported log bundle will be written.  If omitted, a
+    timestamped sub-directory is created under the system temporary folder and
+    its path is printed to stdout on completion.
 
 .PARAMETER Json
-    Emit one JSON object per line (JSON Lines) for machine-readable output.
-    Progress/status messages are sent to the Warning stream in this mode so that
-    standard output remains parseable JSON Lines.
+    Emit a single JSON object on stdout describing the export result (path,
+    start/end time, status).  Progress/status messages are sent to the Warning
+    stream in this mode so that standard output remains parseable JSON.
 
 .EXAMPLE
     .\Veeam_Collector.ps1
 
+    Exports Veeam logs for the last 24 hours to a temp directory and prints the path.
+
 .EXAMPLE
-    .\Veeam_Collector.ps1 -Hours 48
+    .\Veeam_Collector.ps1 -Hours 48 -OutputPath C:\Temp\VeeamLogs
+
+    Exports logs for the last 48 hours to C:\Temp\VeeamLogs.
 
 .EXAMPLE
     .\Veeam_Collector.ps1 -Json
+
+    Exports logs for the last 24 hours and emits a JSON result object on stdout.
 
 .NOTES
     Usage notes:
       - Run this script in PowerShell on a Veeam Backup & Replication server or a host
         with the Veeam console/PowerShell components installed.
       - The script tries Veeam.Backup.PowerShell first, then VeeamPSSnapIn fallback.
-      - It attempts to include internal/background sessions (for example SOBR/capacity-tier
-        offload) via broader session cmdlets and core backup session fallback.
-      - Human-readable mode (default, -Json not specified) prints timestamped progress and
-        status messages to standard output so you can follow along in real time.
+      - Export-VBRLogs must be available after loading Veeam PowerShell components.
+        If it is not present, the script throws a clear error explaining which Veeam
+        PowerShell version is required.
+      - Human-readable mode (default, -Json not specified) prints timestamped progress
+        and the final export path to standard output.
       - -Json mode routes all progress/status messages to the Warning stream; standard
-        output contains only JSON Lines records suitable for piping or log ingestion.
-
-    Get-VBRSession note:
-      - On some Veeam versions Get-VBRSession requires a -Job value and will prompt
-        interactively when called without arguments. This script avoids that entirely:
-        when Get-VBRSession exposes a Job parameter, it is called as Get-VBRSession -Job
-        for each job returned by Get-VBRJob and is never called generically without a job.
+        output contains only a single JSON object suitable for machine consumption.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -72,16 +79,20 @@ param(
     [ValidateRange(1, 8760)]
     [int]$Hours = 24,
 
-    # Emit JSON Lines instead of readable text. Progress goes to Warning stream in this mode.
+    # Directory where the exported log bundle will be written.
+    # Defaults to a timestamped sub-directory under the system temp folder.
+    [string]$OutputPath = '',
+
+    # Emit a JSON result object on stdout instead of human-readable text.
+    # Progress goes to the Warning stream in this mode.
     [switch]$Json
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:Cutoff        = (Get-Date).AddHours(-[Math]::Abs($Hours))
-$script:SeenSessions  = New-Object 'System.Collections.Generic.HashSet[string]'
-$script:EmittedCount  = 0
+$script:EndTime   = Get-Date
+$script:StartTime = $script:EndTime.AddHours(-[Math]::Abs($Hours))
 
 # ---------------------------------------------------------------------------
 # Write-ProgressMessage
@@ -105,8 +116,7 @@ function Write-ProgressMessage {
 # ---------------------------------------------------------------------------
 # Test-CmdletHasParameter
 #   Returns $true when the named cmdlet exposes the named parameter in any
-#   parameter set. Used to route Get-VBRSession through per-job calls whenever
-#   the cmdlet supports/requires -Job.
+#   parameter set.
 # ---------------------------------------------------------------------------
 function Test-CmdletHasParameter {
     [CmdletBinding()]
@@ -119,28 +129,6 @@ function Test-CmdletHasParameter {
     if ($null -eq $cmd) { return $false }
 
     return $cmd.Parameters.ContainsKey($ParameterName)
-}
-
-# ---------------------------------------------------------------------------
-# Test-CmdletCanInvokeWithoutArguments
-#   Returns $true only when at least one parameter set has no mandatory
-#   parameters. This prevents accidental interactive prompts such as:
-#   "Supply values for the following parameters: Job:"
-# ---------------------------------------------------------------------------
-function Test-CmdletCanInvokeWithoutArguments {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [string]$CmdletName)
-
-    $cmd = Get-Command -Name $CmdletName -ErrorAction SilentlyContinue
-    if ($null -eq $cmd) { return $false }
-    if ($cmd.ParameterSets.Count -eq 0) { return $true }
-
-    foreach ($paramSet in $cmd.ParameterSets) {
-        $mandatoryParameters = @($paramSet.Parameters | Where-Object { $_.IsMandatory })
-        if ($mandatoryParameters.Count -eq 0) { return $true }
-    }
-
-    return $false
 }
 
 function Import-VeeamPowerShell {
@@ -195,423 +183,146 @@ function Import-VeeamPowerShell {
     }
 }
 
-function Get-PropertyValue {
+# ---------------------------------------------------------------------------
+# Resolve-ExportOutputPath
+#   Returns the resolved output directory.  Creates the directory if it does
+#   not already exist.  When -OutputPath was not supplied, a timestamped
+#   sub-directory is created under the system temp folder.
+# ---------------------------------------------------------------------------
+function Resolve-ExportOutputPath {
+    [CmdletBinding()]
+    param([string]$RequestedPath)
+
+    if ([string]::IsNullOrWhiteSpace($RequestedPath)) {
+        $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $RequestedPath = [System.IO.Path]::Combine(
+            [System.IO.Path]::GetTempPath(),
+            ('VeeamLogs_{0}' -f $stamp)
+        )
+    }
+
+    if (-not (Test-Path -LiteralPath $RequestedPath -PathType Container)) {
+        Write-ProgressMessage ('Creating output directory: {0}' -f $RequestedPath)
+        [void](New-Item -ItemType Directory -Path $RequestedPath -Force -ErrorAction Stop)
+    }
+
+    return (Resolve-Path -LiteralPath $RequestedPath).ProviderPath
+}
+
+# ---------------------------------------------------------------------------
+# Invoke-VBRLogsExport
+#   Validates that Export-VBRLogs is available, introspects its parameters at
+#   runtime, and calls it with the appropriate time-window and path bindings
+#   for the installed Veeam PowerShell version.
+# ---------------------------------------------------------------------------
+function Invoke-VBRLogsExport {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [object]$InputObject,
-        [Parameter(Mandatory)] [string[]]$Names
+        [Parameter(Mandatory)] [datetime]$StartTime,
+        [Parameter(Mandatory)] [datetime]$EndTime,
+        [Parameter(Mandatory)] [string]$ResolvedOutputPath
     )
 
-    foreach ($name in $Names) {
-        $property = $InputObject.PSObject.Properties[$name]
-        if ($null -ne $property -and $null -ne $property.Value) {
-            return $property.Value
-        }
+    # Validate Export-VBRLogs is available.
+    $exportCmd = Get-Command -Name 'Export-VBRLogs' -ErrorAction SilentlyContinue
+    if ($null -eq $exportCmd) {
+        throw (
+            'Export-VBRLogs is not available after loading Veeam PowerShell components. ' +
+            'This cmdlet is included in Veeam Backup & Replication PowerShell starting with ' +
+            'version 11.  Ensure that the installed Veeam console/PowerShell components ' +
+            'include Export-VBRLogs, then re-run this script.'
+        )
     }
 
-    return $null
-}
+    $availableParams = $exportCmd.Parameters.Keys
+    Write-ProgressMessage ('Export-VBRLogs parameters available: {0}' -f ($availableParams -join ', '))
 
-function Get-ObjectIdentity {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$InputObject)
+    $exportParams = @{}
 
-    $id = Get-PropertyValue -InputObject $InputObject -Names @('Id', 'Uid', 'SessionId')
-    if ($null -ne $id) { return [string]$id }
-
-    $name = Get-PropertyValue -InputObject $InputObject -Names @('Name', 'JobName')
-    $start = Get-SessionStartTime -Session $InputObject
-    return ('{0}|{1}|{2}' -f $InputObject.GetType().FullName, $name, $start)
-}
-
-function Get-SessionName {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $name = Get-PropertyValue -InputObject $Session -Names @('Name', 'JobName', 'SessionName')
-    if ($null -ne $name) { return [string]$name }
-    return '<unnamed>'
-}
-
-function Get-SessionType {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $type = Get-PropertyValue -InputObject $Session -Names @('JobType', 'SessionType', 'Type', 'Operation')
-    if ($null -ne $type) { return [string]$type }
-    return $Session.GetType().Name
-}
-
-function Get-SessionState {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $state = Get-PropertyValue -InputObject $Session -Names @('State', 'Status', 'Result')
-    if ($null -ne $state) { return [string]$state }
-    return '<unknown>'
-}
-
-function Get-SessionStartTime {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $value = Get-PropertyValue -InputObject $Session -Names @(
-        'CreationTime',
-        'CreationTimeLocal',
-        'CreationTimeUTC',
-        'StartTime',
-        'StartTimeLocal',
-        'StartTimeUTC'
-    )
-
-    if ($null -eq $value) { return $null }
-    return [datetime]$value
-}
-
-function Get-SessionEndTime {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $value = Get-PropertyValue -InputObject $Session -Names @(
-        'EndTime',
-        'EndTimeLocal',
-        'EndTimeUTC',
-        'StopTime',
-        'StopTimeLocal',
-        'StopTimeUTC'
-    )
-
-    if ($null -eq $value) { return $null }
-    return [datetime]$value
-}
-
-function Test-SessionInWindow {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $start = Get-SessionStartTime -Session $Session
-    $end = Get-SessionEndTime -Session $Session
-
-    # Include sessions that started in the window, ended in the window, or are still running.
-    if ($null -ne $start -and $start -ge $script:Cutoff) { return $true }
-    if ($null -ne $end -and $end -ge $script:Cutoff) { return $true }
-    if ($null -ne $start -and $null -eq $end) { return $true }
-
-    # If time metadata is not exposed, include it rather than silently losing possible internal sessions.
-    return ($null -eq $start -and $null -eq $end)
-}
-
-function Get-SessionLogRecords {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Session)
-
-    $logger = Get-PropertyValue -InputObject $Session -Names @('Logger')
-    if ($null -eq $logger) { return @() }
-
-    try {
-        $log = $logger.GetLog()
-        if ($null -eq $log) { return @() }
-
-        $records = Get-PropertyValue -InputObject $log -Names @('UpdatedRecords', 'Records')
-        if ($null -ne $records) { return @($records) }
-    }
-    catch {
-        return @()
-    }
-
-    return @()
-}
-
-function Get-RecordTime {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Record)
-
-    $value = Get-PropertyValue -InputObject $Record -Names @(
-        'StartTime',
-        'StartTimeLocal',
-        'StartTimeUTC',
-        'UpdateTime',
-        'UpdateTimeLocal',
-        'UpdateTimeUTC',
-        'CreationTime',
-        'Time'
-    )
-
-    if ($null -eq $value) { return $null }
-    return [datetime]$value
-}
-
-function Get-RecordTitle {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Record)
-
-    $title = Get-PropertyValue -InputObject $Record -Names @('Title', 'Name', 'Text', 'Message')
-    if ($null -ne $title) { return [string]$title }
-    return '<no title>'
-}
-
-function Get-RecordDescription {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Record)
-
-    $description = Get-PropertyValue -InputObject $Record -Names @('Description', 'Details', 'FullMessage')
-    if ($null -ne $description) { return [string]$description }
-    return ''
-}
-
-function Get-RecordStatus {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Record)
-
-    $status = Get-PropertyValue -InputObject $Record -Names @('Status', 'Result', 'State')
-    if ($null -ne $status) { return [string]$status }
-    return '<unknown>'
-}
-
-function Write-LogEntry {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [object]$Session,
-        [Parameter(Mandatory)] [object]$Record,
-        [Parameter(Mandatory)] [string]$Source
-    )
-
-    $entry = [ordered]@{
-        collected_at   = (Get-Date).ToString('o')
-        source         = $Source
-        session_id     = Get-ObjectIdentity -InputObject $Session
-        session_name   = Get-SessionName -Session $Session
-        session_type   = Get-SessionType -Session $Session
-        session_state  = Get-SessionState -Session $Session
-        session_start  = $(if ($null -ne (Get-SessionStartTime -Session $Session)) { (Get-SessionStartTime -Session $Session).ToString('o') } else { $null })
-        session_end    = $(if ($null -ne (Get-SessionEndTime -Session $Session)) { (Get-SessionEndTime -Session $Session).ToString('o') } else { $null })
-        record_time    = $(if ($null -ne (Get-RecordTime -Record $Record)) { (Get-RecordTime -Record $Record).ToString('o') } else { $null })
-        record_status  = Get-RecordStatus -Record $Record
-        record_title   = Get-RecordTitle -Record $Record
-        record_details = Get-RecordDescription -Record $Record
-    }
-
-    if ($Json) {
-        [pscustomobject]$entry | ConvertTo-Json -Compress -Depth 6
-        $script:EmittedCount++
-        return
-    }
-
-    Write-Output ('[{0}] [{1}] [{2}] {3}' -f $entry.record_time, $entry.source, $entry.record_status, $entry.record_title)
-    Write-Output ('  Collected: {0}' -f $entry.collected_at)
-    Write-Output ('  SessionId: {0}' -f $entry.session_id)
-    Write-Output ('  Session : {0}' -f $entry.session_name)
-    Write-Output ('  Type    : {0}' -f $entry.session_type)
-    Write-Output ('  State   : {0}' -f $entry.session_state)
-    Write-Output ('  Start   : {0}' -f $entry.session_start)
-    Write-Output ('  End     : {0}' -f $entry.session_end)
-    if (-not [string]::IsNullOrWhiteSpace($entry.record_details)) {
-        Write-Output ('  Details : {0}' -f $entry.record_details)
-    }
-    Write-Output ''
-    $script:EmittedCount++
-}
-
-function Write-SessionLogs {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [object]$Session,
-        [Parameter(Mandatory)] [string]$Source
-    )
-
-    if (-not (Test-SessionInWindow -Session $Session)) { return }
-
-    $sessionId = Get-ObjectIdentity -InputObject $Session
-    if (-not $script:SeenSessions.Add($sessionId)) { return }
-
-    $records = @(Get-SessionLogRecords -Session $Session)
-
-    if ($records.Count -eq 0) {
-        $synthetic = [pscustomobject]@{
-            StartTime   = Get-SessionStartTime -Session $Session
-            Status      = Get-SessionState -Session $Session
-            Title       = 'No detailed logger records exposed for this session.'
-            Description = ''
-        }
-        Write-LogEntry -Session $Session -Record $synthetic -Source $Source
-        return
-    }
-
-    foreach ($record in $records) {
-        $recordTime = Get-RecordTime -Record $record
-        if ($null -eq $recordTime -or $recordTime -ge $script:Cutoff) {
-            Write-LogEntry -Session $Session -Record $record -Source $Source
-        }
-    }
-}
-
-function Get-RecentSessionsFromCmdlet {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [string]$CmdletName,
-        [Parameter(Mandatory)] [string]$Source
-    )
-
-    Write-ProgressMessage ('Checking cmdlet: {0}' -f $CmdletName)
-
-    if (-not (Get-Command -Name $CmdletName -ErrorAction SilentlyContinue)) {
-        Write-ProgressMessage ('  Skipped: {0} is not available on this system.' -f $CmdletName)
-        return
-    }
-
-    # Get-VBRSession is special: on some Veeam builds it exposes a -Job parameter
-    # and prompts for it when called without arguments. The user environment has
-    # shown that behavior, so never call Get-VBRSession generically when -Job is
-    # available. Per-job collection in Phase 1 passes each Get-VBRJob result to it.
-    if ($CmdletName -eq 'Get-VBRSession' -and (Test-CmdletHasParameter -CmdletName $CmdletName -ParameterName 'Job')) {
-        Write-ProgressMessage ('  Skipped: {0} exposes -Job and will be collected per-job as Get-VBRSession -Job <job> to avoid interactive prompts.' -f $CmdletName)
-        return
-    }
-
-    # For all other generic cmdlets, only call them when metadata says there is
-    # a no-argument parameter set. This avoids any other "Supply values" prompt.
-    if (-not (Test-CmdletCanInvokeWithoutArguments -CmdletName $CmdletName)) {
-        Write-ProgressMessage ('  Skipped: {0} has mandatory parameter(s) and cannot be safely called without arguments.' -f $CmdletName)
-        return
-    }
-
-    Write-ProgressMessage ('  Enumerating sessions via {0} ...' -f $CmdletName)
-    $before = $script:SeenSessions.Count
-
-    try {
-        & $CmdletName -ErrorAction Stop | ForEach-Object {
-            Write-SessionLogs -Session $_ -Source $Source
-        }
-    }
-    catch {
-        Write-Warning ('Unable to collect sessions via {0}: {1}' -f $CmdletName, $_.Exception.Message)
-    }
-
-    Write-ProgressMessage ('  {0}: {1} new unique session(s) processed.' -f $CmdletName, ($script:SeenSessions.Count - $before))
-}
-
-function Get-RecentJobSessions {
-    [CmdletBinding()]
-    param()
-
-    Write-ProgressMessage 'Phase 1 — Job-centric collection (Get-VBRJob).'
-
-    if (-not (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue)) {
-        Write-ProgressMessage '  Get-VBRJob not available. Skipping job-centric collection.'
-        return
-    }
-
-    # Determine up-front whether Get-VBRSession can take -Job. If it can, always
-    # call it per-job here and skip the generic call in Phase 2. This matches
-    # Veeam versions where the cmdlet prompts for Job when called with no args.
-    $vbrSessionAvail       = $null -ne (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)
-    $vbrSessionHasJobParam = $vbrSessionAvail -and (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Job')
-
-    if ($vbrSessionAvail) {
-        if ($vbrSessionHasJobParam) {
-            Write-ProgressMessage '  Get-VBRSession exposes -Job; will call Get-VBRSession -Job for each job.'
-        } else {
-            Write-ProgressMessage '  Get-VBRSession does not expose -Job; it may be called generically in Phase 2 if safe.'
-        }
+    # --- Resolve output/path parameter ---
+    # Common parameter names used across Veeam versions for the destination folder.
+    $pathParamCandidates = @('Path', 'Folder', 'OutputPath', 'TargetPath', 'DestinationPath',
+                              'FilePath', 'ExportPath', 'Target', 'Destination', 'Directory')
+    $pathParam = $pathParamCandidates | Where-Object { $availableParams -contains $_ } |
+                 Select-Object -First 1
+    if ($null -ne $pathParam) {
+        Write-ProgressMessage ('  Binding output path via -{0}' -f $pathParam)
+        $exportParams[$pathParam] = $ResolvedOutputPath
     } else {
-        Write-ProgressMessage '  Get-VBRSession not available on this system.'
+        # Fall back to positional argument if no recognised named parameter exists.
+        Write-ProgressMessage '  No recognised path parameter found; passing output path as positional argument.'
+        $exportParams['__positional_path__'] = $ResolvedOutputPath
     }
 
+    # --- Resolve time-window parameters ---
+    # Prefer explicit From/To (or equivalent) date range parameters.
+    $fromParamCandidates = @('From', 'StartTime', 'StartDate', 'Since', 'After',
+                              'FromDate', 'Start', 'DateFrom', 'BeginTime', 'Begin')
+    $toParamCandidates   = @('To', 'EndTime', 'EndDate', 'Until', 'Before',
+                              'ToDate', 'End', 'DateTo', 'StopTime', 'Finish')
+
+    $fromParam = $fromParamCandidates | Where-Object { $availableParams -contains $_ } |
+                 Select-Object -First 1
+    $toParam   = $toParamCandidates   | Where-Object { $availableParams -contains $_ } |
+                 Select-Object -First 1
+
+    if ($null -ne $fromParam -and $null -ne $toParam) {
+        Write-ProgressMessage ('  Binding time window via -{0} / -{1}' -f $fromParam, $toParam)
+        $exportParams[$fromParam] = $StartTime
+        $exportParams[$toParam]   = $EndTime
+    } elseif ($null -ne $fromParam) {
+        Write-ProgressMessage ('  Binding start time via -{0} (no matching end-time parameter found)' -f $fromParam)
+        $exportParams[$fromParam] = $StartTime
+    } else {
+        # No From/To style params; look for a duration-style parameter.
+        $durationParamCandidates = @('Last', 'Hours', 'LastHours', 'Duration',
+                                      'TimeSpanHours', 'Period', 'HoursBack')
+        $durationParam = $durationParamCandidates | Where-Object { $availableParams -contains $_ } |
+                         Select-Object -First 1
+
+        if ($null -ne $durationParam) {
+            Write-ProgressMessage ('  Binding duration via -{0} {1}' -f $durationParam, $Hours)
+            $exportParams[$durationParam] = $Hours
+        } else {
+            Write-ProgressMessage (
+                '  No time-window parameter (From/To, StartTime/EndTime, Last/Hours, etc.) ' +
+                'recognised in this version of Export-VBRLogs. ' +
+                'Calling without a time-window filter; the export will cover the full log history.'
+            )
+        }
+    }
+
+    # Invoke Export-VBRLogs.
+    Write-ProgressMessage ('Calling Export-VBRLogs ...')
+
     try {
-        $jobs = @(Get-VBRJob -ErrorAction Stop)
-        Write-ProgressMessage ('  Found {0} job(s).' -f $jobs.Count)
+        if ($exportParams.ContainsKey('__positional_path__')) {
+            # Positional path fallback: remove the sentinel key and pass the value as
+            # the first positional argument.
+            $posPath = $exportParams['__positional_path__']
+            $exportParams.Remove('__positional_path__')
 
-        $jobIndex = 0
-        foreach ($job in $jobs) {
-            $jobIndex++
-            Write-ProgressMessage ('  Job {0}/{1}: {2}' -f $jobIndex, $jobs.Count, $job.Name)
-
-            try {
-                $sessions = New-Object 'System.Collections.Generic.List[object]'
-
-                if ($job.PSObject.Methods['GetSessions']) {
-                    Write-ProgressMessage '    Method: GetSessions'
-                    foreach ($session in @($job.GetSessions())) {
-                        if ($null -ne $session) { [void]$sessions.Add($session) }
-                    }
-                }
-
-                if ($job.PSObject.Methods['FindLastSessions']) {
-                    Write-ProgressMessage '    Method: FindLastSessions'
-                    foreach ($session in @($job.FindLastSessions())) {
-                        if ($null -ne $session) { [void]$sessions.Add($session) }
-                    }
-                }
-
-                if ($job.PSObject.Methods['FindLastSession']) {
-                    Write-ProgressMessage '    Method: FindLastSession'
-                    $lastSession = $job.FindLastSession()
-                    if ($null -ne $lastSession) { [void]$sessions.Add($lastSession) }
-                }
-
-                # Call Get-VBRSession with the actual job object from Get-VBRJob.
-                # This is the key fix for Veeam versions that prompt for Job when
-                # Get-VBRSession is invoked without arguments.
-                if ($vbrSessionHasJobParam) {
-                    try {
-                        Write-ProgressMessage ('    Method: Get-VBRSession -Job "{0}"' -f $job.Name)
-                        $vbrSessions = @(Get-VBRSession -Job $job -ErrorAction Stop)
-                        Write-ProgressMessage ('    Get-VBRSession -Job returned {0} session(s).' -f $vbrSessions.Count)
-                        foreach ($session in $vbrSessions) {
-                            if ($null -ne $session) { [void]$sessions.Add($session) }
-                        }
-                    }
-                    catch {
-                        Write-Warning ('Unable to call Get-VBRSession -Job for job "{0}": {1}' -f $job.Name, $_.Exception.Message)
-                    }
-                }
-
-                Write-ProgressMessage ('    Processing {0} session(s) for this job ...' -f $sessions.Count)
-                foreach ($session in $sessions) {
-                    Write-SessionLogs -Session $session -Source 'Get-VBRJob'
-                }
+            if ($exportParams.Count -gt 0) {
+                $result = Export-VBRLogs $posPath @exportParams -ErrorAction Stop
+            } else {
+                $result = Export-VBRLogs $posPath -ErrorAction Stop
             }
-            catch {
-                Write-Warning ('Unable to collect sessions for job "{0}": {1}' -f $job.Name, $_.Exception.Message)
-            }
+        } else {
+            $result = Export-VBRLogs @exportParams -ErrorAction Stop
         }
     }
     catch {
-        Write-Warning ('Unable to enumerate jobs via Get-VBRJob: {0}' -f $_.Exception.Message)
+        throw ('Export-VBRLogs failed: {0}' -f $_.Exception.Message)
     }
+
+    Write-ProgressMessage 'Export-VBRLogs completed successfully.'
+    return $result
 }
 
-function Get-RecentCoreBackupSessions {
-    [CmdletBinding()]
-    param()
-
-    Write-ProgressMessage 'Phase 3 — Core backup session fallback (Veeam.Backup.Core.CBackupSession).'
-
-    try {
-        $type = [Veeam.Backup.Core.CBackupSession]
-    }
-    catch {
-        Write-ProgressMessage '  Type Veeam.Backup.Core.CBackupSession not available. Skipping.'
-        return
-    }
-
-    $before = $script:SeenSessions.Count
-    Write-ProgressMessage '  Enumerating all core backup sessions ...'
-
-    try {
-        $sessions = @($type::GetAll())
-        Write-ProgressMessage ('  Core sessions returned: {0}.' -f $sessions.Count)
-        foreach ($session in $sessions) {
-            Write-SessionLogs -Session $session -Source 'Veeam.Backup.Core.CBackupSession'
-        }
-    }
-    catch {
-        Write-Warning ('Unable to collect core backup sessions: {0}' -f $_.Exception.Message)
-    }
-
-    Write-ProgressMessage ('  Phase 3 complete: {0} new unique session(s) processed.' -f ($script:SeenSessions.Count - $before))
-}
-
+# ---------------------------------------------------------------------------
+# Write-CollectorHeader
+#   Prints a human-readable banner to stdout (skipped in -Json mode).
+# ---------------------------------------------------------------------------
 function Write-CollectorHeader {
     [CmdletBinding()]
     param()
@@ -620,32 +331,94 @@ function Write-CollectorHeader {
 
     Write-Output '============================================================'
     Write-Output 'Veeam Log Collector'
-    Write-Output ('Window     : last {0} hour(s)  (since {1:o})' -f $Hours, $script:Cutoff)
+    Write-Output ('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime)
     Write-Output ('Host       : {0}' -f $env:COMPUTERNAME)
     Write-Output ('PowerShell : {0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
     Write-Output '============================================================'
     Write-Output ''
 }
 
-Write-ProgressMessage ('Veeam Log Collector starting. Window: last {0} hour(s) (since {1:o}).' -f $Hours, $script:Cutoff)
+# ---------------------------------------------------------------------------
+# Collect-ExportedPaths
+#   Inspects the return value of Export-VBRLogs (which varies by Veeam version)
+#   and returns a list of file/folder path strings.  Falls back to the resolved
+#   output directory itself when the cmdlet returns nothing.
+# ---------------------------------------------------------------------------
+function Collect-ExportedPaths {
+    [CmdletBinding()]
+    param(
+        [AllowNull()] [object]$ExportResult,
+        [Parameter(Mandatory)] [string]$ResolvedOutputPath
+    )
+
+    $paths = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($null -ne $ExportResult) {
+        $resultItems = @($ExportResult)
+        foreach ($item in $resultItems) {
+            if ($item -is [string] -and -not [string]::IsNullOrWhiteSpace($item)) {
+                $paths.Add($item)
+                continue
+            }
+            # Object with a path-like property.
+            foreach ($propName in @('FullName', 'Path', 'FilePath', 'FileName', 'Name')) {
+                $val = $item.PSObject.Properties[$propName]
+                if ($null -ne $val -and -not [string]::IsNullOrWhiteSpace([string]$val.Value)) {
+                    $paths.Add([string]$val.Value)
+                    break
+                }
+            }
+        }
+    }
+
+    if ($paths.Count -eq 0) {
+        # Export-VBRLogs wrote files to disk but returned nothing.  Report the
+        # output directory so the caller always has a useful path.
+        $paths.Add($ResolvedOutputPath)
+    }
+
+    return $paths.ToArray()
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+Write-ProgressMessage ('Veeam Log Collector starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
+    -f $Hours, $script:StartTime, $script:EndTime)
+
 Import-VeeamPowerShell
 Write-CollectorHeader
 
-# 1. Job-centric collection: all configured backup jobs and their recent sessions.
-#    Calls Get-VBRSession -Job per-job whenever that cmdlet exposes -Job.
-Get-RecentJobSessions
+$resolvedOutputPath = Resolve-ExportOutputPath -RequestedPath $OutputPath
+Write-ProgressMessage ('Output path : {0}' -f $resolvedOutputPath)
 
-# 2. Public Veeam session cmdlets. These often include backup copy, replica, tape, agent,
-#    restore, and infrastructure/internal sessions depending on VBR version.
-#    Each cmdlet is inspected for mandatory parameters before calling; any cmdlet that
-#    would require interactive input is skipped automatically. Get-VBRSession is never
-#    called generically when it exposes -Job; Phase 1 already passes each job to it.
-Write-ProgressMessage 'Phase 2 — Broad session cmdlet enumeration.'
-Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRSession' -Source 'Get-VBRSession'
-Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRBackupSession' -Source 'Get-VBRBackupSession'
+$exportResult = Invoke-VBRLogsExport `
+    -StartTime          $script:StartTime `
+    -EndTime            $script:EndTime `
+    -ResolvedOutputPath $resolvedOutputPath
 
-# 3. Core session fallback. This is useful for internal processes such as SOBR/capacity-tier
-#    offload sessions that may not be attached to a user-created backup job object.
-Get-RecentCoreBackupSessions
+$exportedPaths = Collect-ExportedPaths -ExportResult $exportResult -ResolvedOutputPath $resolvedOutputPath
 
-Write-ProgressMessage ('Collection complete. Unique sessions: {0}  Records emitted: {1}.' -f $script:SeenSessions.Count, $script:EmittedCount)
+if ($Json) {
+    $jsonResult = [ordered]@{
+        status      = 'success'
+        hours       = $Hours
+        start_time  = $script:StartTime.ToString('o')
+        end_time    = $script:EndTime.ToString('o')
+        output_path = $resolvedOutputPath
+        exported    = @($exportedPaths)
+    }
+    [pscustomobject]$jsonResult | ConvertTo-Json -Compress -Depth 4
+} else {
+    Write-Output ''
+    Write-Output '------------------------------------------------------------'
+    Write-Output 'Export complete.'
+    Write-Output ('Window : last {0} hour(s)  ({1:o}  to  {2:o})' -f $Hours, $script:StartTime, $script:EndTime)
+    Write-Output ''
+    Write-Output 'Exported log location(s):'
+    foreach ($p in $exportedPaths) {
+        Write-Output ('  {0}' -f $p)
+    }
+    Write-Output '------------------------------------------------------------'
+}
