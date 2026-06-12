@@ -136,8 +136,7 @@ function Import-VeeamPowerShell {
     [CmdletBinding()]
     param()
 
-    Write-ProgressMessage ('PowerShell {0} {1} on host: {2}' -f
-        $PSVersionTable.PSEdition, $PSVersionTable.PSVersion, $env:COMPUTERNAME)
+    Write-ProgressMessage "PowerShell $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion) on host: $env:COMPUTERNAME"
 
     $loaded = $false
 
