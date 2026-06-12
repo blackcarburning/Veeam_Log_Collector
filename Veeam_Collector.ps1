@@ -1,21 +1,30 @@
 <#
 .SYNOPSIS
-    Prints Veeam Backup & Replication session log records from the last 24 hours.
+    Prints Veeam Backup & Replication session log records from the last N hours.
 
 .DESCRIPTION
     Uses the Veeam Backup PowerShell module/snap-in to enumerate recent sessions for:
       - all backup jobs returned by Get-VBRJob
-      - VBR sessions returned by Get-VBRSession, when available
+      - VBR sessions returned by Get-VBRSession (called per-job when -Job is mandatory,
+        otherwise called generically)
       - backup sessions returned by Get-VBRBackupSession
       - internal/core sessions returned through Veeam.Backup.Core.CBackupSession, when available
 
-    This intentionally writes to standard output only. Redirect stdout if you want a file.
+    Progress and status messages are printed throughout so you can see what the script is
+    doing while it runs.  In default (human-readable) mode these go to standard output
+    interleaved with log records.  In -Json mode they are sent to the Warning stream so
+    that standard output remains pure JSON Lines.
+
+    This intentionally writes log records to standard output only.
+    Redirect stdout if you want a file.
 
 .PARAMETER Hours
     Time window (in hours) to collect sessions/log records from. Default is 24.
 
 .PARAMETER Json
     Emit one JSON object per line (JSON Lines) for machine-readable output.
+    Progress/status messages are sent to the Warning stream in this mode so that
+    standard output remains parseable JSON Lines.
 
 .EXAMPLE
     .\Veeam_Collector.ps1
@@ -33,6 +42,17 @@
       - The script tries Veeam.Backup.PowerShell first, then VeeamPSSnapIn fallback.
       - It attempts to include internal/background sessions (for example SOBR/capacity-tier
         offload) via broader session cmdlets and core backup session fallback.
+      - Human-readable mode (default, -Json not specified) prints timestamped progress and
+        status messages to standard output so you can follow along in real time.
+      - -Json mode routes all progress/status messages to the Warning stream; standard
+        output contains only JSON Lines records suitable for piping or log ingestion.
+
+    Get-VBRSession note:
+      - On some Veeam versions Get-VBRSession requires a mandatory -Job parameter and will
+        prompt interactively when called without arguments.  This script detects that
+        condition automatically: if -Job is mandatory the cmdlet is called per-job inside
+        the job-enumeration phase; if no mandatory Job parameter exists it is called
+        generically as before.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -52,19 +72,72 @@ param(
     [ValidateRange(1, 8760)]
     [int]$Hours = 24,
 
-    # Emit JSON Lines instead of readable text. Useful for later ingestion/parsing.
+    # Emit JSON Lines instead of readable text. Progress goes to Warning stream in this mode.
     [switch]$Json
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:Cutoff = (Get-Date).AddHours(-[Math]::Abs($Hours))
-$script:SeenSessions = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:Cutoff        = (Get-Date).AddHours(-[Math]::Abs($Hours))
+$script:SeenSessions  = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:EmittedCount  = 0
+
+# ---------------------------------------------------------------------------
+# Write-ProgressMessage
+#   Timestamped status/progress output visible to the operator at all times.
+#   - Human-readable mode: goes to standard output (stream 1).
+#   - Json mode: goes to the Warning stream (stream 3) so stdout stays pure JSON.
+# ---------------------------------------------------------------------------
+function Write-ProgressMessage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Message)
+
+    $line = '[{0:yyyy-MM-dd HH:mm:ss}] {1}' -f (Get-Date), $Message
+
+    if ($Json) {
+        Write-Warning $line
+    } else {
+        Write-Output $line
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Test-CmdletHasMandatoryJobParam
+#   Returns $true when every parameter set of the named cmdlet declares -Job
+#   as mandatory, meaning the cmdlet cannot be safely called without a -Job
+#   argument (doing so would trigger an interactive "Supply values" prompt).
+# ---------------------------------------------------------------------------
+function Test-CmdletHasMandatoryJobParam {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$CmdletName)
+
+    $cmd = Get-Command -Name $CmdletName -ErrorAction SilentlyContinue
+    if ($null -eq $cmd -or $cmd.ParameterSets.Count -eq 0) { return $false }
+
+    # Walk every parameter set.  If we find even one set where Job is NOT
+    # mandatory, the cmdlet can be invoked without arguments — return $false.
+    foreach ($paramSet in $cmd.ParameterSets) {
+        $jobMandatoryInSet = $false
+        foreach ($param in $paramSet.Parameters) {
+            if ($param.Name -eq 'Job' -and $param.IsMandatory) {
+                $jobMandatoryInSet = $true
+                break
+            }
+        }
+        if (-not $jobMandatoryInSet) { return $false }
+    }
+
+    # Every parameter set requires -Job.
+    return $true
+}
 
 function Import-VeeamPowerShell {
     [CmdletBinding()]
     param()
+
+    Write-ProgressMessage ('PowerShell {0} {1} on host: {2}' -f
+        $PSVersionTable.PSEdition, $PSVersionTable.PSVersion, $env:COMPUTERNAME)
 
     $loaded = $false
 
@@ -72,23 +145,32 @@ function Import-VeeamPowerShell {
     # On Windows PowerShell 5.1 the module manifest may declare a minimum PS version of
     # 7.0, which causes Import-Module to throw.  Catch that failure and fall through to
     # the legacy VeeamPSSnapIn snap-in below.
+    Write-ProgressMessage 'Attempting to load modern module: Veeam.Backup.PowerShell ...'
     if (Get-Module -ListAvailable -Name 'Veeam.Backup.PowerShell' -ErrorAction SilentlyContinue) {
         try {
             Import-Module 'Veeam.Backup.PowerShell' -ErrorAction Stop
             $loaded = $true
+            Write-ProgressMessage 'Modern module Veeam.Backup.PowerShell loaded successfully.'
         }
         catch {
+            Write-ProgressMessage ('  Modern module load failed: {0}' -f $_.Exception.Message)
             Write-Warning (("Could not import Veeam.Backup.PowerShell module: {0}  " +
                 "Falling back to VeeamPSSnapIn (required on Windows PowerShell 5.1).") `
                 -f $_.Exception.Message)
         }
+    } else {
+        Write-ProgressMessage '  Module Veeam.Backup.PowerShell not found in module path.'
     }
 
     if (-not $loaded) {
+        Write-ProgressMessage 'Attempting to load legacy snap-in: VeeamPSSnapIn ...'
         $snapIn = Get-PSSnapin -Registered -Name 'VeeamPSSnapIn' -ErrorAction SilentlyContinue
         if ($snapIn) {
             Add-PSSnapin 'VeeamPSSnapIn' -ErrorAction Stop
             $loaded = $true
+            Write-ProgressMessage 'Legacy snap-in VeeamPSSnapIn loaded successfully.'
+        } else {
+            Write-ProgressMessage '  Snap-in VeeamPSSnapIn not found or not registered.'
         }
     }
 
@@ -301,6 +383,7 @@ function Write-LogEntry {
 
     if ($Json) {
         [pscustomobject]$entry | ConvertTo-Json -Compress -Depth 6
+        $script:EmittedCount++
         return
     }
 
@@ -316,6 +399,7 @@ function Write-LogEntry {
         Write-Output ('  Details : {0}' -f $entry.record_details)
     }
     Write-Output ''
+    $script:EmittedCount++
 }
 
 function Write-SessionLogs {
@@ -358,7 +442,24 @@ function Get-RecentSessionsFromCmdlet {
         [Parameter(Mandatory)] [string]$Source
     )
 
-    if (-not (Get-Command -Name $CmdletName -ErrorAction SilentlyContinue)) { return }
+    Write-ProgressMessage ('Checking cmdlet: {0}' -f $CmdletName)
+
+    if (-not (Get-Command -Name $CmdletName -ErrorAction SilentlyContinue)) {
+        Write-ProgressMessage ('  Skipped: {0} is not available on this system.' -f $CmdletName)
+        return
+    }
+
+    # Guard against cmdlets that require a mandatory -Job parameter.  Calling such a
+    # cmdlet without arguments causes an interactive "Supply values for the following
+    # parameters: Job:" prompt that hangs unattended execution.
+    if (Test-CmdletHasMandatoryJobParam -CmdletName $CmdletName) {
+        Write-ProgressMessage ('  Skipped: {0} requires a mandatory -Job parameter. ' +
+            'Sessions are collected per-job in Phase 1 instead.' -f $CmdletName)
+        return
+    }
+
+    Write-ProgressMessage ('  Enumerating sessions via {0} ...' -f $CmdletName)
+    $before = $script:SeenSessions.Count
 
     try {
         & $CmdletName -ErrorAction Stop | ForEach-Object {
@@ -368,37 +469,85 @@ function Get-RecentSessionsFromCmdlet {
     catch {
         Write-Warning ('Unable to collect sessions via {0}: {1}' -f $CmdletName, $_.Exception.Message)
     }
+
+    Write-ProgressMessage ('  {0}: {1} new unique session(s) processed.' -f $CmdletName, ($script:SeenSessions.Count - $before))
 }
 
 function Get-RecentJobSessions {
     [CmdletBinding()]
     param()
 
-    if (-not (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue)) { return }
+    Write-ProgressMessage 'Phase 1 — Job-centric collection (Get-VBRJob).'
+
+    if (-not (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue)) {
+        Write-ProgressMessage '  Get-VBRJob not available. Skipping job-centric collection.'
+        return
+    }
+
+    # Determine up-front whether Get-VBRSession requires a mandatory -Job argument.
+    # If it does, we call it per-job here rather than generically in Phase 2.
+    $vbrSessionAvail    = $null -ne (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)
+    $vbrSessionNeedsJob = $vbrSessionAvail -and (Test-CmdletHasMandatoryJobParam -CmdletName 'Get-VBRSession')
+
+    if ($vbrSessionAvail) {
+        if ($vbrSessionNeedsJob) {
+            Write-ProgressMessage '  Get-VBRSession requires -Job; will be called per-job inside this phase.'
+        } else {
+            Write-ProgressMessage '  Get-VBRSession does not require -Job; it will be called generically in Phase 2.'
+        }
+    } else {
+        Write-ProgressMessage '  Get-VBRSession not available on this system.'
+    }
 
     try {
-        $jobs = Get-VBRJob -ErrorAction Stop
+        $jobs = @(Get-VBRJob -ErrorAction Stop)
+        Write-ProgressMessage ('  Found {0} job(s).' -f $jobs.Count)
+
+        $jobIndex = 0
         foreach ($job in $jobs) {
+            $jobIndex++
+            Write-ProgressMessage ('  Job {0}/{1}: {2}' -f $jobIndex, $jobs.Count, $job.Name)
+
             try {
                 $sessions = New-Object 'System.Collections.Generic.List[object]'
 
                 if ($job.PSObject.Methods['GetSessions']) {
+                    Write-ProgressMessage '    Method: GetSessions'
                     foreach ($session in @($job.GetSessions())) {
                         if ($null -ne $session) { [void]$sessions.Add($session) }
                     }
                 }
 
                 if ($job.PSObject.Methods['FindLastSessions']) {
+                    Write-ProgressMessage '    Method: FindLastSessions'
                     foreach ($session in @($job.FindLastSessions())) {
                         if ($null -ne $session) { [void]$sessions.Add($session) }
                     }
                 }
 
                 if ($job.PSObject.Methods['FindLastSession']) {
+                    Write-ProgressMessage '    Method: FindLastSession'
                     $lastSession = $job.FindLastSession()
                     if ($null -ne $lastSession) { [void]$sessions.Add($lastSession) }
                 }
 
+                # If Get-VBRSession requires -Job, call it per-job here to avoid an
+                # interactive parameter prompt when called with no arguments.
+                if ($vbrSessionNeedsJob) {
+                    try {
+                        Write-ProgressMessage '    Method: Get-VBRSession -Job'
+                        $vbrSessions = @(Get-VBRSession -Job $job -ErrorAction Stop)
+                        Write-ProgressMessage ('    Get-VBRSession -Job returned {0} session(s).' -f $vbrSessions.Count)
+                        foreach ($session in $vbrSessions) {
+                            if ($null -ne $session) { [void]$sessions.Add($session) }
+                        }
+                    }
+                    catch {
+                        Write-Warning ('Unable to call Get-VBRSession for job "{0}": {1}' -f $job.Name, $_.Exception.Message)
+                    }
+                }
+
+                Write-ProgressMessage ('    Processing {0} session(s) for this job ...' -f $sessions.Count)
                 foreach ($session in $sessions) {
                     Write-SessionLogs -Session $session -Source 'Get-VBRJob'
                 }
@@ -417,15 +566,22 @@ function Get-RecentCoreBackupSessions {
     [CmdletBinding()]
     param()
 
+    Write-ProgressMessage 'Phase 3 — Core backup session fallback (Veeam.Backup.Core.CBackupSession).'
+
     try {
         $type = [Veeam.Backup.Core.CBackupSession]
     }
     catch {
+        Write-ProgressMessage '  Type Veeam.Backup.Core.CBackupSession not available. Skipping.'
         return
     }
 
+    $before = $script:SeenSessions.Count
+    Write-ProgressMessage '  Enumerating all core backup sessions ...'
+
     try {
         $sessions = @($type::GetAll())
+        Write-ProgressMessage ('  Core sessions returned: {0}.' -f $sessions.Count)
         foreach ($session in $sessions) {
             Write-SessionLogs -Session $session -Source 'Veeam.Backup.Core.CBackupSession'
         }
@@ -433,6 +589,8 @@ function Get-RecentCoreBackupSessions {
     catch {
         Write-Warning ('Unable to collect core backup sessions: {0}' -f $_.Exception.Message)
     }
+
+    Write-ProgressMessage ('  Phase 3 complete: {0} new unique session(s) processed.' -f ($script:SeenSessions.Count - $before))
 }
 
 function Write-CollectorHeader {
@@ -441,21 +599,28 @@ function Write-CollectorHeader {
 
     if ($Json) { return }
 
+    Write-Output '============================================================'
     Write-Output 'Veeam Log Collector'
-    Write-Output ('Window       : {0:o} through {1:o}' -f $script:Cutoff, (Get-Date))
-    Write-Output ('Host         : {0}' -f $env:COMPUTERNAME)
-    Write-Output ('PowerShell   : {0}' -f $PSVersionTable.PSVersion)
+    Write-Output ('Window     : last {0} hour(s)  (since {1:o})' -f $Hours, $script:Cutoff)
+    Write-Output ('Host       : {0}' -f $env:COMPUTERNAME)
+    Write-Output ('PowerShell : {0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
+    Write-Output '============================================================'
     Write-Output ''
 }
 
+Write-ProgressMessage ('Veeam Log Collector starting. Window: last {0} hour(s) (since {1:o}).' -f $Hours, $script:Cutoff)
 Import-VeeamPowerShell
 Write-CollectorHeader
 
 # 1. Job-centric collection: all configured backup jobs and their recent sessions.
+#    Also calls Get-VBRSession -Job per-job when that cmdlet requires -Job.
 Get-RecentJobSessions
 
 # 2. Public Veeam session cmdlets. These often include backup copy, replica, tape, agent,
 #    restore, and infrastructure/internal sessions depending on VBR version.
+#    Each cmdlet is inspected for mandatory parameters before calling; any cmdlet that
+#    would require interactive input is skipped automatically.
+Write-ProgressMessage 'Phase 2 — Broad session cmdlet enumeration.'
 Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRSession' -Source 'Get-VBRSession'
 Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRBackupSession' -Source 'Get-VBRBackupSession'
 
@@ -463,6 +628,4 @@ Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRBackupSession' -Source 'Get-VBR
 #    offload sessions that may not be attached to a user-created backup job object.
 Get-RecentCoreBackupSessions
 
-if (-not $Json) {
-    Write-Output ('Completed. Sessions examined/emitted: {0}' -f $script:SeenSessions.Count)
-}
+Write-ProgressMessage ('Collection complete. Unique sessions: {0}  Records emitted: {1}.' -f $script:SeenSessions.Count, $script:EmittedCount)
