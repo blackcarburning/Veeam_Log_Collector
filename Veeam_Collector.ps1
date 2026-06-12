@@ -5,8 +5,9 @@
 .DESCRIPTION
     Uses the Veeam Backup PowerShell module/snap-in to enumerate recent sessions for:
       - all backup jobs returned by Get-VBRJob
-      - VBR sessions returned by Get-VBRSession (called per-job when -Job is mandatory,
-        otherwise called generically)
+      - VBR sessions returned by Get-VBRSession (called per-job with -Job when the cmdlet
+        exposes a Job parameter; this avoids interactive prompts on Veeam versions where
+        Get-VBRSession cannot be safely called without a job)
       - backup sessions returned by Get-VBRBackupSession
       - internal/core sessions returned through Veeam.Backup.Core.CBackupSession, when available
 
@@ -48,18 +49,17 @@
         output contains only JSON Lines records suitable for piping or log ingestion.
 
     Get-VBRSession note:
-      - On some Veeam versions Get-VBRSession requires a mandatory -Job parameter and will
-        prompt interactively when called without arguments.  This script detects that
-        condition automatically: if -Job is mandatory the cmdlet is called per-job inside
-        the job-enumeration phase; if no mandatory Job parameter exists it is called
-        generically as before.
+      - On some Veeam versions Get-VBRSession requires a -Job value and will prompt
+        interactively when called without arguments. This script avoids that entirely:
+        when Get-VBRSession exposes a Job parameter, it is called as Get-VBRSession -Job
+        for each job returned by Get-VBRJob and is never called generically without a job.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
       - Windows PowerShell 5.1 (Desktop edition): the modern module manifest declares a
         minimum PS version of 7.0 and cannot be loaded by PS 5.1. The script catches that
         failure and automatically falls back to the legacy VeeamPSSnapIn snap-in.
-        Ensure VeeamPSSnapIn is registered (it is included with Veeam Backup & Replication
+        Ensure VeeamPSSnapIn is registered (it is included with the Veeam Backup & Replication
         console components) when running under Windows PowerShell 5.1.
 
     Run requirements:
@@ -103,33 +103,44 @@ function Write-ProgressMessage {
 }
 
 # ---------------------------------------------------------------------------
-# Test-CmdletHasMandatoryJobParam
-#   Returns $true when every parameter set of the named cmdlet declares -Job
-#   as mandatory, meaning the cmdlet cannot be safely called without a -Job
-#   argument (doing so would trigger an interactive "Supply values" prompt).
+# Test-CmdletHasParameter
+#   Returns $true when the named cmdlet exposes the named parameter in any
+#   parameter set. Used to route Get-VBRSession through per-job calls whenever
+#   the cmdlet supports/requires -Job.
 # ---------------------------------------------------------------------------
-function Test-CmdletHasMandatoryJobParam {
+function Test-CmdletHasParameter {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$CmdletName,
+        [Parameter(Mandatory)] [string]$ParameterName
+    )
+
+    $cmd = Get-Command -Name $CmdletName -ErrorAction SilentlyContinue
+    if ($null -eq $cmd) { return $false }
+
+    return $cmd.Parameters.ContainsKey($ParameterName)
+}
+
+# ---------------------------------------------------------------------------
+# Test-CmdletCanInvokeWithoutArguments
+#   Returns $true only when at least one parameter set has no mandatory
+#   parameters. This prevents accidental interactive prompts such as:
+#   "Supply values for the following parameters: Job:"
+# ---------------------------------------------------------------------------
+function Test-CmdletCanInvokeWithoutArguments {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string]$CmdletName)
 
     $cmd = Get-Command -Name $CmdletName -ErrorAction SilentlyContinue
-    if ($null -eq $cmd -or $cmd.ParameterSets.Count -eq 0) { return $false }
+    if ($null -eq $cmd) { return $false }
+    if ($cmd.ParameterSets.Count -eq 0) { return $true }
 
-    # Walk every parameter set.  If we find even one set where Job is NOT
-    # mandatory, the cmdlet can be invoked without arguments — return $false.
     foreach ($paramSet in $cmd.ParameterSets) {
-        $jobMandatoryInSet = $false
-        foreach ($param in $paramSet.Parameters) {
-            if ($param.Name -eq 'Job' -and $param.IsMandatory) {
-                $jobMandatoryInSet = $true
-                break
-            }
-        }
-        if (-not $jobMandatoryInSet) { return $false }
+        $mandatoryParameters = @($paramSet.Parameters | Where-Object { $_.IsMandatory })
+        if ($mandatoryParameters.Count -eq 0) { return $true }
     }
 
-    # Every parameter set requires -Job.
-    return $true
+    return $false
 }
 
 function Import-VeeamPowerShell {
@@ -448,12 +459,19 @@ function Get-RecentSessionsFromCmdlet {
         return
     }
 
-    # Guard against cmdlets that require a mandatory -Job parameter.  Calling such a
-    # cmdlet without arguments causes an interactive "Supply values for the following
-    # parameters: Job:" prompt that hangs unattended execution.
-    if (Test-CmdletHasMandatoryJobParam -CmdletName $CmdletName) {
-        Write-ProgressMessage ('  Skipped: {0} requires a mandatory -Job parameter. ' +
-            'Sessions are collected per-job in Phase 1 instead.' -f $CmdletName)
+    # Get-VBRSession is special: on some Veeam builds it exposes a -Job parameter
+    # and prompts for it when called without arguments. The user environment has
+    # shown that behavior, so never call Get-VBRSession generically when -Job is
+    # available. Per-job collection in Phase 1 passes each Get-VBRJob result to it.
+    if ($CmdletName -eq 'Get-VBRSession' -and (Test-CmdletHasParameter -CmdletName $CmdletName -ParameterName 'Job')) {
+        Write-ProgressMessage ('  Skipped: {0} exposes -Job and will be collected per-job as Get-VBRSession -Job <job> to avoid interactive prompts.' -f $CmdletName)
+        return
+    }
+
+    # For all other generic cmdlets, only call them when metadata says there is
+    # a no-argument parameter set. This avoids any other "Supply values" prompt.
+    if (-not (Test-CmdletCanInvokeWithoutArguments -CmdletName $CmdletName)) {
+        Write-ProgressMessage ('  Skipped: {0} has mandatory parameter(s) and cannot be safely called without arguments.' -f $CmdletName)
         return
     }
 
@@ -483,16 +501,17 @@ function Get-RecentJobSessions {
         return
     }
 
-    # Determine up-front whether Get-VBRSession requires a mandatory -Job argument.
-    # If it does, we call it per-job here rather than generically in Phase 2.
-    $vbrSessionAvail    = $null -ne (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)
-    $vbrSessionNeedsJob = $vbrSessionAvail -and (Test-CmdletHasMandatoryJobParam -CmdletName 'Get-VBRSession')
+    # Determine up-front whether Get-VBRSession can take -Job. If it can, always
+    # call it per-job here and skip the generic call in Phase 2. This matches
+    # Veeam versions where the cmdlet prompts for Job when called with no args.
+    $vbrSessionAvail       = $null -ne (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)
+    $vbrSessionHasJobParam = $vbrSessionAvail -and (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Job')
 
     if ($vbrSessionAvail) {
-        if ($vbrSessionNeedsJob) {
-            Write-ProgressMessage '  Get-VBRSession requires -Job; will be called per-job inside this phase.'
+        if ($vbrSessionHasJobParam) {
+            Write-ProgressMessage '  Get-VBRSession exposes -Job; will call Get-VBRSession -Job for each job.'
         } else {
-            Write-ProgressMessage '  Get-VBRSession does not require -Job; it will be called generically in Phase 2.'
+            Write-ProgressMessage '  Get-VBRSession does not expose -Job; it may be called generically in Phase 2 if safe.'
         }
     } else {
         Write-ProgressMessage '  Get-VBRSession not available on this system.'
@@ -530,11 +549,12 @@ function Get-RecentJobSessions {
                     if ($null -ne $lastSession) { [void]$sessions.Add($lastSession) }
                 }
 
-                # If Get-VBRSession requires -Job, call it per-job here to avoid an
-                # interactive parameter prompt when called with no arguments.
-                if ($vbrSessionNeedsJob) {
+                # Call Get-VBRSession with the actual job object from Get-VBRJob.
+                # This is the key fix for Veeam versions that prompt for Job when
+                # Get-VBRSession is invoked without arguments.
+                if ($vbrSessionHasJobParam) {
                     try {
-                        Write-ProgressMessage '    Method: Get-VBRSession -Job'
+                        Write-ProgressMessage ('    Method: Get-VBRSession -Job "{0}"' -f $job.Name)
                         $vbrSessions = @(Get-VBRSession -Job $job -ErrorAction Stop)
                         Write-ProgressMessage ('    Get-VBRSession -Job returned {0} session(s).' -f $vbrSessions.Count)
                         foreach ($session in $vbrSessions) {
@@ -542,7 +562,7 @@ function Get-RecentJobSessions {
                         }
                     }
                     catch {
-                        Write-Warning ('Unable to call Get-VBRSession for job "{0}": {1}' -f $job.Name, $_.Exception.Message)
+                        Write-Warning ('Unable to call Get-VBRSession -Job for job "{0}": {1}' -f $job.Name, $_.Exception.Message)
                     }
                 }
 
@@ -612,13 +632,14 @@ Import-VeeamPowerShell
 Write-CollectorHeader
 
 # 1. Job-centric collection: all configured backup jobs and their recent sessions.
-#    Also calls Get-VBRSession -Job per-job when that cmdlet requires -Job.
+#    Calls Get-VBRSession -Job per-job whenever that cmdlet exposes -Job.
 Get-RecentJobSessions
 
 # 2. Public Veeam session cmdlets. These often include backup copy, replica, tape, agent,
 #    restore, and infrastructure/internal sessions depending on VBR version.
 #    Each cmdlet is inspected for mandatory parameters before calling; any cmdlet that
-#    would require interactive input is skipped automatically.
+#    would require interactive input is skipped automatically. Get-VBRSession is never
+#    called generically when it exposes -Job; Phase 1 already passes each job to it.
 Write-ProgressMessage 'Phase 2 — Broad session cmdlet enumeration.'
 Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRSession' -Source 'Get-VBRSession'
 Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRBackupSession' -Source 'Get-VBRBackupSession'
