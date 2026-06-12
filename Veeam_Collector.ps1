@@ -9,16 +9,39 @@
       - backup sessions returned by Get-VBRBackupSession
       - internal/core sessions returned through Veeam.Backup.Core.CBackupSession, when available
 
-    This intentionally writes to standard output only. Redirect stdout if you want a file, e.g.:
-      .\Veeam_Collector.ps1 *> .\veeam-log-output.txt
+    This intentionally writes to standard output only. Redirect stdout if you want a file.
+
+.PARAMETER Hours
+    Time window (in hours) to collect sessions/log records from. Default is 24.
+
+.PARAMETER Json
+    Emit one JSON object per line (JSON Lines) for machine-readable output.
+
+.EXAMPLE
+    .\Veeam_Collector.ps1
+
+.EXAMPLE
+    .\Veeam_Collector.ps1 -Hours 48
+
+.EXAMPLE
+    .\Veeam_Collector.ps1 -Json
 
 .NOTES
+    Usage notes:
+      - Run this script in Windows PowerShell on a Veeam Backup & Replication server
+        or a host with the Veeam console/PowerShell components installed.
+      - The script tries Veeam.Backup.PowerShell first, then VeeamPSSnapIn fallback.
+      - It attempts to include internal/background sessions (for example SOBR/capacity-tier
+        offload) via broader session cmdlets and core backup session fallback.
+
+    Run requirements:
     Run in an elevated PowerShell session on the Veeam Backup & Replication server or a host
     with the Veeam console/PowerShell components installed.
 #>
 
 [CmdletBinding()]
 param(
+    [ValidateRange(1, 8760)]
     [int]$Hours = 24,
 
     # Emit JSON Lines instead of readable text. Useful for later ingestion/parsing.
@@ -257,9 +280,13 @@ function Write-LogEntry {
     }
 
     Write-Output ('[{0}] [{1}] [{2}] {3}' -f $entry.record_time, $entry.source, $entry.record_status, $entry.record_title)
+    Write-Output ('  Collected: {0}' -f $entry.collected_at)
+    Write-Output ('  SessionId: {0}' -f $entry.session_id)
     Write-Output ('  Session : {0}' -f $entry.session_name)
     Write-Output ('  Type    : {0}' -f $entry.session_type)
     Write-Output ('  State   : {0}' -f $entry.session_state)
+    Write-Output ('  Start   : {0}' -f $entry.session_start)
+    Write-Output ('  End     : {0}' -f $entry.session_end)
     if (-not [string]::IsNullOrWhiteSpace($entry.record_details)) {
         Write-Output ('  Details : {0}' -f $entry.record_details)
     }
@@ -328,15 +355,23 @@ function Get-RecentJobSessions {
         $jobs = Get-VBRJob -ErrorAction Stop
         foreach ($job in $jobs) {
             try {
-                $sessions = @()
+                $sessions = New-Object 'System.Collections.Generic.List[object]'
 
-                if ($job.PSObject.Methods['FindLastSession']) {
-                    $lastSession = $job.FindLastSession()
-                    if ($null -ne $lastSession) { $sessions += $lastSession }
+                if ($job.PSObject.Methods['GetSessions']) {
+                    foreach ($session in @($job.GetSessions())) {
+                        if ($null -ne $session) { [void]$sessions.Add($session) }
+                    }
                 }
 
                 if ($job.PSObject.Methods['FindLastSessions']) {
-                    $sessions += @($job.FindLastSessions())
+                    foreach ($session in @($job.FindLastSessions())) {
+                        if ($null -ne $session) { [void]$sessions.Add($session) }
+                    }
+                }
+
+                if ($job.PSObject.Methods['FindLastSession']) {
+                    $lastSession = $job.FindLastSession()
+                    if ($null -ne $lastSession) { [void]$sessions.Add($lastSession) }
                 }
 
                 foreach ($session in $sessions) {
