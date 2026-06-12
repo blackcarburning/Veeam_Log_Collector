@@ -424,7 +424,7 @@ function Write-SessionLogs {
     $sessionId = Get-ObjectIdentity -InputObject $Session
     if (-not $script:SeenSessions.Add($sessionId)) { return }
 
-    $records = Get-SessionLogRecords -Session $Session
+    $records = @(Get-SessionLogRecords -Session $Session)
 
     if ($records.Count -eq 0) {
         $synthetic = [pscustomobject]@{
