@@ -83,12 +83,6 @@ $script:Cutoff        = (Get-Date).AddHours(-[Math]::Abs($Hours))
 $script:SeenSessions  = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:EmittedCount  = 0
 
-# ---------------------------------------------------------------------------
-# Write-ProgressMessage
-#   Timestamped status/progress output visible to the operator at all times.
-#   - Human-readable mode: goes to standard output (stream 1).
-#   - Json mode: goes to the Warning stream (stream 3) so stdout stays pure JSON.
-# ---------------------------------------------------------------------------
 function Write-ProgressMessage {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string]$Message)
@@ -102,12 +96,6 @@ function Write-ProgressMessage {
     }
 }
 
-# ---------------------------------------------------------------------------
-# Test-CmdletHasParameter
-#   Returns $true when the named cmdlet exposes the named parameter in any
-#   parameter set. Used to route Get-VBRSession through per-job calls whenever
-#   the cmdlet supports/requires -Job.
-# ---------------------------------------------------------------------------
 function Test-CmdletHasParameter {
     [CmdletBinding()]
     param(
@@ -121,12 +109,6 @@ function Test-CmdletHasParameter {
     return $cmd.Parameters.ContainsKey($ParameterName)
 }
 
-# ---------------------------------------------------------------------------
-# Test-CmdletCanInvokeWithoutArguments
-#   Returns $true only when at least one parameter set has no mandatory
-#   parameters. This prevents accidental interactive prompts such as:
-#   "Supply values for the following parameters: Job:"
-# ---------------------------------------------------------------------------
 function Test-CmdletCanInvokeWithoutArguments {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string]$CmdletName)
@@ -151,10 +133,6 @@ function Import-VeeamPowerShell {
 
     $loaded = $false
 
-    # Try the modern Veeam.Backup.PowerShell module first.
-    # On Windows PowerShell 5.1 the module manifest may declare a minimum PS version of
-    # 7.0, which causes Import-Module to throw.  Catch that failure and fall through to
-    # the legacy VeeamPSSnapIn snap-in below.
     Write-ProgressMessage 'Attempting to load modern module: Veeam.Backup.PowerShell ...'
     if (Get-Module -ListAvailable -Name 'Veeam.Backup.PowerShell' -ErrorAction SilentlyContinue) {
         try {
@@ -256,12 +234,8 @@ function Get-SessionStartTime {
     param([Parameter(Mandatory)] [object]$Session)
 
     $value = Get-PropertyValue -InputObject $Session -Names @(
-        'CreationTime',
-        'CreationTimeLocal',
-        'CreationTimeUTC',
-        'StartTime',
-        'StartTimeLocal',
-        'StartTimeUTC'
+        'CreationTime', 'CreationTimeLocal', 'CreationTimeUTC',
+        'StartTime', 'StartTimeLocal', 'StartTimeUTC'
     )
 
     if ($null -eq $value) { return $null }
@@ -273,12 +247,8 @@ function Get-SessionEndTime {
     param([Parameter(Mandatory)] [object]$Session)
 
     $value = Get-PropertyValue -InputObject $Session -Names @(
-        'EndTime',
-        'EndTimeLocal',
-        'EndTimeUTC',
-        'StopTime',
-        'StopTimeLocal',
-        'StopTimeUTC'
+        'EndTime', 'EndTimeLocal', 'EndTimeUTC',
+        'StopTime', 'StopTimeLocal', 'StopTimeUTC'
     )
 
     if ($null -eq $value) { return $null }
@@ -292,12 +262,10 @@ function Test-SessionInWindow {
     $start = Get-SessionStartTime -Session $Session
     $end = Get-SessionEndTime -Session $Session
 
-    # Include sessions that started in the window, ended in the window, or are still running.
     if ($null -ne $start -and $start -ge $script:Cutoff) { return $true }
     if ($null -ne $end -and $end -ge $script:Cutoff) { return $true }
     if ($null -ne $start -and $null -eq $end) { return $true }
 
-    # If time metadata is not exposed, include it rather than silently losing possible internal sessions.
     return ($null -eq $start -and $null -eq $end)
 }
 
@@ -327,14 +295,9 @@ function Get-RecordTime {
     param([Parameter(Mandatory)] [object]$Record)
 
     $value = Get-PropertyValue -InputObject $Record -Names @(
-        'StartTime',
-        'StartTimeLocal',
-        'StartTimeUTC',
-        'UpdateTime',
-        'UpdateTimeLocal',
-        'UpdateTimeUTC',
-        'CreationTime',
-        'Time'
+        'StartTime', 'StartTimeLocal', 'StartTimeUTC',
+        'UpdateTime', 'UpdateTimeLocal', 'UpdateTimeUTC',
+        'CreationTime', 'Time'
     )
 
     if ($null -eq $value) { return $null }
@@ -376,6 +339,10 @@ function Write-LogEntry {
         [Parameter(Mandatory)] [string]$Source
     )
 
+    $sessionStart = Get-SessionStartTime -Session $Session
+    $sessionEnd = Get-SessionEndTime -Session $Session
+    $recordTime = Get-RecordTime -Record $Record
+
     $entry = [ordered]@{
         collected_at   = (Get-Date).ToString('o')
         source         = $Source
@@ -383,9 +350,9 @@ function Write-LogEntry {
         session_name   = Get-SessionName -Session $Session
         session_type   = Get-SessionType -Session $Session
         session_state  = Get-SessionState -Session $Session
-        session_start  = $(if ($null -ne (Get-SessionStartTime -Session $Session)) { (Get-SessionStartTime -Session $Session).ToString('o') } else { $null })
-        session_end    = $(if ($null -ne (Get-SessionEndTime -Session $Session)) { (Get-SessionEndTime -Session $Session).ToString('o') } else { $null })
-        record_time    = $(if ($null -ne (Get-RecordTime -Record $Record)) { (Get-RecordTime -Record $Record).ToString('o') } else { $null })
+        session_start  = $(if ($null -ne $sessionStart) { $sessionStart.ToString('o') } else { $null })
+        session_end    = $(if ($null -ne $sessionEnd) { $sessionEnd.ToString('o') } else { $null })
+        record_time    = $(if ($null -ne $recordTime) { $recordTime.ToString('o') } else { $null })
         record_status  = Get-RecordStatus -Record $Record
         record_title   = Get-RecordTitle -Record $Record
         record_details = Get-RecordDescription -Record $Record
@@ -424,7 +391,10 @@ function Write-SessionLogs {
     $sessionId = Get-ObjectIdentity -InputObject $Session
     if (-not $script:SeenSessions.Add($sessionId)) { return }
 
-    $records = Get-SessionLogRecords -Session $Session
+    # Force the function output into an array. PowerShell may unwrap a single
+    # log record into a scalar object; under StrictMode, reading .Count from
+    # that scalar can throw "The property 'Count' cannot be found".
+    $records = @(Get-SessionLogRecords -Session $Session)
 
     if ($records.Count -eq 0) {
         $synthetic = [pscustomobject]@{
@@ -459,17 +429,11 @@ function Get-RecentSessionsFromCmdlet {
         return
     }
 
-    # Get-VBRSession is special: on some Veeam builds it exposes a -Job parameter
-    # and prompts for it when called without arguments. The user environment has
-    # shown that behavior, so never call Get-VBRSession generically when -Job is
-    # available. Per-job collection in Phase 1 passes each Get-VBRJob result to it.
     if ($CmdletName -eq 'Get-VBRSession' -and (Test-CmdletHasParameter -CmdletName $CmdletName -ParameterName 'Job')) {
         Write-ProgressMessage ('  Skipped: {0} exposes -Job and will be collected per-job as Get-VBRSession -Job <job> to avoid interactive prompts.' -f $CmdletName)
         return
     }
 
-    # For all other generic cmdlets, only call them when metadata says there is
-    # a no-argument parameter set. This avoids any other "Supply values" prompt.
     if (-not (Test-CmdletCanInvokeWithoutArguments -CmdletName $CmdletName)) {
         Write-ProgressMessage ('  Skipped: {0} has mandatory parameter(s) and cannot be safely called without arguments.' -f $CmdletName)
         return
@@ -501,9 +465,6 @@ function Get-RecentJobSessions {
         return
     }
 
-    # Determine up-front whether Get-VBRSession can take -Job. If it can, always
-    # call it per-job here and skip the generic call in Phase 2. This matches
-    # Veeam versions where the cmdlet prompts for Job when called with no args.
     $vbrSessionAvail       = $null -ne (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)
     $vbrSessionHasJobParam = $vbrSessionAvail -and (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Job')
 
@@ -549,9 +510,6 @@ function Get-RecentJobSessions {
                     if ($null -ne $lastSession) { [void]$sessions.Add($lastSession) }
                 }
 
-                # Call Get-VBRSession with the actual job object from Get-VBRJob.
-                # This is the key fix for Veeam versions that prompt for Job when
-                # Get-VBRSession is invoked without arguments.
                 if ($vbrSessionHasJobParam) {
                     try {
                         Write-ProgressMessage ('    Method: Get-VBRSession -Job "{0}"' -f $job.Name)
@@ -631,21 +589,12 @@ Write-ProgressMessage ('Veeam Log Collector starting. Window: last {0} hour(s) (
 Import-VeeamPowerShell
 Write-CollectorHeader
 
-# 1. Job-centric collection: all configured backup jobs and their recent sessions.
-#    Calls Get-VBRSession -Job per-job whenever that cmdlet exposes -Job.
 Get-RecentJobSessions
 
-# 2. Public Veeam session cmdlets. These often include backup copy, replica, tape, agent,
-#    restore, and infrastructure/internal sessions depending on VBR version.
-#    Each cmdlet is inspected for mandatory parameters before calling; any cmdlet that
-#    would require interactive input is skipped automatically. Get-VBRSession is never
-#    called generically when it exposes -Job; Phase 1 already passes each job to it.
 Write-ProgressMessage 'Phase 2 — Broad session cmdlet enumeration.'
 Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRSession' -Source 'Get-VBRSession'
 Get-RecentSessionsFromCmdlet -CmdletName 'Get-VBRBackupSession' -Source 'Get-VBRBackupSession'
 
-# 3. Core session fallback. This is useful for internal processes such as SOBR/capacity-tier
-#    offload sessions that may not be attached to a user-created backup job object.
 Get-RecentCoreBackupSessions
 
 Write-ProgressMessage ('Collection complete. Unique sessions: {0}  Records emitted: {1}.' -f $script:SeenSessions.Count, $script:EmittedCount)
