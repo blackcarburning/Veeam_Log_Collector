@@ -240,7 +240,8 @@ function Invoke-VBRLogsExport {
     $exportParams = @{}
 
     # --- Resolve output/path parameter ---
-    # Common parameter names used across Veeam versions for the destination folder.
+    # Different Veeam versions expose the destination folder under different parameter
+    # names. The list below covers known variants; the first match wins.
     $pathParamCandidates = @('Path', 'Folder', 'OutputPath', 'TargetPath', 'DestinationPath',
                               'FilePath', 'ExportPath', 'Target', 'Destination', 'Directory')
     $pathParam = $pathParamCandidates | Where-Object { $availableParams -contains $_ } |
@@ -251,11 +252,16 @@ function Invoke-VBRLogsExport {
     } else {
         # Fall back to positional argument if no recognised named parameter exists.
         Write-ProgressMessage '  No recognised path parameter found; passing output path as positional argument.'
-        $exportParams['__positional_path__'] = $ResolvedOutputPath
+        $exportParams['PositionalPath'] = $ResolvedOutputPath
     }
 
     # --- Resolve time-window parameters ---
     # Prefer explicit From/To (or equivalent) date range parameters.
+    # The duration in whole hours is derived from StartTime/EndTime for use with
+    # duration-style parameters (-Last, -Hours, etc.).
+    $durationHours = [int][Math]::Ceiling(($EndTime - $StartTime).TotalHours)
+
+    # Parameter name candidates listed in rough order of likelihood per Veeam version.
     $fromParamCandidates = @('From', 'StartTime', 'StartDate', 'Since', 'After',
                               'FromDate', 'Start', 'DateFrom', 'BeginTime', 'Begin')
     $toParamCandidates   = @('To', 'EndTime', 'EndDate', 'Until', 'Before',
@@ -281,8 +287,8 @@ function Invoke-VBRLogsExport {
                          Select-Object -First 1
 
         if ($null -ne $durationParam) {
-            Write-ProgressMessage ('  Binding duration via -{0} {1}' -f $durationParam, $Hours)
-            $exportParams[$durationParam] = $Hours
+            Write-ProgressMessage ('  Binding duration via -{0} {1}' -f $durationParam, $durationHours)
+            $exportParams[$durationParam] = $durationHours
         } else {
             Write-ProgressMessage (
                 '  No time-window parameter (From/To, StartTime/EndTime, Last/Hours, etc.) ' +
@@ -296,11 +302,11 @@ function Invoke-VBRLogsExport {
     Write-ProgressMessage ('Calling Export-VBRLogs ...')
 
     try {
-        if ($exportParams.ContainsKey('__positional_path__')) {
+        if ($exportParams.ContainsKey('PositionalPath')) {
             # Positional path fallback: remove the sentinel key and pass the value as
             # the first positional argument.
-            $posPath = $exportParams['__positional_path__']
-            $exportParams.Remove('__positional_path__')
+            $posPath = $exportParams['PositionalPath']
+            $exportParams.Remove('PositionalPath')
 
             if ($exportParams.Count -gt 0) {
                 $result = Export-VBRLogs $posPath @exportParams -ErrorAction Stop
