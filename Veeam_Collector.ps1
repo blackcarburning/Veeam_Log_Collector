@@ -834,16 +834,16 @@ function Invoke-ExportForTargetSet {
     # already present.  Used for the self-healing retry path.
     $buildRetrySplat = {
         param([hashtable]$OriginalSplat)
-        $r = @{}
+        $stripped = @{}
         foreach ($k in @($OriginalSplat.Keys)) {
             if ($FromParamCandidates -notcontains $k -and $ToParamCandidates -notcontains $k) {
-                $r[$k] = $OriginalSplat[$k]
+                $stripped[$k] = $OriginalSplat[$k]
             }
         }
-        if ($null -ne $lastDaysParam -and (-not $r.ContainsKey($lastDaysParam))) {
-            $r[$lastDaysParam] = $LastDays
+        if ($null -ne $lastDaysParam -and (-not $stripped.ContainsKey($lastDaysParam))) {
+            $stripped[$lastDaysParam] = $LastDays
         }
-        $r
+        $stripped
     }
 
     Write-ProgressMessage ('Calling Export-VBRLogs using parameter set "{0}" target -{1} ({2} object(s)).' -f $SetInfo.Name, $TargetParam, $Objects.Count)
@@ -993,9 +993,10 @@ function Invoke-VBRLogsExport {
     # which is preferred over -From/-To on Veeam builds that reject the latter.
     # Rounding up intentionally provides slightly broader coverage than the exact
     # window to ensure all relevant logs fall within the exported range.
-    # Math.Abs guards against any clock skew that could make TotalHours negative.
-    $windowHours = [Math]::Abs(($EndTime - $StartTime).TotalHours)
-    $lastDays    = [Math]::Max(1, [int][Math]::Ceiling($windowHours / 24.0))
+    # $StartTime is always before $EndTime here: it is computed as
+    # $EndTime.AddHours(-$Hours) where $Hours is [ValidateRange(1, 8760)].
+    $windowHours = ($EndTime - $StartTime).TotalHours
+    $lastDays    = [Math]::Max(1, [int][Math]::Ceiling($windowHours / 24.0))  # 24 hours per day
 
     # --- Job export ---
     $jobSet = $candidateSets | Where-Object { $_.TargetParam -eq 'Job' } | Select-Object -First 1
