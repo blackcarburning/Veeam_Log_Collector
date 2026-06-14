@@ -938,19 +938,14 @@ function Remove-OldCollectorExports {
         [int]$RetentionDays = 2
     )
 
-    if ([string]::IsNullOrWhiteSpace($CollectorPath)) {
-        Write-ProgressMessage '  Cleanup skipped: no collector path provided.'
-        return
-    }
-
     if (-not (Test-Path -LiteralPath $CollectorPath -PathType Container)) {
         Write-ProgressMessage ('  Cleanup skipped: collector path does not exist: {0}' -f $CollectorPath)
         return
     }
 
-    $cutoff  = (Get-Date).AddDays(-$RetentionDays)
-    $removed = 0
-    $skipped = 0
+    $cutoff   = (Get-Date).AddDays(-$RetentionDays)
+    $removed  = 0
+    $retained = 0
 
     Write-ProgressMessage ('  Cleanup: removing items in ''{0}'' older than {1} day(s) (cutoff: {2:o}).' `
         -f $CollectorPath, $RetentionDays, $cutoff)
@@ -969,15 +964,15 @@ function Remove-OldCollectorExports {
                 $removed++
             } catch {
                 Write-Warning ('Cleanup: failed to remove ''{0}'': {1}' -f $child.FullName, $_.Exception.Message)
-                $skipped++
+                $retained++
             }
         } else {
-            $skipped++
+            $retained++
         }
     }
 
     Write-ProgressMessage ('  Cleanup complete: {0} item(s) removed, {1} item(s) retained/skipped.' `
-        -f $removed, $skipped)
+        -f $removed, $retained)
 }
 
 
