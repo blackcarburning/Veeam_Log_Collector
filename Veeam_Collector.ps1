@@ -787,7 +787,10 @@ function Invoke-ExportForTargetSet {
         [Parameter(Mandatory)] [ref]$ExportedItems
     )
 
-    if ($Objects.Count -eq 0) { return }
+    if ($Objects.Count -eq 0) {
+        Write-ProgressMessage ('Skipping Export-VBRLogs -{0}: object collection is empty.' -f $TargetParam)
+        return
+    }
 
     $setParamKeys = @($SetInfo.ParameterKeys)
     $pathParam = $PathParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
@@ -1004,7 +1007,7 @@ function Invoke-VBRLogsExport {
     }
 
     if ($successfulExports -eq 0) {
-        throw 'Export-VBRLogs failed for all attempted target types.'
+        throw ('Export-VBRLogs failed for all attempted target types ({0} attempt(s)).' -f $attemptedExports)
     }
 
     Write-ProgressMessage ('Export-VBRLogs completed: {0} successful call(s) out of {1} attempt(s).' -f $successfulExports, $attemptedExports)
@@ -1156,15 +1159,15 @@ if ([string]::IsNullOrWhiteSpace($resolvedOutputPath)) {
 Write-ProgressMessage ('Output path : {0}' -f $resolvedOutputPath)
 
 $exportResult = $null
-$exportWarningMessage = $null
+$exportFailureMessage = $null
 try {
     $exportResult = Invoke-VBRLogsExport `
         -StartTime          $script:StartTime `
         -EndTime            $script:EndTime `
         -ResolvedOutputPath $resolvedOutputPath
 } catch {
-    $exportWarningMessage = ('Export phase warning: {0}' -f $_.Exception.Message)
-    Write-Warning $exportWarningMessage
+    $exportFailureMessage = ('Export phase warning: {0}' -f $_.Exception.Message)
+    Write-Warning $exportFailureMessage
 }
 
 $exportedPaths = Collect-ExportedPaths -ExportResult $exportResult -ResolvedOutputPath $resolvedOutputPath
@@ -1175,7 +1178,7 @@ $exportedPaths = Collect-ExportedPaths -ExportResult $exportResult -ResolvedOutp
 if ($Json) {
     $summary = [ordered]@{
         record_type = 'export_summary'
-        status      = if ($null -eq $exportWarningMessage) { 'success' } else { 'warning' }
+        status      = if ($null -eq $exportFailureMessage) { 'success' } else { 'warning' }
         hours       = $Hours
         start_time  = $script:StartTime.ToString('o')
         end_time    = $script:EndTime.ToString('o')
@@ -1184,8 +1187,8 @@ if ($Json) {
         sessions_seen    = $script:SeenSessions.Count
         records_emitted  = $script:EmittedCount
     }
-    if ($null -ne $exportWarningMessage) {
-        $summary['export_warning'] = $exportWarningMessage
+    if ($null -ne $exportFailureMessage) {
+        $summary['export_warning'] = $exportFailureMessage
     }
     [pscustomobject]$summary | ConvertTo-Json -Compress -Depth 4
 } else {
