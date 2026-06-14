@@ -174,7 +174,8 @@ function Import-VeeamPowerShell {
     [CmdletBinding()]
     param()
 
-    Write-ProgressMessage ('PowerShell {0} {1} on host: {2}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion, $env:COMPUTERNAME)
+    $psEdition = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
+    Write-ProgressMessage ('PowerShell {0} {1} on host: {2}' -f $psEdition, $PSVersionTable.PSVersion, $env:COMPUTERNAME)
 
     $loaded = $false
 
@@ -921,7 +922,8 @@ function Write-CollectorHeader {
     Write-Output 'Veeam Log Collector'
     Write-Output ('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime)
     Write-Output ('Host       : {0}' -f $env:COMPUTERNAME)
-    Write-Output ('PowerShell : {0} {1}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion)
+    $psEdition = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
+    Write-Output ('PowerShell : {0} {1}' -f $psEdition, $PSVersionTable.PSVersion)
     Write-Output '============================================================'
     Write-Output ''
 }
