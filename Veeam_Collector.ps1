@@ -595,7 +595,7 @@ function Get-RecentJobSessions {
     }
 
     try {
-        $jobs = @(Get-VBRJob -ErrorAction Stop)
+        $jobs = @(Get-VBRJob -ErrorAction Stop -WarningAction SilentlyContinue)
         Write-ProgressMessage ('  Found {0} job(s).' -f $jobs.Count)
 
         $jobIndex = 0
@@ -634,7 +634,7 @@ function Get-RecentComputerBackupJobSessions {
     Write-ProgressMessage '  Get-VBRComputerBackupJob is available.'
 
     try {
-        $computerJobs = @(Get-VBRComputerBackupJob -ErrorAction Stop)
+        $computerJobs = @(Get-VBRComputerBackupJob -ErrorAction Stop -WarningAction SilentlyContinue)
         Write-ProgressMessage ('  Found {0} computer backup job(s).' -f $computerJobs.Count)
 
         $jobIndex = 0
