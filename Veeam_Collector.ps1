@@ -376,7 +376,9 @@ function Get-LastErrorText {
                 $taskResultProp = $task.PSObject.Properties['Result']
                 if ($null -ne $taskResultProp) { $taskResult = [string]$taskResultProp.Value }
                 $taskStateProp = $task.PSObject.Properties['State']
-                if ($null -ne $taskStateProp) { $taskResult = [string]$taskStateProp.Value }
+                if ($null -ne $taskStateProp -and [string]::IsNullOrWhiteSpace($taskResult)) {
+                    $taskResult = [string]$taskStateProp.Value
+                }
 
                 $isBad = $taskResult -imatch 'Failed|Warning|Error'
                 if (-not $isBad) { continue }
@@ -734,14 +736,6 @@ $filtered = if ($OnlyFailures) {
 # ---------------------------------------------------------------------------
 # Sort: Failed first (0), Warning (1), other (2); then end_time descending.
 # ---------------------------------------------------------------------------
-$sorted = @($filtered | Sort-Object -Property {
-    Get-ResultSeverityOrder -Result $_.result
-}, {
-    if ($null -ne $_.end_time) { [datetime]$_.end_time } else { [datetime]::MinValue }
-} -Descending:$false)
-# Note: Sort-Object does not support per-key descending in PS 5.1; apply secondary sort manually.
-# We want severity ascending (0,1,2) and within each group end_time descending.
-# Achieve this by composing a single comparable key.
 $sorted = @($filtered | Sort-Object -Property @(
     @{ Expression = { Get-ResultSeverityOrder -Result $_.result }; Descending = $false },
     @{ Expression = {
