@@ -765,6 +765,84 @@ function Resolve-ExportOutputPath {
 }
 
 # ---------------------------------------------------------------------------
+# Invoke-ExportForTargetSet
+#   Executes Export-VBRLogs for a specific target parameter set. Supports
+#   optional per-object fallback when a batched call fails.
+# ---------------------------------------------------------------------------
+function Invoke-ExportForTargetSet {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$TargetParam,
+        [Parameter(Mandatory)] [object[]]$Objects,
+        [Parameter(Mandatory)] [object]$SetInfo,
+        [Parameter(Mandatory)] [string]$ResolvedOutputPath,
+        [Parameter(Mandatory)] [datetime]$StartTime,
+        [Parameter(Mandatory)] [datetime]$EndTime,
+        [Parameter(Mandatory)] [string[]]$PathParamCandidates,
+        [Parameter(Mandatory)] [string[]]$FromParamCandidates,
+        [Parameter(Mandatory)] [string[]]$ToParamCandidates,
+        [switch]$FallbackPerObject,
+        [Parameter(Mandatory)] [ref]$AttemptedExports,
+        [Parameter(Mandatory)] [ref]$SuccessfulExports,
+        [Parameter(Mandatory)] [ref]$ExportedItems
+    )
+
+    if ($Objects.Count -eq 0) { return }
+
+    $setParamKeys = @($SetInfo.ParameterKeys)
+    $pathParam = $PathParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+    if ($null -eq $pathParam) {
+        Write-Warning ('Skipping Export-VBRLogs {0} set: no recognised path parameter in this set.' -f $SetInfo.Name)
+        return
+    }
+
+    $fromParam = $FromParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+    $toParam   = $ToParamCandidates   | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+
+    Write-ProgressMessage ('Calling Export-VBRLogs using parameter set "{0}" target -{1} ({2} object(s)).' -f $SetInfo.Name, $TargetParam, $Objects.Count)
+    $AttemptedExports.Value++
+
+    try {
+        $splat = @{}
+        $splat[$TargetParam] = @($Objects)
+        $splat[$pathParam] = $ResolvedOutputPath
+        if ($null -ne $fromParam) { $splat[$fromParam] = $StartTime }
+        if ($null -ne $toParam)   { $splat[$toParam]   = $EndTime }
+        if ($setParamKeys -contains 'Wait') { $splat['Wait'] = $true }
+
+        $result = Export-VBRLogs @splat -ErrorAction Stop
+        foreach ($item in @($result)) { [void]$ExportedItems.Value.Add($item) }
+        $SuccessfulExports.Value++
+        Write-ProgressMessage ('Export-VBRLogs succeeded for -{0} ({1} object(s)).' -f $TargetParam, $Objects.Count)
+    } catch {
+        Write-Warning ('Export-VBRLogs failed for -{0} ({1} object(s)): {2}' -f $TargetParam, $Objects.Count, $_.Exception.Message)
+        if ($FallbackPerObject -and $Objects.Count -gt 1) {
+            Write-ProgressMessage ('Falling back to per-object Export-VBRLogs calls for -{0} ...' -f $TargetParam)
+            $index = 0
+            foreach ($objectItem in $Objects) {
+                $index++
+                Write-ProgressMessage ('  -{0} item {1}/{2}' -f $TargetParam, $index, $Objects.Count)
+                $AttemptedExports.Value++
+                try {
+                    $perSplat = @{}
+                    $perSplat[$TargetParam] = $objectItem
+                    $perSplat[$pathParam] = $ResolvedOutputPath
+                    if ($null -ne $fromParam) { $perSplat[$fromParam] = $StartTime }
+                    if ($null -ne $toParam)   { $perSplat[$toParam]   = $EndTime }
+                    if ($setParamKeys -contains 'Wait') { $perSplat['Wait'] = $true }
+
+                    $perResult = Export-VBRLogs @perSplat -ErrorAction Stop
+                    foreach ($item in @($perResult)) { [void]$ExportedItems.Value.Add($item) }
+                    $SuccessfulExports.Value++
+                } catch {
+                    Write-Warning ('  Export-VBRLogs failed for -{0} item {1}/{2}: {3}' -f $TargetParam, $index, $Objects.Count, $_.Exception.Message)
+                }
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Invoke-VBRLogsExport
 #   Validates that Export-VBRLogs is available, introspects its parameters at
 #   runtime, and calls it with the appropriate time-window and path bindings
@@ -827,70 +905,6 @@ function Invoke-VBRLogsExport {
     $toParamCandidates   = @('To', 'EndTime', 'EndDate', 'Until', 'Before',
                               'ToDate', 'End', 'DateTo', 'StopTime', 'Finish')
 
-    function Invoke-ExportForTarget {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory)] [string]$TargetParam,
-            [Parameter(Mandatory)] [object[]]$Objects,
-            [Parameter(Mandatory)] [object]$SetInfo,
-            [switch]$FallbackPerObject
-        )
-
-        if ($Objects.Count -eq 0) { return }
-
-        $setParamKeys = @($SetInfo.ParameterKeys)
-        $pathParam = $pathParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
-        if ($null -eq $pathParam) {
-            Write-Warning ('Skipping Export-VBRLogs {0} set: no recognised path parameter in this set.' -f $SetInfo.Name)
-            return
-        }
-
-        $buildSplat = {
-            param([object]$targetValue)
-            $splat = @{}
-            $splat[$TargetParam] = $targetValue
-            $splat[$pathParam] = $ResolvedOutputPath
-
-            $fromParam = $fromParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
-            $toParam   = $toParamCandidates   | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
-
-            if ($null -ne $fromParam) { $splat[$fromParam] = $StartTime }
-            if ($null -ne $toParam)   { $splat[$toParam]   = $EndTime }
-            if ($setParamKeys -contains 'Wait') { $splat['Wait'] = $true }
-            return $splat
-        }
-
-        Write-ProgressMessage ('Calling Export-VBRLogs using parameter set "{0}" target -{1} ({2} object(s)).' -f $SetInfo.Name, $TargetParam, $Objects.Count)
-        $attemptedExports++
-
-        try {
-            $splat = & $buildSplat -targetValue @($Objects)
-            $result = Export-VBRLogs @splat -ErrorAction Stop
-            foreach ($item in @($result)) { $exportedItems.Add($item) }
-            $successfulExports++
-            Write-ProgressMessage ('Export-VBRLogs succeeded for -{0} ({1} object(s)).' -f $TargetParam, $Objects.Count)
-        } catch {
-            Write-Warning ('Export-VBRLogs failed for -{0} ({1} object(s)): {2}' -f $TargetParam, $Objects.Count, $_.Exception.Message)
-            if ($FallbackPerObject -and $Objects.Count -gt 1) {
-                Write-ProgressMessage ('Falling back to per-object Export-VBRLogs calls for -{0} ...' -f $TargetParam)
-                $index = 0
-                foreach ($objectItem in $Objects) {
-                    $index++
-                    Write-ProgressMessage ('  -{0} item {1}/{2}' -f $TargetParam, $index, $Objects.Count)
-                    $attemptedExports++
-                    try {
-                        $perSplat = & $buildSplat -targetValue $objectItem
-                        $perResult = Export-VBRLogs @perSplat -ErrorAction Stop
-                        foreach ($item in @($perResult)) { $exportedItems.Add($item) }
-                        $successfulExports++
-                    } catch {
-                        Write-Warning ('  Export-VBRLogs failed for -{0} item {1}/{2}: {3}' -f $TargetParam, $index, $Objects.Count, $_.Exception.Message)
-                    }
-                }
-            }
-        }
-    }
-
     # --- Job export ---
     $jobSet = $candidateSets | Where-Object { $_.TargetParam -eq 'Job' } | Select-Object -First 1
     if ($null -ne $jobSet) {
@@ -902,7 +916,10 @@ function Invoke-VBRLogsExport {
                 if ($jobs.Count -eq 0) {
                     Write-ProgressMessage 'Skipping Export-VBRLogs -Job: no jobs returned by Get-VBRJob.'
                 } else {
-                    Invoke-ExportForTarget -TargetParam 'Job' -Objects $jobs -SetInfo $jobSet -FallbackPerObject
+                    Invoke-ExportForTargetSet -TargetParam 'Job' -Objects $jobs -SetInfo $jobSet `
+                        -ResolvedOutputPath $ResolvedOutputPath -StartTime $StartTime -EndTime $EndTime `
+                        -PathParamCandidates $pathParamCandidates -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
+                        -FallbackPerObject -AttemptedExports ([ref]$attemptedExports) -SuccessfulExports ([ref]$successfulExports) -ExportedItems ([ref]$exportedItems)
                 }
             } catch {
                 Write-Warning ('Skipping Export-VBRLogs -Job: unable to enumerate jobs: {0}' -f $_.Exception.Message)
@@ -925,7 +942,10 @@ function Invoke-VBRLogsExport {
                 if ($compatibleServers.Count -eq 0) {
                     Write-ProgressMessage ('Skipping Export-VBRLogs -Server: no compatible server objects found (expected type: {0}).' -f $serverType.FullName)
                 } else {
-                    Invoke-ExportForTarget -TargetParam 'Server' -Objects $compatibleServers -SetInfo $serverSet
+                    Invoke-ExportForTargetSet -TargetParam 'Server' -Objects $compatibleServers -SetInfo $serverSet `
+                        -ResolvedOutputPath $ResolvedOutputPath -StartTime $StartTime -EndTime $EndTime `
+                        -PathParamCandidates $pathParamCandidates -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
+                        -AttemptedExports ([ref]$attemptedExports) -SuccessfulExports ([ref]$successfulExports) -ExportedItems ([ref]$exportedItems)
                 }
             } catch {
                 Write-Warning ('Skipping Export-VBRLogs -Server: unable to enumerate servers: {0}' -f $_.Exception.Message)
@@ -938,10 +958,8 @@ function Invoke-VBRLogsExport {
     # --- Discovered computer export ---
     $computerSet = $candidateSets | Where-Object { $_.TargetParam -eq 'Computer' } | Select-Object -First 1
     if ($null -ne $computerSet) {
-        $discoveredComputerCmdlets = @(
-            Get-Command -Name 'Get-VBRDiscoveredComputer' -ErrorAction SilentlyContinue
-            Get-Command -Name 'Get-VBR*Discovered*Computer*' -ErrorAction SilentlyContinue
-        ) | Where-Object { $null -ne $_ } | Sort-Object -Property Name -Unique
+        $discoveredComputerCmdlets = @(Get-Command -Name 'Get-VBR*Discovered*Computer*' -ErrorAction SilentlyContinue) |
+            Where-Object { $null -ne $_ } | Sort-Object -Property Name -Unique
 
         if ($discoveredComputerCmdlets.Count -eq 0) {
             Write-ProgressMessage 'Skipping Export-VBRLogs -Computer: no discovered-computer cmdlet is available.'
@@ -970,7 +988,10 @@ function Invoke-VBRLogsExport {
             if ($compatibleDiscoveredComputers.Count -eq 0) {
                 Write-ProgressMessage ('Skipping Export-VBRLogs -Computer: no compatible discovered computer objects found (expected type: {0}).' -f $computerType.FullName)
             } else {
-                Invoke-ExportForTarget -TargetParam 'Computer' -Objects @($compatibleDiscoveredComputers.ToArray()) -SetInfo $computerSet
+                Invoke-ExportForTargetSet -TargetParam 'Computer' -Objects @($compatibleDiscoveredComputers.ToArray()) -SetInfo $computerSet `
+                    -ResolvedOutputPath $ResolvedOutputPath -StartTime $StartTime -EndTime $EndTime `
+                    -PathParamCandidates $pathParamCandidates -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
+                    -AttemptedExports ([ref]$attemptedExports) -SuccessfulExports ([ref]$successfulExports) -ExportedItems ([ref]$exportedItems)
             }
         }
     } else {
