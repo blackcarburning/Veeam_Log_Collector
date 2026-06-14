@@ -827,7 +827,7 @@ function Invoke-ExportForTargetSet {
 
     # Regex that matches the "From and To parameters are not supported" runtime
     # error emitted by some Veeam builds that still declare -From/-To in metadata.
-    $fromToRejectedPattern = 'From\s*(and|[/&])\s*To\s*parameters?\s*(are\s*)?not\s*supported'
+    $fromToRejectedPattern = 'From\s*(and|[/&])\s*To\s*parameters?\s*are\s*not\s*supported'
 
     # Helper: return a copy of the given splat with all -From/-To keys removed,
     # and with -LastDays added if the parameter set exposes it and it is not
@@ -993,7 +993,8 @@ function Invoke-VBRLogsExport {
     # which is preferred over -From/-To on Veeam builds that reject the latter.
     # Rounding up intentionally provides slightly broader coverage than the exact
     # window to ensure all relevant logs fall within the exported range.
-    $windowHours = ($EndTime - $StartTime).TotalHours
+    # Math.Abs guards against any clock skew that could make TotalHours negative.
+    $windowHours = [Math]::Abs(($EndTime - $StartTime).TotalHours)
     $lastDays    = [Math]::Max(1, [int][Math]::Ceiling($windowHours / 24.0))
 
     # --- Job export ---
