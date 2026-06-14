@@ -82,6 +82,15 @@
         If neither loading path succeeds under PS 5.1, the error message includes the
         exact command to re-run using pwsh.exe (PowerShell 7).
 
+    Export-VBRLogs time-window behavior:
+      - -LastDays is preferred over -From/-To because some Veeam builds declare
+        -From/-To in their parameter metadata but reject them at runtime with
+        "From and To parameters are not supported".  The script detects -LastDays
+        on each parameter set and uses it instead.  -From/-To are only sent as a
+        fallback when -LastDays is absent.  If -From/-To are still rejected, the
+        script automatically retries without any time-window parameters rather
+        than failing the export entirely.
+
     Run requirements:
       Run in an elevated PowerShell session on the Veeam Backup & Replication server
       or a host with the Veeam console/PowerShell components installed.
@@ -768,6 +777,14 @@ function Resolve-ExportOutputPath {
 # Invoke-ExportForTargetSet
 #   Executes Export-VBRLogs for a specific target parameter set. Supports
 #   optional per-object fallback when a batched call fails.
+#
+#   Time-window preference: -LastDays is used when the parameter set exposes it
+#   because some Veeam builds declare -From/-To in their parameter metadata but
+#   reject them at runtime.  -From/-To are only bound as a fallback when -LastDays
+#   is absent from the parameter set.  If Export-VBRLogs throws "From and To
+#   parameters are not supported", the call is automatically retried without
+#   -From/-To (using -LastDays when available, or with no time-window filter) so
+#   the script self-heals across Veeam versions.
 # ---------------------------------------------------------------------------
 function Invoke-ExportForTargetSet {
     [CmdletBinding()]
@@ -778,7 +795,9 @@ function Invoke-ExportForTargetSet {
         [Parameter(Mandatory)] [string]$ResolvedOutputPath,
         [Parameter(Mandatory)] [datetime]$StartTime,
         [Parameter(Mandatory)] [datetime]$EndTime,
+        [Parameter(Mandatory)] [int]$LastDays,
         [Parameter(Mandatory)] [string[]]$PathParamCandidates,
+        [Parameter(Mandatory)] [string[]]$LastDaysParamCandidates,
         [Parameter(Mandatory)] [string[]]$FromParamCandidates,
         [Parameter(Mandatory)] [string[]]$ToParamCandidates,
         [switch]$FallbackPerObject,
@@ -792,15 +811,19 @@ function Invoke-ExportForTargetSet {
         return
     }
 
-    $setParamKeys = @($SetInfo.ParameterKeys)
-    $pathParam = $PathParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+    $setParamKeys  = @($SetInfo.ParameterKeys)
+    $pathParam     = $PathParamCandidates     | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
     if ($null -eq $pathParam) {
         Write-Warning ('Skipping Export-VBRLogs {0} set: no recognised path parameter in this set.' -f $SetInfo.Name)
         return
     }
 
-    $fromParam = $FromParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
-    $toParam   = $ToParamCandidates   | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+    # Detect time-window parameters. -LastDays is preferred because some Veeam
+    # builds declare -From/-To but reject them at runtime; -From/-To are used only
+    # as a fallback when -LastDays is absent from the parameter set.
+    $lastDaysParam = $LastDaysParamCandidates | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+    $fromParam     = $FromParamCandidates     | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
+    $toParam       = $ToParamCandidates       | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
 
     Write-ProgressMessage ('Calling Export-VBRLogs using parameter set "{0}" target -{1} ({2} object(s)).' -f $SetInfo.Name, $TargetParam, $Objects.Count)
     $AttemptedExports.Value++
@@ -808,15 +831,40 @@ function Invoke-ExportForTargetSet {
     try {
         $splat = @{}
         $splat[$TargetParam] = @($Objects)
-        $splat[$pathParam] = $ResolvedOutputPath
-        if ($null -ne $fromParam) { $splat[$fromParam] = $StartTime }
-        if ($null -ne $toParam)   { $splat[$toParam]   = $EndTime }
+        $splat[$pathParam]   = $ResolvedOutputPath
+        if ($null -ne $lastDaysParam) {
+            $splat[$lastDaysParam] = $LastDays
+        } else {
+            if ($null -ne $fromParam) { $splat[$fromParam] = $StartTime }
+            if ($null -ne $toParam)   { $splat[$toParam]   = $EndTime }
+        }
         if ($setParamKeys -contains 'Wait') { $splat['Wait'] = $true }
 
-        $result = Export-VBRLogs @splat -ErrorAction Stop
-        foreach ($item in @($result)) { [void]$ExportedItems.Value.Add($item) }
-        $SuccessfulExports.Value++
-        Write-ProgressMessage ('Export-VBRLogs succeeded for -{0} ({1} object(s)).' -f $TargetParam, $Objects.Count)
+        try {
+            $result = Export-VBRLogs @splat -ErrorAction Stop
+            foreach ($item in @($result)) { [void]$ExportedItems.Value.Add($item) }
+            $SuccessfulExports.Value++
+            Write-ProgressMessage ('Export-VBRLogs succeeded for -{0} ({1} object(s)).' -f $TargetParam, $Objects.Count)
+        } catch {
+            if ($_.Exception.Message -imatch 'From\s*(and|[/&])\s*To\s*parameters?\s*(are\s*)?not\s*supported') {
+                Write-ProgressMessage ('Export-VBRLogs rejected -From/-To for -{0}; retrying without time-window parameters.' -f $TargetParam)
+                $retrySplat = @{}
+                foreach ($k in @($splat.Keys)) {
+                    if ($FromParamCandidates -notcontains $k -and $ToParamCandidates -notcontains $k) {
+                        $retrySplat[$k] = $splat[$k]
+                    }
+                }
+                if ($null -ne $lastDaysParam -and (-not $retrySplat.ContainsKey($lastDaysParam))) {
+                    $retrySplat[$lastDaysParam] = $LastDays
+                }
+                $result = Export-VBRLogs @retrySplat -ErrorAction Stop
+                foreach ($item in @($result)) { [void]$ExportedItems.Value.Add($item) }
+                $SuccessfulExports.Value++
+                Write-ProgressMessage ('Export-VBRLogs succeeded for -{0} ({1} object(s)) after retrying without -From/-To.' -f $TargetParam, $Objects.Count)
+            } else {
+                throw
+            }
+        }
     } catch {
         Write-Warning ('Export-VBRLogs failed for -{0} ({1} object(s)): {2}' -f $TargetParam, $Objects.Count, $_.Exception.Message)
         if ($FallbackPerObject -and $Objects.Count -gt 1) {
@@ -829,14 +877,38 @@ function Invoke-ExportForTargetSet {
                 try {
                     $perSplat = @{}
                     $perSplat[$TargetParam] = $objectItem
-                    $perSplat[$pathParam] = $ResolvedOutputPath
-                    if ($null -ne $fromParam) { $perSplat[$fromParam] = $StartTime }
-                    if ($null -ne $toParam)   { $perSplat[$toParam]   = $EndTime }
+                    $perSplat[$pathParam]   = $ResolvedOutputPath
+                    if ($null -ne $lastDaysParam) {
+                        $perSplat[$lastDaysParam] = $LastDays
+                    } else {
+                        if ($null -ne $fromParam) { $perSplat[$fromParam] = $StartTime }
+                        if ($null -ne $toParam)   { $perSplat[$toParam]   = $EndTime }
+                    }
                     if ($setParamKeys -contains 'Wait') { $perSplat['Wait'] = $true }
 
-                    $perResult = Export-VBRLogs @perSplat -ErrorAction Stop
-                    foreach ($item in @($perResult)) { [void]$ExportedItems.Value.Add($item) }
-                    $SuccessfulExports.Value++
+                    try {
+                        $perResult = Export-VBRLogs @perSplat -ErrorAction Stop
+                        foreach ($item in @($perResult)) { [void]$ExportedItems.Value.Add($item) }
+                        $SuccessfulExports.Value++
+                    } catch {
+                        if ($_.Exception.Message -imatch 'From\s*(and|[/&])\s*To\s*parameters?\s*(are\s*)?not\s*supported') {
+                            Write-ProgressMessage ('  Export-VBRLogs rejected -From/-To for -{0} item {1}/{2}; retrying without time-window parameters.' -f $TargetParam, $index, $Objects.Count)
+                            $perRetrySplat = @{}
+                            foreach ($k in @($perSplat.Keys)) {
+                                if ($FromParamCandidates -notcontains $k -and $ToParamCandidates -notcontains $k) {
+                                    $perRetrySplat[$k] = $perSplat[$k]
+                                }
+                            }
+                            if ($null -ne $lastDaysParam -and (-not $perRetrySplat.ContainsKey($lastDaysParam))) {
+                                $perRetrySplat[$lastDaysParam] = $LastDays
+                            }
+                            $perResult = Export-VBRLogs @perRetrySplat -ErrorAction Stop
+                            foreach ($item in @($perResult)) { [void]$ExportedItems.Value.Add($item) }
+                            $SuccessfulExports.Value++
+                        } else {
+                            throw
+                        }
+                    }
                 } catch {
                     Write-Warning ('  Export-VBRLogs failed for -{0} item {1}/{2}: {3}' -f $TargetParam, $index, $Objects.Count, $_.Exception.Message)
                 }
@@ -849,7 +921,9 @@ function Invoke-ExportForTargetSet {
 # Invoke-VBRLogsExport
 #   Validates that Export-VBRLogs is available, introspects its parameters at
 #   runtime, and calls it with the appropriate time-window and path bindings
-#   for the installed Veeam PowerShell version.
+#   for the installed Veeam PowerShell version.  -LastDays is preferred for the
+#   time window; -From/-To are only used as a fallback because some Veeam builds
+#   declare those parameters but reject them at runtime.
 # ---------------------------------------------------------------------------
 function Invoke-VBRLogsExport {
     [CmdletBinding()]
@@ -907,6 +981,13 @@ function Invoke-VBRLogsExport {
                               'FromDate', 'Start', 'DateFrom', 'BeginTime', 'Begin')
     $toParamCandidates   = @('To', 'EndTime', 'EndDate', 'Until', 'Before',
                               'ToDate', 'End', 'DateTo', 'StopTime', 'Finish')
+    $lastDaysParamCandidates = @('LastDays', 'Days', 'DaysBack', 'RecentDays')
+
+    # Compute the time window in whole days, rounding up; minimum 1.
+    # Passed to Export-VBRLogs as -LastDays when that parameter is available,
+    # which is preferred over -From/-To on Veeam builds that reject the latter.
+    $windowHours = ($EndTime - $StartTime).TotalHours
+    $lastDays    = [Math]::Max(1, [int][Math]::Ceiling($windowHours / 24.0))
 
     # --- Job export ---
     $jobSet = $candidateSets | Where-Object { $_.TargetParam -eq 'Job' } | Select-Object -First 1
@@ -921,7 +1002,9 @@ function Invoke-VBRLogsExport {
                 } else {
                     Invoke-ExportForTargetSet -TargetParam 'Job' -Objects $jobs -SetInfo $jobSet `
                         -ResolvedOutputPath $ResolvedOutputPath -StartTime $StartTime -EndTime $EndTime `
-                        -PathParamCandidates $pathParamCandidates -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
+                        -LastDays $lastDays -PathParamCandidates $pathParamCandidates `
+                        -LastDaysParamCandidates $lastDaysParamCandidates `
+                        -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
                         -FallbackPerObject -AttemptedExports ([ref]$attemptedExports) -SuccessfulExports ([ref]$successfulExports) -ExportedItems ([ref]$exportedItems)
                 }
             } catch {
@@ -947,7 +1030,9 @@ function Invoke-VBRLogsExport {
                 } else {
                     Invoke-ExportForTargetSet -TargetParam 'Server' -Objects $compatibleServers -SetInfo $serverSet `
                         -ResolvedOutputPath $ResolvedOutputPath -StartTime $StartTime -EndTime $EndTime `
-                        -PathParamCandidates $pathParamCandidates -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
+                        -LastDays $lastDays -PathParamCandidates $pathParamCandidates `
+                        -LastDaysParamCandidates $lastDaysParamCandidates `
+                        -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
                         -AttemptedExports ([ref]$attemptedExports) -SuccessfulExports ([ref]$successfulExports) -ExportedItems ([ref]$exportedItems)
                 }
             } catch {
@@ -993,7 +1078,9 @@ function Invoke-VBRLogsExport {
             } else {
                 Invoke-ExportForTargetSet -TargetParam 'Computer' -Objects @($compatibleDiscoveredComputers.ToArray()) -SetInfo $computerSet `
                     -ResolvedOutputPath $ResolvedOutputPath -StartTime $StartTime -EndTime $EndTime `
-                    -PathParamCandidates $pathParamCandidates -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
+                    -LastDays $lastDays -PathParamCandidates $pathParamCandidates `
+                    -LastDaysParamCandidates $lastDaysParamCandidates `
+                    -FromParamCandidates $fromParamCandidates -ToParamCandidates $toParamCandidates `
                     -AttemptedExports ([ref]$attemptedExports) -SuccessfulExports ([ref]$successfulExports) -ExportedItems ([ref]$exportedItems)
             }
         }
