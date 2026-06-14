@@ -469,9 +469,9 @@ function Get-LastErrorText {
 function Get-ResultSeverityOrder {
     [CmdletBinding()]
     param([string]$Result)
-    if ($Result -imatch 'Failed|Fail|Error') { return 0 }
-    if ($Result -imatch 'Warning|Warn')      { return 1 }
-    return 2
+    if ($Result -imatch 'Failed|Fail|Error') { return [int]0 }
+    if ($Result -imatch 'Warning|Warn')      { return [int]1 }
+    return [int]2
 }
 
 # ---------------------------------------------------------------------------
@@ -737,9 +737,21 @@ $filtered = if ($OnlyFailures) {
 # Sort: Failed first (0), Warning (1), other (2); then end_time descending.
 # ---------------------------------------------------------------------------
 $sorted = @($filtered | Sort-Object -Property @(
-    @{ Expression = { Get-ResultSeverityOrder -Result $_.result }; Descending = $false },
+    @{ Expression = { [int](Get-ResultSeverityOrder -Result $_.result) }; Descending = $false },
     @{ Expression = {
-        if ($null -ne $_.end_time) { [datetime]$_.end_time } else { [datetime]::MinValue }
+        $endValue = $_.end_time
+        if ([string]::IsNullOrWhiteSpace([string]$endValue)) {
+            [long]0
+        } elseif ($endValue -is [datetime]) {
+            [long]$endValue.Ticks
+        } else {
+            try {
+                $parsedDate = [datetime]::Parse([string]$endValue, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                [long]$parsedDate.Ticks
+            } catch {
+                [long]0
+            }
+        }
     }; Descending = $true }
 ))
 
