@@ -825,6 +825,27 @@ function Invoke-ExportForTargetSet {
     $fromParam     = $FromParamCandidates     | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
     $toParam       = $ToParamCandidates       | Where-Object { $setParamKeys -contains $_ } | Select-Object -First 1
 
+    # Regex that matches the "From and To parameters are not supported" runtime
+    # error emitted by some Veeam builds that still declare -From/-To in metadata.
+    $fromToRejectedPattern = 'From\s*(and|[/&])\s*To\s*parameters?\s*(are\s*)?not\s*supported'
+
+    # Helper: return a copy of the given splat with all -From/-To keys removed,
+    # and with -LastDays added if the parameter set exposes it and it is not
+    # already present.  Used for the self-healing retry path.
+    $buildRetrySplat = {
+        param([hashtable]$OriginalSplat)
+        $r = @{}
+        foreach ($k in @($OriginalSplat.Keys)) {
+            if ($FromParamCandidates -notcontains $k -and $ToParamCandidates -notcontains $k) {
+                $r[$k] = $OriginalSplat[$k]
+            }
+        }
+        if ($null -ne $lastDaysParam -and (-not $r.ContainsKey($lastDaysParam))) {
+            $r[$lastDaysParam] = $LastDays
+        }
+        $r
+    }
+
     Write-ProgressMessage ('Calling Export-VBRLogs using parameter set "{0}" target -{1} ({2} object(s)).' -f $SetInfo.Name, $TargetParam, $Objects.Count)
     $AttemptedExports.Value++
 
@@ -846,17 +867,9 @@ function Invoke-ExportForTargetSet {
             $SuccessfulExports.Value++
             Write-ProgressMessage ('Export-VBRLogs succeeded for -{0} ({1} object(s)).' -f $TargetParam, $Objects.Count)
         } catch {
-            if ($_.Exception.Message -imatch 'From\s*(and|[/&])\s*To\s*parameters?\s*(are\s*)?not\s*supported') {
+            if ($_.Exception.Message -imatch $fromToRejectedPattern) {
                 Write-ProgressMessage ('Export-VBRLogs rejected -From/-To for -{0}; retrying without time-window parameters.' -f $TargetParam)
-                $retrySplat = @{}
-                foreach ($k in @($splat.Keys)) {
-                    if ($FromParamCandidates -notcontains $k -and $ToParamCandidates -notcontains $k) {
-                        $retrySplat[$k] = $splat[$k]
-                    }
-                }
-                if ($null -ne $lastDaysParam -and (-not $retrySplat.ContainsKey($lastDaysParam))) {
-                    $retrySplat[$lastDaysParam] = $LastDays
-                }
+                $retrySplat = & $buildRetrySplat $splat
                 $result = Export-VBRLogs @retrySplat -ErrorAction Stop
                 foreach ($item in @($result)) { [void]$ExportedItems.Value.Add($item) }
                 $SuccessfulExports.Value++
@@ -891,17 +904,9 @@ function Invoke-ExportForTargetSet {
                         foreach ($item in @($perResult)) { [void]$ExportedItems.Value.Add($item) }
                         $SuccessfulExports.Value++
                     } catch {
-                        if ($_.Exception.Message -imatch 'From\s*(and|[/&])\s*To\s*parameters?\s*(are\s*)?not\s*supported') {
+                        if ($_.Exception.Message -imatch $fromToRejectedPattern) {
                             Write-ProgressMessage ('  Export-VBRLogs rejected -From/-To for -{0} item {1}/{2}; retrying without time-window parameters.' -f $TargetParam, $index, $Objects.Count)
-                            $perRetrySplat = @{}
-                            foreach ($k in @($perSplat.Keys)) {
-                                if ($FromParamCandidates -notcontains $k -and $ToParamCandidates -notcontains $k) {
-                                    $perRetrySplat[$k] = $perSplat[$k]
-                                }
-                            }
-                            if ($null -ne $lastDaysParam -and (-not $perRetrySplat.ContainsKey($lastDaysParam))) {
-                                $perRetrySplat[$lastDaysParam] = $LastDays
-                            }
+                            $perRetrySplat = & $buildRetrySplat $perSplat
                             $perResult = Export-VBRLogs @perRetrySplat -ErrorAction Stop
                             foreach ($item in @($perResult)) { [void]$ExportedItems.Value.Add($item) }
                             $SuccessfulExports.Value++
@@ -986,6 +991,8 @@ function Invoke-VBRLogsExport {
     # Compute the time window in whole days, rounding up; minimum 1.
     # Passed to Export-VBRLogs as -LastDays when that parameter is available,
     # which is preferred over -From/-To on Veeam builds that reject the latter.
+    # Rounding up intentionally provides slightly broader coverage than the exact
+    # window to ensure all relevant logs fall within the exported range.
     $windowHours = ($EndTime - $StartTime).TotalHours
     $lastDays    = [Math]::Max(1, [int][Math]::Ceiling($windowHours / 24.0))
 
