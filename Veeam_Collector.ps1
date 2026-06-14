@@ -98,6 +98,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Get-SortableTicks {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return [long]0 }
+    try {
+        if ($Value -is [datetime]) { return [long]$Value.ToUniversalTime().Ticks }
+        $s = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($s)) { return [long]0 }
+        $parsed = [datetime]::Parse($s, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        return [long]$parsed.ToUniversalTime().Ticks
+    } catch {
+        return [long]0
+    }
+}
+
 $script:EndTime      = Get-Date
 $script:StartTime    = $script:EndTime.AddHours(-[Math]::Abs($Hours))
 $script:Cutoff       = $script:StartTime
@@ -565,7 +581,9 @@ function Add-JobReportFromJob {
     $sorted = @($inWindow | Sort-Object -Property {
         $e = Get-SessionEndTime   -Session $_
         $s = Get-SessionStartTime -Session $_
-        if ($null -ne $e) { $e } elseif ($null -ne $s) { $s } else { [datetime]::MinValue }
+        if ($null -ne $e) { Get-SortableTicks -Value $e }
+        elseif ($null -ne $s) { Get-SortableTicks -Value $s }
+        else { [long]0 }
     } -Descending)
 
     $session = $sorted[0]
@@ -697,9 +715,9 @@ if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyCont
         foreach ($s in $inWindow) {
             $sName = Get-SessionName -Session $s
             $sEnd  = Get-SessionEndTime -Session $s
-            $sTime = if ($null -ne $sEnd) { $sEnd } else {
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
                 $st = Get-SessionStartTime -Session $s
-                if ($null -ne $st) { $st } else { [datetime]::MinValue }
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
             }
             if (-not $grouped.ContainsKey($sName)) {
                 $grouped[$sName] = @{ Session = $s; Time = $sTime }
@@ -738,21 +756,7 @@ $filtered = if ($OnlyFailures) {
 # ---------------------------------------------------------------------------
 $sorted = @($filtered | Sort-Object -Property @(
     @{ Expression = { [int](Get-ResultSeverityOrder -Result $_.result) }; Descending = $false },
-    @{ Expression = {
-        $endValue = $_.end_time
-        if ([string]::IsNullOrWhiteSpace([string]$endValue)) {
-            [long]0
-        } elseif ($endValue -is [datetime]) {
-            [long]$endValue.Ticks
-        } else {
-            try {
-                $parsedDate = [datetime]::Parse([string]$endValue, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
-                [long]$parsedDate.Ticks
-            } catch {
-                [long]0
-            }
-        }
-    }; Descending = $true }
+    @{ Expression = { Get-SortableTicks -Value $_.end_time }; Descending = $true }
 ))
 
 # ---------------------------------------------------------------------------
