@@ -27,8 +27,10 @@
     logs for. Default is 24 (last 24 hours).
 
 .PARAMETER OutputPath
-    Directory where the exported Veeam log bundle will be written.  If omitted, a
-    timestamped sub-directory is created under the system temporary folder.
+    Directory where the exported Veeam log bundle will be written.  If omitted,
+    defaults to E:\VEEAM_LOGS\COLLECTOR.  The directory is created if it does not
+    exist.  After a successful export, items in the collector output directory that
+    are older than 2 days are automatically removed to keep the folder tidy.
 
 .PARAMETER Json
     Emit one JSON object per line (JSON Lines) for machine-readable output.
@@ -745,11 +747,7 @@ function Resolve-ExportOutputPath {
     param([string]$RequestedPath)
 
     if ([string]::IsNullOrWhiteSpace($RequestedPath)) {
-        $stamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
-        $RequestedPath = [System.IO.Path]::Combine(
-            [System.IO.Path]::GetTempPath(),
-            ('VeeamLogs_{0}' -f $stamp)
-        )
+        $RequestedPath = 'E:\VEEAM_LOGS\COLLECTOR'
     }
 
     if (-not (Test-Path -LiteralPath $RequestedPath -PathType Container)) {
@@ -796,16 +794,34 @@ function Invoke-VBRLogsExport {
     $exportParams = @{}
 
     # --- Resolve output/path parameter ---
-    $pathParamCandidates = @('Path', 'Folder', 'OutputPath', 'TargetPath', 'DestinationPath',
-                              'FilePath', 'ExportPath', 'Target', 'Destination', 'Directory')
+    # FolderPath is listed first because that is the parameter name used by the
+    # Veeam 12.x Export-VBRLogs cmdlet.  The remaining names cover older/alternative
+    # Veeam PowerShell versions.
+    $pathParamCandidates = @('FolderPath', 'Path', 'Folder', 'OutputPath', 'TargetPath',
+                              'DestinationPath', 'FilePath', 'ExportPath', 'Target',
+                              'Destination', 'Directory')
     $pathParam = $pathParamCandidates | Where-Object { $availableParams -contains $_ } |
                  Select-Object -First 1
     if ($null -ne $pathParam) {
         Write-ProgressMessage ('  Binding output path via -{0}' -f $pathParam)
         $exportParams[$pathParam] = $ResolvedOutputPath
     } else {
-        Write-ProgressMessage '  No recognised path parameter found; passing output path as positional argument.'
-        $exportParams['PositionalPath'] = $ResolvedOutputPath
+        # Last-resort: try positional only when the first positional parameter of
+        # Export-VBRLogs is confirmed to be a string/path type (i.e. position 0).
+        $firstPositional = $exportCmd.Parameters.Values |
+            Where-Object { $_.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Position -eq 0 } } |
+            Select-Object -First 1
+
+        if ($null -ne $firstPositional) {
+            Write-ProgressMessage ('  No recognised named path parameter found; passing output path positionally via position-0 parameter ''{0}''.' -f $firstPositional.Name)
+            $exportParams['PositionalPath'] = $ResolvedOutputPath
+        } else {
+            throw (
+                'Export-VBRLogs: no recognised output-path parameter was found and no position-0 ' +
+                'parameter exists to accept the path positionally. ' +
+                'Available parameters: ' + ($availableParams -join ', ')
+            )
+        }
     }
 
     # --- Resolve time-window parameters ---
@@ -909,9 +925,57 @@ function Collect-ExportedPaths {
 }
 
 # ---------------------------------------------------------------------------
-# Write-CollectorHeader
-#   Prints a human-readable banner to the console (skipped in -Json mode).
+# Remove-OldCollectorExports
+#   Deletes files and sub-directories under $CollectorPath whose LastWriteTime
+#   is older than $RetentionDays days.  Errors are treated as warnings so that
+#   a successful collection/export is not rolled back by a cleanup failure.
+#   Progress messages respect -Json mode (non-success stream only).
 # ---------------------------------------------------------------------------
+function Remove-OldCollectorExports {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$CollectorPath,
+        [int]$RetentionDays = 2
+    )
+
+    if (-not (Test-Path -LiteralPath $CollectorPath -PathType Container)) {
+        Write-ProgressMessage ('  Cleanup skipped: collector path does not exist: {0}' -f $CollectorPath)
+        return
+    }
+
+    $cutoff   = (Get-Date).AddDays(-$RetentionDays)
+    $removed  = 0
+    $retained = 0
+
+    Write-ProgressMessage ('  Cleanup: removing items in ''{0}'' older than {1} day(s) (cutoff: {2:o}).' `
+        -f $CollectorPath, $RetentionDays, $cutoff)
+
+    try {
+        $children = Get-ChildItem -LiteralPath $CollectorPath -Force -ErrorAction Stop
+    } catch {
+        Write-Warning ('Cleanup: could not enumerate ''{0}'': {1}' -f $CollectorPath, $_.Exception.Message)
+        return
+    }
+
+    foreach ($child in $children) {
+        if ($child.LastWriteTime -lt $cutoff) {
+            try {
+                Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                Write-Warning ('Cleanup: failed to remove ''{0}'': {1}' -f $child.FullName, $_.Exception.Message)
+                $retained++
+            }
+        } else {
+            $retained++
+        }
+    }
+
+    Write-ProgressMessage ('  Cleanup complete: {0} item(s) removed, {1} item(s) retained/skipped.' `
+        -f $removed, $retained)
+}
+
+
 function Write-CollectorHeader {
     [CmdletBinding()]
     param()
@@ -1002,3 +1066,10 @@ if ($Json) {
     }
     Write-Output '------------------------------------------------------------'
 }
+
+# ---------------------------------------------------------------------------
+# Post-export cleanup: remove collector exports older than 2 days.
+# This runs after the final summary so that even in -Json mode the summary is
+# already emitted before any cleanup messages appear on non-success streams.
+# ---------------------------------------------------------------------------
+Remove-OldCollectorExports -CollectorPath $resolvedOutputPath -RetentionDays 2
