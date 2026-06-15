@@ -35,8 +35,8 @@
     messages are sent to the Warning stream so stdout stays valid JSON.
 
 .PARAMETER OnlyFailures
-    When set, only include jobs whose most recent session result is Failed or
-    Warning.  Successful/skipped jobs are omitted from the report.
+    When set, only include jobs whose most recent session result is Failed,
+    Warning, Error, or Stopped.  Successful/skipped jobs are omitted.
 
 .PARAMETER CollectorDebug
     Enable detailed diagnostic/debug logging.  Debug messages are routed to the
@@ -149,6 +149,9 @@
     Repository offload / extent sync (housekeeping):
       - Get-VBRRepositoryExtentSyncSession is used when available.  Absence of
         this cmdlet is handled gracefully.
+      - When dedicated housekeeping session cmdlets are unavailable, the script
+        also uses a Get-VBRSession fallback to find repository/offload/
+        configuration housekeeping sessions.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -170,7 +173,7 @@ param(
     # Emit a JSON array on stdout. Progress goes to Warning stream.
     [switch]$Json,
 
-    # Only include jobs with Failed or Warning last session.
+    # Only include jobs with Failed, Warning, Error, or Stopped last session.
     [switch]$OnlyFailures,
 
     # Enable detailed script-level diagnostic/debug logging.
@@ -1676,6 +1679,120 @@ if (Get-Command -Name 'Get-VBRRepositoryExtentSyncSession' -ErrorAction Silently
     Write-DebugMessage '[Main] Get-VBRRepositoryExtentSyncSession cmdlet not found.'
 }
 
+# ---------------------------------------------------------------------------
+# Phase 6 — Generic housekeeping fallback via Get-VBRSession
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 6 — Housekeeping fallback (Get-VBRSession).'
+Write-DebugMessage '[Main] Phase 6 — Get-VBRSession fallback'
+if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
+    try {
+        $housekeepingTerms = @('Offload', 'Capacity', 'Archive', 'Repository', 'Object', 'SOBR', 'Sync', 'Config', 'Configuration')
+        $housekeepingPattern = (($housekeepingTerms | ForEach-Object { [regex]::Escape($_) }) -join '|')
+        $fallbackCandidates = New-Object 'System.Collections.Generic.List[object]'
+
+        # Try -Type enum discovery first when available.
+        try {
+            $sessionCommand = Get-Command -Name 'Get-VBRSession' -ErrorAction Stop
+            $typeParameter = $sessionCommand.Parameters['Type']
+            $typeNames = @()
+            if ($null -ne $typeParameter) {
+                $typeParameterType = $typeParameter.ParameterType
+                if ($typeParameterType.IsArray) {
+                    $typeParameterType = $typeParameterType.GetElementType()
+                }
+                if ($null -ne $typeParameterType -and $typeParameterType.IsEnum) {
+                    $typeNames = [enum]::GetNames($typeParameterType)
+                }
+            }
+
+            $matchingTypes = @($typeNames | Where-Object {
+                $typeName = [string]$_
+                $housekeepingTerms | Where-Object { $typeName -imatch [regex]::Escape($_) }
+            } | Select-Object -Unique)
+
+            foreach ($typeName in $matchingTypes) {
+                try {
+                    Write-DebugMessage ('[Main] Get-VBRSession fallback querying -Type {0}' -f $typeName)
+                    $typedSessions = @(Get-VBRSession -Type $typeName -ErrorAction Stop)
+                    foreach ($s in $typedSessions) {
+                        if ($null -ne $s) { [void]$fallbackCandidates.Add($s) }
+                    }
+                } catch {
+                    Write-DebugMessage ('[Main] Get-VBRSession -Type {0} threw:' -f $typeName +
+                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                }
+            }
+        } catch {
+            Write-DebugMessage ('[Main] Get-VBRSession -Type discovery failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+
+        # Conservative text-match fallback over generic session properties.
+        try {
+            $allSessions = @(Get-VBRSession -ErrorAction Stop)
+            foreach ($s in $allSessions) {
+                if ($null -eq $s) { continue }
+                $fields = @(
+                    Get-PropertyValue -InputObject $s -Names @('Name'),
+                    Get-PropertyValue -InputObject $s -Names @('JobName'),
+                    Get-PropertyValue -InputObject $s -Names @('SessionName'),
+                    Get-PropertyValue -InputObject $s -Names @('SessionType'),
+                    Get-PropertyValue -InputObject $s -Names @('JobType'),
+                    Get-PropertyValue -InputObject $s -Names @('Type'),
+                    Get-PropertyValue -InputObject $s -Names @('Operation'),
+                    Get-PropertyValue -InputObject $s -Names @('Description')
+                )
+                $searchText = (($fields | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ' ')
+                if (-not [string]::IsNullOrWhiteSpace($searchText) -and $searchText -imatch $housekeepingPattern) {
+                    [void]$fallbackCandidates.Add($s)
+                }
+            }
+        } catch {
+            Write-Warning ('Unable to enumerate Get-VBRSession fallback sessions: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Main] Get-VBRSession fallback enumeration threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+
+        Write-DebugMessage ('[Main] Get-VBRSession fallback candidate count before window filter: {0}' -f $fallbackCandidates.Count)
+        $inWindow = @($fallbackCandidates | Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) })
+        Write-ProgressMessage ('  {0} fallback housekeeping session candidate(s) in window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] Get-VBRSession fallback candidates in window: {0}' -f $inWindow.Count)
+
+        # Group by logical name/type and keep the newest session per key.
+        $grouped = @{}
+        foreach ($s in $inWindow) {
+            $name = Get-SessionName -Session $s
+            $type = Get-SessionType -Session $s
+            $groupKey = ('{0}|{1}' -f $name, $type)
+            $sEnd  = Get-SessionEndTime -Session $s
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
+                $st = Get-SessionStartTime -Session $s
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
+            }
+            if (-not $grouped.ContainsKey($groupKey)) {
+                $grouped[$groupKey] = @{ Session = $s; Time = $sTime }
+            } elseif ($sTime -gt $grouped[$groupKey].Time) {
+                $grouped[$groupKey] = @{ Session = $s; Time = $sTime }
+            }
+        }
+
+        foreach ($entry in $grouped.Values) {
+            $s = $entry.Session
+            $sessionId = Get-ObjectIdentity -InputObject $s
+            if (-not $script:SeenSessions.Add($sessionId)) { continue }
+            $sessionType = Get-SessionType -Session $s
+            $fallbackJobType = if ([string]::IsNullOrWhiteSpace($sessionType)) { 'HousekeepingSessionFallback' } else { ('HousekeepingSessionFallback/{0}' -f $sessionType) }
+            $report = Build-JobReport -Session $s -JobType $fallbackJobType -Source 'Get-VBRSessionFallback'
+            Write-DebugMessage ('[Main] Fallback report: name={0} type={1} result={2}' -f $report.job_name, $report.job_type, $report.result)
+            [void]$allReports.Add($report)
+        }
+    } catch {
+        Write-Warning ('Unable to execute Get-VBRSession fallback phase: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRSession fallback phase threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRSession not available. Skipping fallback.'
+    Write-DebugMessage '[Main] Get-VBRSession cmdlet not found for fallback phase.'
+}
+
 
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
@@ -1688,7 +1805,7 @@ Write-DebugMessage ('[Main] Applying OnlyFailures filter. OnlyFailures={0}; inpu
 if ($OnlyFailures) {
     $filtered = foreach ($report in $allReports) {
         $resultText = if ($null -ne $report.result) { [string]$report.result } else { '' }
-        if ($resultText -imatch 'Failed|Warning|Warn|Error') {
+        if ($resultText -imatch 'Failed|Warning|Warn|Error|Stopped') {
             $report
         }
     }
