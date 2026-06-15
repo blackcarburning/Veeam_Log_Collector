@@ -6,7 +6,7 @@ A focused PowerShell script that reports the **last error text** from the most r
 
 For every backup/replication/offload/housekeeping job it finds the **most recent session within the last N hours**, extracts the last error/warning text, and produces a compact, LLM-friendly report.  No log bundles are created — the output is small enough to paste directly into an LLM prompt or pipe to `jq`.
 
-Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available.  If a cmdlet is absent the phase is skipped gracefully with a progress/debug message.
+Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available. If dedicated housekeeping session cmdlets are unavailable, the script also uses a `Get-VBRSession` fallback pass to discover relevant offload/repository/configuration sessions.
 
 ## Requirements
 
@@ -33,7 +33,7 @@ Housekeeping-style processes (configuration backup and repository offload/extent
 |-----------|------|---------|-------------|
 | `-Hours` | int | 24 | Time window in hours (1–8760). Sessions outside this window are ignored. |
 | `-Json` | switch | — | Emit a JSON array on stdout. Progress messages go to the Warning stream. |
-| `-OnlyFailures` | switch | — | Only include jobs with a Failed or Warning last session. |
+| `-OnlyFailures` | switch | — | Only include jobs with a Failed, Warning, Error, or Stopped last session. |
 
 ## Output
 
