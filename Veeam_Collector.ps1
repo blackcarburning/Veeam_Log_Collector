@@ -177,6 +177,8 @@ function Write-DebugMessage {
 
     if ($null -ne $script:DebugLogFile) {
         try {
+            # Synchronous append is intentional: durable writes ensure no diagnostic
+            # lines are lost if the script terminates unexpectedly mid-run.
             Add-Content -LiteralPath $script:DebugLogFile -Value $line -Encoding UTF8
         } catch {
             # Swallow file I/O errors to avoid recursive failure.
@@ -316,11 +318,11 @@ function Format-VeeamObjectSummary {
         }
     }
 
-    # Property inventory (first 20)
+    # Property inventory (representative sample — PSObject.Properties order is not guaranteed).
     $propNames = @($InputObject.PSObject.Properties | Select-Object -First 20 -ExpandProperty Name)
     [void]$sb.Append("  Properties(first20): $($propNames -join ', ')$nl")
 
-    # Method inventory (first 10)
+    # Method inventory (representative sample — PSObject.Methods order is not guaranteed).
     $methodNames = @($InputObject.PSObject.Methods | Select-Object -First 10 -ExpandProperty Name)
     [void]$sb.Append("  Methods(first10): $($methodNames -join ', ')$nl")
 
@@ -976,13 +978,9 @@ function Write-CollectorHeader {
 trap {
     $fatalMsg = '[FATAL] Veeam_Collector.ps1 terminated with an unhandled error.'
     Write-Warning $fatalMsg
-    if ($null -ne $script:DebugLogFile) {
-        try {
-            $ts   = '[DBG {0:yyyy-MM-dd HH:mm:ss.fff}]' -f (Get-Date)
-            $body = '{0} {1}{2}{3}' -f $ts, $fatalMsg, [Environment]::NewLine, (Format-ErrorRecord -ErrorRecord $_)
-            Add-Content -LiteralPath $script:DebugLogFile -Value $body -Encoding UTF8
-        } catch { }
-    }
+    # Use Write-DebugMessage for the detail record; it handles both Warning stream
+    # and file append in one place.  The plain Write-Warning above always fires so
+    # callers see the FATAL line even when -CollectorDebug is not set.
     Write-DebugMessage ('FATAL error detail:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
     $host.SetShouldExit(1)
     break
