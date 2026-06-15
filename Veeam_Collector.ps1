@@ -50,6 +50,30 @@
     -CollectorDebug is set.  If omitted and -CollectorDebug is set, a
     timestamped file is created in $env:TEMP automatically.
 
+.PARAMETER DisableEmail
+    When set, skip sending the post-run email.  Report-body file writing and
+    retention cleanup still run unless they fail independently.
+
+.PARAMETER SmtpServer
+    SMTP server used for the post-run report email.  Default:
+    outlook.unison.co.uk
+
+.PARAMETER MailFrom
+    From address used for the post-run report email.  Default:
+    Veeam@unison.co.uk
+
+.PARAMETER MailTo
+    Recipient list for the post-run report email.  Defaults to
+    mark.hockings@csiltd.co.uk and mark@blackcarburning.com
+
+.PARAMETER ReportOutputDirectory
+    Directory where the human-readable report body is written after successful
+    report generation.  Default: E:\VEEAM_LOGS\COLLECTOR
+
+.PARAMETER RetentionDays
+    Remove old collector-created report/log files older than this many days
+    from -ReportOutputDirectory after a successful run.  Default: 7
+
 .EXAMPLE
     .\Veeam_Collector.ps1
 
@@ -82,6 +106,12 @@
     timestamped log file is created in $env:TEMP and its path is printed as a
     warning before execution begins.
 
+.EXAMPLE
+    .\Veeam_Collector.ps1 -DisableEmail -ReportOutputDirectory E:\VEEAM_LOGS\COLLECTOR
+
+    Generates the normal report, writes the canonical human-readable report body
+    to disk, skips email delivery, and still applies retention cleanup.
+
 .NOTES
     Usage notes:
       - Run this script with PowerShell 7 on a Veeam Backup & Replication server
@@ -97,6 +127,9 @@
         to the Warning stream and optionally to -DebugLogPath, never to stdout.
       - The script also attempts to extract deeper per-task warning details from
         task sessions and logger records (without creating log bundles).
+      - After the report is built, the same human-readable body is written to
+        E:\VEEAM_LOGS\COLLECTOR by default, emailed by default, and old
+        collector-created files in that directory are removed after 7 days.
 
     Computer/agent backup jobs:
       - Get-VBRComputerBackupJob is used when available so that Get-VBRJob is not
@@ -135,7 +168,22 @@ param(
 
     # Optional path for the debug log file. Only used when -CollectorDebug is set.
     # If omitted, a timestamped file is created in $env:TEMP automatically.
-    [string]$DebugLogPath = ''
+    [string]$DebugLogPath = '',
+
+    # Disable the default post-run email delivery.
+    [switch]$DisableEmail,
+
+    # SMTP server and envelope settings for the report email.
+    [string]$SmtpServer = 'outlook.unison.co.uk',
+    [string]$MailFrom = 'Veeam@unison.co.uk',
+    [string[]]$MailTo = @('mark.hockings@csiltd.co.uk', 'mark@blackcarburning.com'),
+
+    # Directory for the canonical human-readable report body file.
+    [string]$ReportOutputDirectory = 'E:\VEEAM_LOGS\COLLECTOR',
+
+    # Retention period for collector-created report/log files in ReportOutputDirectory.
+    [ValidateRange(1, 3650)]
+    [int]$RetentionDays = 7
 )
 
 Set-StrictMode -Version Latest
@@ -247,6 +295,8 @@ function Write-EnvironmentDiagnostics {
     Write-DebugMessage ('  ScriptPath     : {0}' -f $(if ($PSCommandPath) { $PSCommandPath } else { '<interactive>' }))
     Write-DebugMessage ('  Arguments      : Hours={0}  Json={1}  OnlyFailures={2}  CollectorDebug={3}  DebugLogPath={4}' `
         -f $Hours, $Json.IsPresent, $OnlyFailures.IsPresent, $CollectorDebug.IsPresent, $DebugLogPath)
+    Write-DebugMessage ('  ReportOutput   : DisableEmail={0}  SmtpServer={1}  MailFrom={2}  MailTo={3}  ReportOutputDirectory={4}  RetentionDays={5}' `
+        -f $DisableEmail.IsPresent, $SmtpServer, $MailFrom, ($MailTo -join ', '), $ReportOutputDirectory, $RetentionDays)
     Write-DebugMessage ('  TimeWindow     : {0:o}  to  {1:o}  ({2} hour(s))' -f $script:StartTime, $script:EndTime, $Hours)
     Write-DebugMessage ('  Host           : {0}' -f $env:COMPUTERNAME)
     Write-DebugMessage ('  User           : {0}' -f [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
@@ -1113,45 +1163,239 @@ function Add-JobReportFromJob {
 }
 
 # ---------------------------------------------------------------------------
-# Write-TextReport
-#   Emits one compact block per report entry to stdout.
+# Get-CollectorHostName
 # ---------------------------------------------------------------------------
-function Write-TextReport {
+function Get-CollectorHostName {
     [CmdletBinding()]
-    param([Parameter(Mandatory)] [object[]]$Reports)
+    param()
 
-    foreach ($r in $Reports) {
-        Write-Output ('Job      : {0}' -f $r.job_name)
-        Write-Output ('Type     : {0}' -f $r.job_type)
-        Write-Output ('Result   : {0}' -f $r.result)
-        Write-Output ('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' }))
-        if (-not [string]::IsNullOrWhiteSpace($r.last_error)) {
-            Write-Output ('Error    : {0}' -f $r.last_error)
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+        return $env:COMPUTERNAME
+    }
+
+    return [System.Environment]::MachineName
+}
+
+# ---------------------------------------------------------------------------
+# New-CollectorReportBody
+#   Returns the single canonical human-readable report string used for console,
+#   disk, and email output. Never includes progress/debug lines.
+# ---------------------------------------------------------------------------
+function New-CollectorReportBody {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object[]]$Reports,
+        [Parameter(Mandatory)] [int]$TotalJobs,
+        [Parameter(Mandatory)] [int]$FailedCount,
+        [Parameter(Mandatory)] [int]$WarnCount,
+        [Parameter(Mandatory)] [int]$SuccessCount,
+        [Parameter(Mandatory)] [int]$WithError
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
+
+    [void]$lines.Add('============================================================')
+    [void]$lines.Add('Veeam Last-Error Report')
+    [void]$lines.Add(('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
+    [void]$lines.Add(('Host       : {0}' -f (Get-CollectorHostName)))
+    [void]$lines.Add(('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion))
+    [void]$lines.Add('============================================================')
+    [void]$lines.Add('')
+
+    if ($Reports.Count -eq 0) {
+        if ($OnlyFailures) {
+            [void]$lines.Add('No Failed or Warning sessions found in the specified window.')
+        } else {
+            [void]$lines.Add('No sessions found in the specified window.')
         }
-        if (-not [string]::IsNullOrWhiteSpace($r.warning_details)) {
-            Write-Output ('Warning  : {0}' -f $r.warning_details)
+    } else {
+        foreach ($r in $Reports) {
+            [void]$lines.Add(('Job      : {0}' -f $r.job_name))
+            [void]$lines.Add(('Type     : {0}' -f $r.job_type))
+            [void]$lines.Add(('Result   : {0}' -f $r.result))
+            [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
+            if (-not [string]::IsNullOrWhiteSpace([string]$r.last_error)) {
+                [void]$lines.Add(('Error    : {0}' -f $r.last_error))
+            }
+
+            $warningDetails = Get-PropertyValue -InputObject $r -Names @('warning_details')
+            if (-not [string]::IsNullOrWhiteSpace([string]$warningDetails)) {
+                [void]$lines.Add(('Warning  : {0}' -f $warningDetails))
+            }
+
+            [void]$lines.Add('')
         }
-        Write-Output ''
+    }
+
+    [void]$lines.Add('------------------------------------------------------------')
+    [void]$lines.Add(('Window   : last {0} hour(s)  ({1:o}  to  {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
+    [void]$lines.Add(('Jobs     : {0}  (Failed: {1}  Warning: {2}  Success: {3}  WithError: {4})' `
+        -f $TotalJobs, $FailedCount, $WarnCount, $SuccessCount, $WithError))
+    [void]$lines.Add('------------------------------------------------------------')
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+# ---------------------------------------------------------------------------
+# Get-CollectorReportFilePath
+# ---------------------------------------------------------------------------
+function Get-CollectorReportFilePath {
+    [CmdletBinding()]
+    param()
+
+    $timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+    return [IO.Path]::Combine($ReportOutputDirectory, ('Veeam_Collector_Report_{0}.txt' -f $timestamp))
+}
+
+# ---------------------------------------------------------------------------
+# Write-CollectorReportBodyToDisk
+# ---------------------------------------------------------------------------
+function Write-CollectorReportBodyToDisk {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Body)
+
+    try {
+        if (-not (Test-Path -LiteralPath $ReportOutputDirectory)) {
+            $null = New-Item -ItemType Directory -Path $ReportOutputDirectory -Force
+        }
+
+        $path = Get-CollectorReportFilePath
+        [System.IO.File]::WriteAllText($path, $Body, [System.Text.Encoding]::UTF8)
+        Write-ProgressMessage ('Report body written to: {0}' -f $path)
+        return $path
+    } catch {
+        Write-Warning ('Unable to write report body to "{0}": {1}' -f $ReportOutputDirectory, $_.Exception.Message)
+        Write-DebugMessage ('[Write-CollectorReportBodyToDisk] Failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
     }
 }
 
 # ---------------------------------------------------------------------------
-# Write-CollectorHeader
+# Get-CollectorMailSubject
 # ---------------------------------------------------------------------------
-function Write-CollectorHeader {
+function Get-CollectorMailSubject {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [int]$FailedCount,
+        [Parameter(Mandatory)] [int]$WarnCount
+    )
+
+    return ('Veeam Last-Error Report - {0} - Failed: {1} Warning: {2}' -f (Get-CollectorHostName), $FailedCount, $WarnCount)
+}
+
+# ---------------------------------------------------------------------------
+# Send-CollectorReportEmail
+# ---------------------------------------------------------------------------
+function Send-CollectorReportEmail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Body,
+        [Parameter(Mandatory)] [string]$Subject
+    )
+
+    if ($DisableEmail) {
+        Write-ProgressMessage 'Email delivery disabled by -DisableEmail.'
+        return $false
+    }
+
+    $recipients = @(
+        foreach ($recipient in $MailTo) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$recipient)) {
+                [string]$recipient
+            }
+        }
+    )
+
+    if ($recipients.Count -eq 0) {
+        Write-Warning 'Email delivery skipped because no recipients were configured.'
+        return $false
+    }
+
+    try {
+        if (Get-Command -Name 'Send-MailMessage' -ErrorAction SilentlyContinue) {
+            Send-MailMessage -SmtpServer $SmtpServer -From $MailFrom -To $recipients -Subject $Subject -Body $Body -ErrorAction Stop
+        } else {
+            $mailMessage = New-Object 'System.Net.Mail.MailMessage'
+            try {
+                $mailMessage.From = $MailFrom
+                foreach ($recipient in $recipients) {
+                    [void]$mailMessage.To.Add($recipient)
+                }
+                $mailMessage.Subject = $Subject
+                $mailMessage.Body = $Body
+                $mailMessage.IsBodyHtml = $false
+
+                $smtpClient = New-Object 'System.Net.Mail.SmtpClient'($SmtpServer)
+                try {
+                    $smtpClient.Send($mailMessage)
+                } finally {
+                    $smtpClient.Dispose()
+                }
+            } finally {
+                $mailMessage.Dispose()
+            }
+        }
+
+        Write-ProgressMessage ('Report email sent to: {0}' -f ($recipients -join ', '))
+        return $true
+    } catch {
+        Write-Warning ('Unable to send report email via "{0}": {1}' -f $SmtpServer, $_.Exception.Message)
+        Write-DebugMessage ('[Send-CollectorReportEmail] Failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Remove-OldCollectorFiles
+# ---------------------------------------------------------------------------
+function Remove-OldCollectorFiles {
     [CmdletBinding()]
     param()
 
-    if ($Json) { return }
+    if (-not (Test-Path -LiteralPath $ReportOutputDirectory)) {
+        Write-DebugMessage ('[Remove-OldCollectorFiles] Directory not found, skipping cleanup: {0}' -f $ReportOutputDirectory)
+        return
+    }
 
-    Write-Output '============================================================'
-    Write-Output 'Veeam Last-Error Report'
-    Write-Output ('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime)
-    Write-Output ('Host       : {0}' -f $env:COMPUTERNAME)
-    $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
-    Write-Output ('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion)
-    Write-Output '============================================================'
-    Write-Output ''
+    $cutoff = (Get-Date).AddDays(-1 * $RetentionDays)
+    $patterns = @(
+        'Veeam_Collector_Report_*.txt',
+        'Veeam_Collector_*.log',
+        'veeam-collector-debug-*.log'
+    )
+
+    try {
+        $staleFiles = @(Get-ChildItem -LiteralPath $ReportOutputDirectory -File -ErrorAction Stop | Where-Object {
+            $file = $_
+            if ($file.LastWriteTime -ge $cutoff) { return $false }
+
+            foreach ($pattern in $patterns) {
+                if ($file.Name -like $pattern) {
+                    return $true
+                }
+            }
+
+            return $false
+        })
+
+        foreach ($file in $staleFiles) {
+            try {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                Write-ProgressMessage ('Removed old collector file: {0}' -f $file.FullName)
+            } catch {
+                Write-Warning ('Unable to remove old collector file "{0}": {1}' -f $file.FullName, $_.Exception.Message)
+                Write-DebugMessage ('[Remove-OldCollectorFiles] Remove failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+            }
+        }
+
+        if ($staleFiles.Count -eq 0) {
+            Write-ProgressMessage ('No collector report/log files older than {0} day(s) found in {1}.' -f $RetentionDays, $ReportOutputDirectory)
+        }
+    } catch {
+        Write-Warning ('Unable to clean up old collector files in "{0}": {1}' -f $ReportOutputDirectory, $_.Exception.Message)
+        Write-DebugMessage ('[Remove-OldCollectorFiles] Enumeration failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
 }
 
 # ===========================================================================
@@ -1177,7 +1421,6 @@ Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(
 
 Import-VeeamPowerShell
 Write-EnvironmentDiagnostics
-Write-CollectorHeader
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
 
@@ -1362,6 +1605,11 @@ foreach ($report in $sorted) {
 Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3} withError={4}' `
     -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
 
+$reportBody = New-CollectorReportBody -Reports $sorted `
+    -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
+    -SuccessCount $successCount -WithError $withError
+Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -1371,22 +1619,13 @@ if ($Json) {
     Write-Warning ('Summary: jobs={0} failed={1} warning={2} success={3} with_error={4}' `
         -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
 } else {
-    if ($sorted.Count -eq 0) {
-        if ($OnlyFailures) {
-            Write-Output 'No Failed or Warning sessions found in the specified window.'
-        } else {
-            Write-Output 'No sessions found in the specified window.'
-        }
-    } else {
-        Write-TextReport -Reports $sorted
-    }
-
-    Write-Output '------------------------------------------------------------'
-    Write-Output ('Window   : last {0} hour(s)  ({1:o}  to  {2:o})' -f $Hours, $script:StartTime, $script:EndTime)
-    Write-Output ('Jobs     : {0}  (Failed: {1}  Warning: {2}  Success: {3}  WithError: {4})' `
-        -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
-    Write-Output '------------------------------------------------------------'
+    Write-Output $reportBody
 }
+
+$null = Write-CollectorReportBodyToDisk -Body $reportBody
+$mailSubject = Get-CollectorMailSubject -FailedCount $failedCount -WarnCount $warnCount
+$null = Send-CollectorReportEmail -Body $reportBody -Subject $mailSubject
+Remove-OldCollectorFiles
 
 Write-DebugMessage '[Main] Script completed successfully.'
 if ($script:CollectorDebugEnabled -and $null -ne $script:DebugLogFile) {
