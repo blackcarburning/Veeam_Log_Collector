@@ -1313,28 +1313,24 @@ function Send-CollectorReportEmail {
     }
 
     try {
-        if (Get-Command -Name 'Send-MailMessage' -ErrorAction SilentlyContinue) {
-            Send-MailMessage -SmtpServer $SmtpServer -From $MailFrom -To $recipients -Subject $Subject -Body $Body -ErrorAction Stop
-        } else {
-            $mailMessage = New-Object 'System.Net.Mail.MailMessage'
-            try {
-                $mailMessage.From = $MailFrom
-                foreach ($recipient in $recipients) {
-                    [void]$mailMessage.To.Add($recipient)
-                }
-                $mailMessage.Subject = $Subject
-                $mailMessage.Body = $Body
-                $mailMessage.IsBodyHtml = $false
-
-                $smtpClient = New-Object 'System.Net.Mail.SmtpClient'($SmtpServer)
-                try {
-                    $smtpClient.Send($mailMessage)
-                } finally {
-                    $smtpClient.Dispose()
-                }
-            } finally {
-                $mailMessage.Dispose()
+        $mailMessage = New-Object 'System.Net.Mail.MailMessage'
+        try {
+            $mailMessage.From = $MailFrom
+            foreach ($recipient in $recipients) {
+                [void]$mailMessage.To.Add($recipient)
             }
+            $mailMessage.Subject = $Subject
+            $mailMessage.Body = $Body
+            $mailMessage.IsBodyHtml = $false
+
+            $smtpClient = New-Object 'System.Net.Mail.SmtpClient'($SmtpServer)
+            try {
+                $smtpClient.Send($mailMessage)
+            } finally {
+                $smtpClient.Dispose()
+            }
+        } finally {
+            $mailMessage.Dispose()
         }
 
         Write-ProgressMessage ('Report email sent to: {0}' -f ($recipients -join ', '))
