@@ -357,9 +357,13 @@ function Test-SessionInWindow {
     $start = Get-SessionStartTime -Session $Session
     $end   = Get-SessionEndTime   -Session $Session
 
-    if ($null -ne $start -and $start -ge $script:Cutoff) { return $true }
-    if ($null -ne $end   -and $end   -ge $script:Cutoff) { return $true }
-    if ($null -ne $start -and $null -eq $end)            { return $true }
+    $cutoffTicks = Get-SortableTicks -Value $script:Cutoff
+    $startTicks  = if ($null -ne $start) { Get-SortableTicks -Value $start } else { $null }
+    $endTicks    = if ($null -ne $end)   { Get-SortableTicks -Value $end }   else { $null }
+
+    if ($null -ne $startTicks -and $startTicks -ge $cutoffTicks) { return $true }
+    if ($null -ne $endTicks   -and $endTicks   -ge $cutoffTicks) { return $true }
+    if ($null -ne $start -and $null -eq $end)                    { return $true }
 
     return ($null -eq $start -and $null -eq $end)
 }
