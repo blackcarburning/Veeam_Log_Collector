@@ -34,6 +34,20 @@
     When set, only include jobs whose most recent session result is Failed or
     Warning.  Successful/skipped jobs are omitted from the report.
 
+.PARAMETER CollectorDebug
+    Enable detailed diagnostic/debug logging.  Debug messages are routed to the
+    Warning stream and, if -DebugLogPath is given, to that file.  They never
+    appear on stdout, so -Json output remains valid JSON.  When this switch is
+    set without -DebugLogPath, a timestamped log file is created automatically
+    under $env:TEMP and its path is printed as a warning.
+    NOTE: Do not use -Debug (the built-in common parameter) for this purpose;
+    -CollectorDebug is the dedicated opt-in for script-level diagnostics.
+
+.PARAMETER DebugLogPath
+    Optional file path for the debug/diagnostic log.  Only meaningful when
+    -CollectorDebug is set.  If omitted and -CollectorDebug is set, a
+    timestamped file is created in $env:TEMP automatically.
+
 .EXAMPLE
     .\Veeam_Collector.ps1
 
@@ -51,6 +65,20 @@
     Emits a JSON array on stdout suitable for piping to an LLM or jq.
     Progress messages appear on the Warning stream only.
 
+.EXAMPLE
+    .\Veeam_Collector.ps1 -CollectorDebug -DebugLogPath C:\Temp\veeam-collector-debug.log
+
+    Runs with full diagnostic logging written to the specified file.  Use this
+    when the script crashes silently in a customer environment and you need to
+    find the exact failing API call.
+
+.EXAMPLE
+    .\Veeam_Collector.ps1 -CollectorDebug
+
+    Runs with diagnostic logging.  Because no -DebugLogPath is specified, a
+    timestamped log file is created in $env:TEMP and its path is printed as a
+    warning before execution begins.
+
 .NOTES
     Usage notes:
       - Run this script with PowerShell 7 on a Veeam Backup & Replication server
@@ -62,6 +90,8 @@
       - -Json mode routes all progress/status messages to the Warning stream; stdout
         contains only a single JSON array suitable for parsing with ConvertFrom-Json
         or jq.
+      - -CollectorDebug adds detailed per-call breadcrumbs.  Debug output always goes
+        to the Warning stream and optionally to -DebugLogPath, never to stdout.
 
     Computer/agent backup jobs:
       - Get-VBRComputerBackupJob is used when available so that Get-VBRJob is not
@@ -92,11 +122,212 @@ param(
     [switch]$Json,
 
     # Only include jobs with Failed or Warning last session.
-    [switch]$OnlyFailures
+    [switch]$OnlyFailures,
+
+    # Enable detailed script-level diagnostic/debug logging.
+    # Use -CollectorDebug instead of the built-in -Debug common parameter.
+    [switch]$CollectorDebug,
+
+    # Optional path for the debug log file. Only used when -CollectorDebug is set.
+    # If omitted, a timestamped file is created in $env:TEMP automatically.
+    [string]$DebugLogPath = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# Debug / diagnostic infrastructure
+# ---------------------------------------------------------------------------
+$script:CollectorDebugEnabled = $CollectorDebug.IsPresent
+$script:DebugLogFile = $null   # resolved below when debug is enabled
+
+if ($script:CollectorDebugEnabled) {
+    if ([string]::IsNullOrWhiteSpace($DebugLogPath)) {
+        $ts = (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $script:DebugLogFile = [IO.Path]::Combine(
+            [IO.Path]::GetTempPath(),
+            ('veeam-collector-debug-{0}.log' -f $ts)
+        )
+        Write-Warning ('[CollectorDebug] No -DebugLogPath specified. Debug log: {0}' -f $script:DebugLogFile)
+    } else {
+        $script:DebugLogFile = $DebugLogPath
+    }
+    # Ensure the parent directory exists.
+    $debugDir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($script:DebugLogFile))
+    if ($debugDir -and -not (Test-Path $debugDir)) {
+        $null = New-Item -ItemType Directory -Path $debugDir -Force
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Write-DebugMessage
+#   Emits a timestamped diagnostic line to the Warning stream and, when a
+#   debug log file is configured, appends it there as well.
+#   Never writes to the success/output stream (stream 1).
+# ---------------------------------------------------------------------------
+function Write-DebugMessage {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Message)
+
+    if (-not $script:CollectorDebugEnabled) { return }
+
+    $line = '[DBG {0:yyyy-MM-dd HH:mm:ss.fff}] {1}' -f (Get-Date), $Message
+    Write-Warning $line
+
+    if ($null -ne $script:DebugLogFile) {
+        try {
+            # Synchronous append is intentional: durable writes ensure no diagnostic
+            # lines are lost if the script terminates unexpectedly mid-run.
+            Add-Content -LiteralPath $script:DebugLogFile -Value $line -Encoding UTF8
+        } catch {
+            # Swallow file I/O errors to avoid recursive failure.
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Format-ErrorRecord
+#   Returns a multi-line string describing a caught error record with full
+#   context: type, message, script stack trace, position, category, FQID,
+#   and inner exceptions.
+# ---------------------------------------------------------------------------
+function Format-ErrorRecord {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $sb = New-Object 'System.Text.StringBuilder'
+    $nl = [Environment]::NewLine
+
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+    while ($null -ne $ex) {
+        $prefix = if ($depth -eq 0) { 'Exception' } else { "InnerException[$depth]" }
+        [void]$sb.Append("  ${prefix}.Type    : $($ex.GetType().FullName)$nl")
+        [void]$sb.Append("  ${prefix}.Message : $($ex.Message)$nl")
+        $ex = $ex.InnerException
+        $depth++
+    }
+
+    [void]$sb.Append("  CategoryInfo       : $($ErrorRecord.CategoryInfo)$nl")
+    [void]$sb.Append("  FullyQualifiedErrorId: $($ErrorRecord.FullyQualifiedErrorId)$nl")
+
+    if ($null -ne $ErrorRecord.InvocationInfo -and $null -ne $ErrorRecord.InvocationInfo.PositionMessage) {
+        [void]$sb.Append("  InvocationInfo     : $($ErrorRecord.InvocationInfo.PositionMessage.Trim())$nl")
+    }
+
+    if ($null -ne $ErrorRecord.ScriptStackTrace) {
+        [void]$sb.Append("  ScriptStackTrace   :$nl")
+        foreach ($traceLine in ($ErrorRecord.ScriptStackTrace -split '\r?\n')) {
+            [void]$sb.Append("    $traceLine$nl")
+        }
+    }
+
+    return $sb.ToString().TrimEnd()
+}
+
+# ---------------------------------------------------------------------------
+# Write-EnvironmentDiagnostics
+#   Logs host/user/PS/OS/culture/elevation details plus loaded Veeam
+#   components to the debug channel.
+# ---------------------------------------------------------------------------
+function Write-EnvironmentDiagnostics {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:CollectorDebugEnabled) { return }
+
+    $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
+    Write-DebugMessage '=== Environment Diagnostics ==='
+    Write-DebugMessage ('  ScriptPath     : {0}' -f $(if ($PSCommandPath) { $PSCommandPath } else { '<interactive>' }))
+    Write-DebugMessage ('  Arguments      : Hours={0}  Json={1}  OnlyFailures={2}  CollectorDebug={3}  DebugLogPath={4}' `
+        -f $Hours, $Json.IsPresent, $OnlyFailures.IsPresent, $CollectorDebug.IsPresent, $DebugLogPath)
+    Write-DebugMessage ('  TimeWindow     : {0:o}  to  {1:o}  ({2} hour(s))' -f $script:StartTime, $script:EndTime, $Hours)
+    Write-DebugMessage ('  Host           : {0}' -f $env:COMPUTERNAME)
+    Write-DebugMessage ('  User           : {0}' -f [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    Write-DebugMessage ('  PSEdition      : {0}' -f $ed)
+    Write-DebugMessage ('  PSVersion      : {0}' -f $PSVersionTable.PSVersion)
+    Write-DebugMessage ('  OS             : {0}' -f $(
+        if ($PSVersionTable.OS) { $PSVersionTable.OS }
+        elseif ([System.Environment]::OSVersion) { [System.Environment]::OSVersion.VersionString }
+        else { '<unknown>' }
+    ))
+    Write-DebugMessage ('  Culture        : {0}' -f [System.Globalization.CultureInfo]::CurrentCulture.Name)
+    Write-DebugMessage ('  ProcessBitness : {0}-bit' -f $(if ([IntPtr]::Size -eq 8) { 64 } else { 32 }))
+
+    # Elevation check (Windows only — ignore on non-Windows PS 7+)
+    try {
+        $identity  = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
+        $isAdmin   = $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+        Write-DebugMessage ('  Elevated       : {0}' -f $isAdmin)
+    } catch {
+        Write-DebugMessage '  Elevated       : <unable to determine>'
+    }
+
+    # Loaded Veeam modules / snap-ins
+    $veeamModules = @(Get-Module | Where-Object { $_.Name -like 'Veeam*' })
+    if ($veeamModules.Count -gt 0) {
+        foreach ($m in $veeamModules) {
+            Write-DebugMessage ('  VeeamModule    : {0}  v{1}  [{2}]' -f $m.Name, $m.Version, $m.ModuleBase)
+        }
+    } else {
+        Write-DebugMessage '  VeeamModule    : none loaded'
+    }
+
+    $veeamSnaps = @(Get-PSSnapin -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Veeam*' })
+    if ($veeamSnaps.Count -gt 0) {
+        foreach ($snap in $veeamSnaps) {
+            Write-DebugMessage ('  VeeamSnapIn    : {0}  v{1}' -f $snap.Name, $snap.Version)
+        }
+    } else {
+        Write-DebugMessage '  VeeamSnapIn    : none loaded'
+    }
+
+    Write-DebugMessage '=== End Environment Diagnostics ==='
+}
+
+# ---------------------------------------------------------------------------
+# Format-VeeamObjectSummary
+#   Returns a safe string summary of a Veeam object for debug output:
+#   type name, key IDs/names, first 20 property names, first 10 method names.
+# ---------------------------------------------------------------------------
+function Format-VeeamObjectSummary {
+    [CmdletBinding()]
+    param([object]$InputObject)
+
+    if ($null -eq $InputObject) { return '<null>' }
+
+    $nl  = [Environment]::NewLine
+    $sb  = New-Object 'System.Text.StringBuilder'
+    [void]$sb.Append("Type: $($InputObject.GetType().FullName)$nl")
+
+    # Key identity properties
+    foreach ($key in @('Id','Uid','SessionId','Name','JobName','SessionName')) {
+        $prop = $InputObject.PSObject.Properties[$key]
+        if ($null -ne $prop -and $null -ne $prop.Value) {
+            [void]$sb.Append("  $key = $($prop.Value)$nl")
+        }
+    }
+
+    # Timing and result
+    foreach ($key in @('CreationTime','StartTime','EndTime','StopTime','Result','State','Status')) {
+        $prop = $InputObject.PSObject.Properties[$key]
+        if ($null -ne $prop -and $null -ne $prop.Value) {
+            [void]$sb.Append("  $key = $($prop.Value)$nl")
+        }
+    }
+
+    # Property inventory (representative sample — PSObject.Properties order is not guaranteed).
+    $propNames = @($InputObject.PSObject.Properties | Select-Object -First 20 -ExpandProperty Name)
+    [void]$sb.Append("  Properties(first20): $($propNames -join ', ')$nl")
+
+    # Method inventory (representative sample — PSObject.Methods order is not guaranteed).
+    $methodNames = @($InputObject.PSObject.Methods | Select-Object -First 10 -ExpandProperty Name)
+    [void]$sb.Append("  Methods(first10): $($methodNames -join ', ')$nl")
+
+    return $sb.ToString().TrimEnd()
+}
 
 function Get-SortableTicks {
     [CmdletBinding()]
@@ -196,31 +427,47 @@ function Import-VeeamPowerShell {
     # 7.0, which causes Import-Module to throw.  Catch that and fall through to the
     # legacy VeeamPSSnapIn snap-in below.
     Write-ProgressMessage 'Attempting to load modern module: Veeam.Backup.PowerShell ...'
+    Write-DebugMessage '[Import-VeeamPowerShell] Checking for Veeam.Backup.PowerShell in module path.'
     if (Get-Module -ListAvailable -Name 'Veeam.Backup.PowerShell' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage '[Import-VeeamPowerShell] Module found; calling Import-Module Veeam.Backup.PowerShell.'
         try {
             Import-Module 'Veeam.Backup.PowerShell' -ErrorAction Stop
             $loaded = $true
             Write-ProgressMessage 'Modern module Veeam.Backup.PowerShell loaded successfully.'
+            Write-DebugMessage '[Import-VeeamPowerShell] Import-Module succeeded.'
         }
         catch {
             Write-ProgressMessage ('  Modern module load failed: {0}' -f $_.Exception.Message)
             Write-Warning (('Could not import Veeam.Backup.PowerShell module: {0}  ' +
                 'Falling back to VeeamPSSnapIn (required on Windows PowerShell 5.1).') `
                 -f $_.Exception.Message)
+            Write-DebugMessage ('[Import-VeeamPowerShell] Import-Module Veeam.Backup.PowerShell FAILED:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
     } else {
         Write-ProgressMessage '  Module Veeam.Backup.PowerShell not found in module path.'
+        Write-DebugMessage '[Import-VeeamPowerShell] Veeam.Backup.PowerShell not found via Get-Module -ListAvailable.'
     }
 
     if (-not $loaded) {
         Write-ProgressMessage 'Attempting to load legacy snap-in: VeeamPSSnapIn ...'
+        Write-DebugMessage '[Import-VeeamPowerShell] Checking for registered snap-in VeeamPSSnapIn.'
         $snapIn = Get-PSSnapin -Registered -Name 'VeeamPSSnapIn' -ErrorAction SilentlyContinue
         if ($snapIn) {
-            Add-PSSnapin 'VeeamPSSnapIn' -ErrorAction Stop
-            $loaded = $true
-            Write-ProgressMessage 'Legacy snap-in VeeamPSSnapIn loaded successfully.'
+            Write-DebugMessage ('[Import-VeeamPowerShell] VeeamPSSnapIn found (v{0}); calling Add-PSSnapin.' -f $snapIn.Version)
+            try {
+                Add-PSSnapin 'VeeamPSSnapIn' -ErrorAction Stop
+                $loaded = $true
+                Write-ProgressMessage 'Legacy snap-in VeeamPSSnapIn loaded successfully.'
+                Write-DebugMessage '[Import-VeeamPowerShell] Add-PSSnapin VeeamPSSnapIn succeeded.'
+            } catch {
+                Write-DebugMessage ('[Import-VeeamPowerShell] Add-PSSnapin VeeamPSSnapIn FAILED:' +
+                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                throw
+            }
         } else {
             Write-ProgressMessage '  Snap-in VeeamPSSnapIn not found or not registered.'
+            Write-DebugMessage '[Import-VeeamPowerShell] VeeamPSSnapIn not found via Get-PSSnapin -Registered.'
         }
     }
 
@@ -260,6 +507,7 @@ function Import-VeeamPowerShell {
             $errorMessage = $errorMessage + [Environment]::NewLine + $pwshSuggestion
         }
 
+        Write-DebugMessage ('[Import-VeeamPowerShell] No Veeam components loaded. Throwing fatal error.')
         throw $errorMessage
     }
 }
@@ -373,24 +621,37 @@ function Get-LastErrorText {
     param([Parameter(Mandatory)] [object]$Session)
 
     $messages = New-Object 'System.Collections.Generic.List[string]'
+    $sessionDesc = Get-SessionName -Session $Session
+
+    Write-DebugMessage ('[Get-LastErrorText] Session: {0}' -f $sessionDesc)
 
     # --- Approach 1: $session.GetLastError() ---
     if ($Session.PSObject.Methods['GetLastError']) {
+        Write-DebugMessage '[Get-LastErrorText] Approach 1: calling $Session.GetLastError()'
         try {
             $err = $Session.GetLastError()
             if ($null -ne $err) {
                 $text = [string]$err
                 if (-not [string]::IsNullOrWhiteSpace($text)) {
+                    Write-DebugMessage ('[Get-LastErrorText] GetLastError() returned: {0}' -f $text.Trim())
                     return $text.Trim()
                 }
             }
-        } catch { }
+            Write-DebugMessage '[Get-LastErrorText] GetLastError() returned null or empty.'
+        } catch {
+            Write-DebugMessage ('[Get-LastErrorText] $Session.GetLastError() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    } else {
+        Write-DebugMessage '[Get-LastErrorText] Session has no GetLastError() method.'
     }
 
     # --- Approach 2: task sessions ---
     if ($Session.PSObject.Methods['GetTaskSessions']) {
+        Write-DebugMessage '[Get-LastErrorText] Approach 2: calling $Session.GetTaskSessions()'
         try {
             $tasks = @($Session.GetTaskSessions())
+            Write-DebugMessage ('[Get-LastErrorText] GetTaskSessions() returned {0} task(s).' -f $tasks.Count)
             foreach ($task in $tasks) {
                 $taskResult = ''
                 $taskResultProp = $task.PSObject.Properties['Result']
@@ -403,17 +664,24 @@ function Get-LastErrorText {
                 $isBad = $taskResult -imatch 'Failed|Warning|Error'
                 if (-not $isBad) { continue }
 
+                $taskDesc = Get-PropertyValue -InputObject $task -Names @('Name', 'Title', 'ObjectName')
+                Write-DebugMessage ('[Get-LastErrorText] Processing bad task: {0} result={1}' -f $taskDesc, $taskResult)
+
                 if ($task.PSObject.Methods['GetLastError']) {
                     try {
                         $taskErr = $task.GetLastError()
                         if ($null -ne $taskErr) {
                             $t = [string]$taskErr
                             if (-not [string]::IsNullOrWhiteSpace($t)) {
+                                Write-DebugMessage ('[Get-LastErrorText] task.GetLastError()={0}' -f $t.Trim())
                                 [void]$messages.Add($t.Trim())
                                 continue
                             }
                         }
-                    } catch { }
+                    } catch {
+                        Write-DebugMessage ('[Get-LastErrorText] task.GetLastError() threw:' +
+                            [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                    }
                 }
 
                 if ($task.PSObject.Methods['GetDetails']) {
@@ -422,11 +690,15 @@ function Get-LastErrorText {
                         if ($null -ne $details) {
                             $t = [string]$details
                             if (-not [string]::IsNullOrWhiteSpace($t)) {
+                                Write-DebugMessage ('[Get-LastErrorText] task.GetDetails()={0}' -f $t.Trim())
                                 [void]$messages.Add($t.Trim())
                                 continue
                             }
                         }
-                    } catch { }
+                    } catch {
+                        Write-DebugMessage ('[Get-LastErrorText] task.GetDetails() threw:' +
+                            [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                    }
                 }
 
                 # fall back to Name/Title on the task
@@ -435,7 +707,12 @@ function Get-LastErrorText {
                     [void]$messages.Add(('{0}: {1}' -f [string]$taskName, $taskResult).Trim())
                 }
             }
-        } catch { }
+        } catch {
+            Write-DebugMessage ('[Get-LastErrorText] $Session.GetTaskSessions() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    } else {
+        Write-DebugMessage '[Get-LastErrorText] Session has no GetTaskSessions() method.'
     }
 
     if ($messages.Count -gt 0) {
@@ -446,8 +723,10 @@ function Get-LastErrorText {
     # --- Approach 3: logger records — only EFailed/EWarning entries ---
     $loggerProp = $Session.PSObject.Properties['Logger']
     if ($null -ne $loggerProp -and $null -ne $loggerProp.Value) {
+        Write-DebugMessage '[Get-LastErrorText] Approach 3: enumerating Logger records.'
         try {
             $log = $loggerProp.Value.GetLog()
+            Write-DebugMessage ('[Get-LastErrorText] Logger.GetLog() returned: {0}' -f $(if ($null -eq $log) { '<null>' } else { $log.GetType().FullName }))
             if ($null -ne $log) {
                 $records = $null
                 $updatedProp = $log.PSObject.Properties['UpdatedRecords']
@@ -456,6 +735,9 @@ function Get-LastErrorText {
                     $recProp = $log.PSObject.Properties['Records']
                     if ($null -ne $recProp) { $records = $recProp.Value }
                 }
+
+                $recCount = if ($null -ne $records) { @($records).Count } else { 0 }
+                Write-DebugMessage ('[Get-LastErrorText] Log record count: {0}' -f $recCount)
 
                 if ($null -ne $records) {
                     foreach ($rec in @($records)) {
@@ -466,12 +748,18 @@ function Get-LastErrorText {
 
                         $title = Get-PropertyValue -InputObject $rec -Names @('Title', 'Name', 'Text', 'Message')
                         if ($null -ne $title -and -not [string]::IsNullOrWhiteSpace([string]$title)) {
+                            Write-DebugMessage ('[Get-LastErrorText] Log record [{0}]: {1}' -f $statusVal, [string]$title.Trim())
                             [void]$messages.Add([string]$title.Trim())
                         }
                     }
                 }
             }
-        } catch { }
+        } catch {
+            Write-DebugMessage ('[Get-LastErrorText] Logger approach threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    } else {
+        Write-DebugMessage '[Get-LastErrorText] Session has no Logger property or Logger is null.'
     }
 
     if ($messages.Count -gt 0) {
@@ -541,44 +829,76 @@ function Add-JobReportFromJob {
     $jobName = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
     $jobType = Get-SessionType -Session $Job
 
+    Write-DebugMessage ('[Add-JobReportFromJob] Job="{0}" Type="{1}" Source={2}' -f $jobName, $jobType, $Source)
+    if ($script:CollectorDebugEnabled) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Job object summary:' + [Environment]::NewLine + (Format-VeeamObjectSummary -InputObject $Job))
+    }
+
     # Collect candidate sessions from the job object.
     $candidates = New-Object 'System.Collections.Generic.List[object]'
 
     if ($Job.PSObject.Methods['FindLastSession']) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.FindLastSession() for "{0}"' -f $jobName)
         try {
             $s = $Job.FindLastSession()
-            if ($null -ne $s) { [void]$candidates.Add($s) }
-        } catch { }
+            if ($null -ne $s) {
+                Write-DebugMessage ('[Add-JobReportFromJob] FindLastSession() returned: {0}' -f (Get-SessionName -Session $s))
+                [void]$candidates.Add($s)
+            } else {
+                Write-DebugMessage '[Add-JobReportFromJob] FindLastSession() returned null.'
+            }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] $Job.FindLastSession() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
     }
 
     if ($Job.PSObject.Methods['FindLastSessions']) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.FindLastSessions() for "{0}"' -f $jobName)
         try {
-            foreach ($s in @($Job.FindLastSessions())) {
+            $found = @($Job.FindLastSessions())
+            Write-DebugMessage ('[Add-JobReportFromJob] FindLastSessions() returned {0} session(s).' -f $found.Count)
+            foreach ($s in $found) {
                 if ($null -ne $s) { [void]$candidates.Add($s) }
             }
-        } catch { }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] $Job.FindLastSessions() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
     }
 
     if ($Job.PSObject.Methods['GetSessions']) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.GetSessions() for "{0}"' -f $jobName)
         try {
-            foreach ($s in @($Job.GetSessions())) {
+            $found = @($Job.GetSessions())
+            Write-DebugMessage ('[Add-JobReportFromJob] GetSessions() returned {0} session(s).' -f $found.Count)
+            foreach ($s in $found) {
                 if ($null -ne $s) { [void]$candidates.Add($s) }
             }
-        } catch { }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] $Job.GetSessions() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
     }
 
     # Also try Get-VBRBackupSession filtered by job when available.
     if (Get-Command -Name 'Get-VBRBackupSession' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling Get-VBRBackupSession -Job "{0}"' -f $jobName)
         try {
             $bsSessions = @(Get-VBRBackupSession -Job $Job -ErrorAction Stop)
+            Write-DebugMessage ('[Add-JobReportFromJob] Get-VBRBackupSession returned {0} session(s).' -f $bsSessions.Count)
             foreach ($s in $bsSessions) {
                 if ($null -ne $s) { [void]$candidates.Add($s) }
             }
-        } catch { }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] Get-VBRBackupSession -Job "{0}" threw:' -f $jobName +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
     }
 
     # Filter to window and pick the most recent.
     $inWindow = @($candidates | Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) })
+    Write-DebugMessage ('[Add-JobReportFromJob] "{0}": {1} candidate(s), {2} in window.' -f $jobName, $candidates.Count, $inWindow.Count)
     if ($inWindow.Count -eq 0) { return }
 
     # Sort by end time descending, then start time descending; pick first.
@@ -592,10 +912,20 @@ function Add-JobReportFromJob {
 
     $session = $sorted[0]
 
+    Write-DebugMessage ('[Add-JobReportFromJob] Selected session for "{0}": {1}' -f $jobName, (Get-SessionName -Session $session))
+    if ($script:CollectorDebugEnabled) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Session object summary:' + [Environment]::NewLine + (Format-VeeamObjectSummary -InputObject $session))
+    }
+
     $sessionId = Get-ObjectIdentity -InputObject $session
-    if (-not $script:SeenSessions.Add($sessionId)) { return }
+    if (-not $script:SeenSessions.Add($sessionId)) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Session "{0}" already seen; skipping duplicate.' -f $sessionId)
+        return
+    }
 
     $report = Build-JobReport -Session $session -JobName $jobName -JobType $jobType -Source $Source
+    Write-DebugMessage ('[Add-JobReportFromJob] Built report for "{0}": result={1}  lastError={2}' `
+        -f $jobName, $report.result, $(if ([string]::IsNullOrWhiteSpace($report.last_error)) { '<none>' } else { $report.last_error }))
     [void]$Results.Value.Add($report)
 }
 
@@ -642,10 +972,25 @@ function Write-CollectorHeader {
 # Main
 # ===========================================================================
 
+# Top-level fatal error trap — catches any terminating error that escapes the
+# structured try/catch blocks below, emits a FATAL diagnostic record, and
+# exits with a non-zero code so callers detect the failure.
+trap {
+    $fatalMsg = '[FATAL] Veeam_Collector.ps1 terminated with an unhandled error.'
+    Write-Warning $fatalMsg
+    # Use Write-DebugMessage for the detail record; it handles both Warning stream
+    # and file append in one place.  The plain Write-Warning above always fires so
+    # callers see the FATAL line even when -CollectorDebug is not set.
+    Write-DebugMessage ('FATAL error detail:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    $host.SetShouldExit(1)
+    break
+}
+
 Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
     -f $Hours, $script:StartTime, $script:EndTime)
 
 Import-VeeamPowerShell
+Write-EnvironmentDiagnostics
 Write-CollectorHeader
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
@@ -654,10 +999,13 @@ $allReports = New-Object 'System.Collections.Generic.List[object]'
 # Phase 1 — Regular VBR jobs via Get-VBRJob
 # ---------------------------------------------------------------------------
 Write-ProgressMessage 'Phase 1 — Enumerating regular jobs (Get-VBRJob).'
+Write-DebugMessage '[Main] Phase 1 — Get-VBRJob'
 if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
     try {
+        Write-DebugMessage '[Main] Calling Get-VBRJob ...'
         $vbrJobs = @(Get-VBRJob -ErrorAction Stop -WarningAction SilentlyContinue)
         Write-ProgressMessage ('  Found {0} job(s) via Get-VBRJob.' -f $vbrJobs.Count)
+        Write-DebugMessage ('[Main] Get-VBRJob returned {0} job(s).' -f $vbrJobs.Count)
         $idx = 0
         foreach ($job in $vbrJobs) {
             $idx++
@@ -667,23 +1015,30 @@ if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
                 Add-JobReportFromJob -Job $job -Source 'Get-VBRJob' -Results ([ref]$allReports)
             } catch {
                 Write-Warning ('  Unable to process job "{0}": {1}' -f $jn, $_.Exception.Message)
+                Write-DebugMessage ('[Main] Add-JobReportFromJob failed for "{0}":' -f $jn +
+                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
             }
         }
     } catch {
         Write-Warning ('Unable to enumerate jobs via Get-VBRJob: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
     }
 } else {
     Write-ProgressMessage '  Get-VBRJob not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRJob cmdlet not found.'
 }
 
 # ---------------------------------------------------------------------------
 # Phase 2 — Computer/agent backup jobs via Get-VBRComputerBackupJob
 # ---------------------------------------------------------------------------
 Write-ProgressMessage 'Phase 2 — Computer/agent backup jobs (Get-VBRComputerBackupJob).'
+Write-DebugMessage '[Main] Phase 2 — Get-VBRComputerBackupJob'
 if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) {
     try {
+        Write-DebugMessage '[Main] Calling Get-VBRComputerBackupJob ...'
         $computerJobs = @(Get-VBRComputerBackupJob -ErrorAction Stop -WarningAction SilentlyContinue)
         Write-ProgressMessage ('  Found {0} computer backup job(s).' -f $computerJobs.Count)
+        Write-DebugMessage ('[Main] Get-VBRComputerBackupJob returned {0} job(s).' -f $computerJobs.Count)
         $idx = 0
         foreach ($job in $computerJobs) {
             $idx++
@@ -693,25 +1048,33 @@ if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) 
                 Add-JobReportFromJob -Job $job -Source 'Get-VBRComputerBackupJob' -Results ([ref]$allReports)
             } catch {
                 Write-Warning ('  Unable to process computer backup job "{0}": {1}' -f $jn, $_.Exception.Message)
+                Write-DebugMessage ('[Main] Add-JobReportFromJob failed for computer job "{0}":' -f $jn +
+                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
             }
         }
     } catch {
         Write-Warning ('Unable to enumerate computer backup jobs: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRComputerBackupJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
     }
 } else {
     Write-ProgressMessage '  Get-VBRComputerBackupJob not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRComputerBackupJob cmdlet not found.'
 }
 
 # ---------------------------------------------------------------------------
 # Phase 3 — SOBR capacity-tier offload sessions
 # ---------------------------------------------------------------------------
 Write-ProgressMessage 'Phase 3 — SOBR capacity-tier offload (Get-VBRCapacityTierSyncSession).'
+Write-DebugMessage '[Main] Phase 3 — Get-VBRCapacityTierSyncSession'
 if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyContinue) {
     try {
+        Write-DebugMessage '[Main] Calling Get-VBRCapacityTierSyncSession ...'
         $sobrSessions = @(Get-VBRCapacityTierSyncSession -ErrorAction Stop)
         Write-ProgressMessage ('  Found {0} capacity-tier session(s).' -f $sobrSessions.Count)
+        Write-DebugMessage ('[Main] Get-VBRCapacityTierSyncSession returned {0} session(s).' -f $sobrSessions.Count)
         $inWindow = @($sobrSessions | Where-Object { Test-SessionInWindow -Session $_ })
         Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] SOBR sessions in window: {0}' -f $inWindow.Count)
 
         # For SOBR sessions there is no parent job object — report per session.
         # Group by name to pick the most-recent per named offload job.
@@ -735,16 +1098,20 @@ if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyCont
             $sessionId = Get-ObjectIdentity -InputObject $s
             if (-not $script:SeenSessions.Add($sessionId)) { continue }
             $report = Build-JobReport -Session $s -JobType 'CapacityTierSync' -Source 'Get-VBRCapacityTierSyncSession'
+            Write-DebugMessage ('[Main] SOBR report: name={0} result={1}' -f $report.job_name, $report.result)
             [void]$allReports.Add($report)
         }
     } catch {
         Write-Warning ('Unable to enumerate capacity-tier sessions: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRCapacityTierSyncSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
     }
 } else {
     Write-ProgressMessage '  Get-VBRCapacityTierSyncSession not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRCapacityTierSyncSession cmdlet not found.'
 }
 
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
+Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
 
 # ---------------------------------------------------------------------------
 # Apply -OnlyFailures filter
@@ -754,10 +1121,12 @@ $filtered = if ($OnlyFailures) {
 } else {
     @($allReports)
 }
+Write-DebugMessage ('[Main] After OnlyFailures filter: {0} entries.' -f $filtered.Count)
 
 # ---------------------------------------------------------------------------
 # Sort: Failed first (0), Warning (1), other (2); then end_time descending.
 # ---------------------------------------------------------------------------
+Write-DebugMessage '[Main] Sorting results by severity then end time.'
 $sorted = @($filtered | Sort-Object -Property @(
     @{ Expression = { [int](Get-ResultSeverityOrder -Result $_.result) }; Descending = $false },
     @{ Expression = { Get-SortableTicks -Value $_.end_time }; Descending = $true }
@@ -772,9 +1141,13 @@ $warnCount   = @($sorted | Where-Object { $_.result -imatch 'Warning|Warn' }).Co
 $successCount= @($sorted | Where-Object { $_.result -imatch 'Success' }).Count
 $withError   = @($sorted | Where-Object { -not [string]::IsNullOrWhiteSpace($_.last_error) }).Count
 
+Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3} withError={4}' `
+    -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
+Write-DebugMessage '[Main] Producing output.'
 if ($Json) {
     $sorted | ConvertTo-Json -Depth 6
     Write-Warning ('Summary: jobs={0} failed={1} warning={2} success={3} with_error={4}' `
@@ -795,4 +1168,9 @@ if ($Json) {
     Write-Output ('Jobs     : {0}  (Failed: {1}  Warning: {2}  Success: {3}  WithError: {4})' `
         -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
     Write-Output '------------------------------------------------------------'
+}
+
+Write-DebugMessage '[Main] Script completed successfully.'
+if ($script:CollectorDebugEnabled -and $null -ne $script:DebugLogFile) {
+    Write-Warning ('[CollectorDebug] Debug log written to: {0}' -f $script:DebugLogFile)
 }
