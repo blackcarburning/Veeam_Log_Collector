@@ -1116,30 +1116,62 @@ Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allRep
 # ---------------------------------------------------------------------------
 # Apply -OnlyFailures filter
 # ---------------------------------------------------------------------------
-$filtered = if ($OnlyFailures) {
-    @($allReports | Where-Object { $_.result -imatch 'Failed|Warning|Warn|Error' })
+Write-DebugMessage ('[Main] Applying OnlyFailures filter. OnlyFailures={0}; input entries={1}' -f [bool]$OnlyFailures, $allReports.Count)
+
+if ($OnlyFailures) {
+    $filtered = foreach ($report in $allReports) {
+        $resultText = if ($null -ne $report.result) { [string]$report.result } else { '' }
+        if ($resultText -imatch 'Failed|Warning|Warn|Error') {
+            $report
+        }
+    }
 } else {
-    @($allReports)
+    $filtered = foreach ($report in $allReports) {
+        $report
+    }
 }
-Write-DebugMessage ('[Main] After OnlyFailures filter: {0} entries.' -f $filtered.Count)
+
+$filtered = @($filtered)
+Write-DebugMessage ('[Main] Filtered entries: {0}.' -f $filtered.Count)
 
 # ---------------------------------------------------------------------------
 # Sort: Failed first (0), Warning (1), other (2); then end_time descending.
 # ---------------------------------------------------------------------------
 Write-DebugMessage '[Main] Sorting results by severity then end time.'
-$sorted = @($filtered | Sort-Object -Property @(
+$sorted = foreach ($report in ($filtered | Sort-Object -Property @(
     @{ Expression = { [int](Get-ResultSeverityOrder -Result $_.result) }; Descending = $false },
     @{ Expression = { Get-SortableTicks -Value $_.end_time }; Descending = $true }
-))
+))) {
+    $report
+}
+
+$sorted = @($sorted)
 
 # ---------------------------------------------------------------------------
 # Compute summary counts
 # ---------------------------------------------------------------------------
 $totalJobs   = $sorted.Count
-$failedCount = @($sorted | Where-Object { $_.result -imatch 'Failed|Fail' }).Count
-$warnCount   = @($sorted | Where-Object { $_.result -imatch 'Warning|Warn' }).Count
-$successCount= @($sorted | Where-Object { $_.result -imatch 'Success' }).Count
-$withError   = @($sorted | Where-Object { -not [string]::IsNullOrWhiteSpace($_.last_error) }).Count
+$failedCount = 0
+$warnCount   = 0
+$successCount= 0
+$withError   = 0
+
+foreach ($report in $sorted) {
+    $resultText = if ($null -ne $report.result) { [string]$report.result } else { '' }
+
+    if ($resultText -imatch 'Failed|Fail') {
+        $failedCount++
+    }
+    if ($resultText -imatch 'Warning|Warn') {
+        $warnCount++
+    }
+    if ($resultText -imatch 'Success') {
+        $successCount++
+    }
+    if (-not [string]::IsNullOrWhiteSpace($report.last_error)) {
+        $withError++
+    }
+}
 
 Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3} withError={4}' `
     -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
