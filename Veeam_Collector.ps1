@@ -803,7 +803,7 @@ function Get-VeeamWarningDetails {
 
     $messages = New-Object 'System.Collections.Generic.List[string]'
     $seenMessages = New-Object 'System.Collections.Generic.HashSet[string]'
-    $statusPattern = 'EWarning|EFailed|Warning|Warn|Failed|Fail|Error|Stopped'
+    $statusPattern = '(EWarning|EFailed|Warning|Warn|Failed|Fail|Error|Stopped)'
 
     function Add-WarningMessage {
         param(
@@ -857,12 +857,18 @@ function Get-VeeamWarningDetails {
             foreach ($record in @($records)) {
                 if ($null -eq $record) { continue }
 
-                $statusText = [string](Get-PropertyValue -InputObject $record -Names @('Status', 'Result', 'State'))
-                if ($statusText -notmatch $statusPattern) { continue }
+                $statusValue = Get-PropertyValue -InputObject $record -Names @('Status', 'Result', 'State')
+                if ($null -eq $statusValue) { continue }
+
+                $statusText = [string]$statusValue
+                if ([string]::IsNullOrWhiteSpace($statusText) -or $statusText -notmatch $statusPattern) { continue }
 
                 $recordText = Get-PropertyValue -InputObject $record -Names @('Title', 'Name', 'Text', 'Message', 'Description')
                 if ($null -eq $recordText -or [string]::IsNullOrWhiteSpace([string]$recordText)) {
                     $recordText = [string]$record
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$recordText)) {
+                    $recordText = ('Warning record (status: {0})' -f $statusText)
                 }
 
                 Add-WarningMessage -Value $recordText -Prefix $Prefix
@@ -918,11 +924,6 @@ function Get-VeeamWarningDetails {
             $taskName = '<task>'
         }
         $taskPrefix = ('Task {0}' -f [string]$taskName)
-
-        $taskStatus = [string](Get-PropertyValue -InputObject $task -Names @('Result', 'State', 'Status'))
-        if (-not [string]::IsNullOrWhiteSpace($taskStatus) -and $taskStatus -match $statusPattern) {
-            Add-WarningMessage -Value $taskStatus -Prefix $taskPrefix
-        }
 
         if ($task.PSObject.Methods['GetLastError']) {
             try {
