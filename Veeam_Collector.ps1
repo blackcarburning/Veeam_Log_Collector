@@ -35,8 +35,8 @@
     messages are sent to the Warning stream so stdout stays valid JSON.
 
 .PARAMETER OnlyFailures
-    When set, only include jobs whose most recent session result is Failed or
-    Warning (or Stopped).  Successful/skipped jobs are omitted from the report.
+    When set, only include jobs whose most recent session result is Failed,
+    Warning, Error, or Stopped.  Successful/skipped jobs are omitted.
 
 .PARAMETER CollectorDebug
     Enable detailed diagnostic/debug logging.  Debug messages are routed to the
@@ -173,7 +173,7 @@ param(
     # Emit a JSON array on stdout. Progress goes to Warning stream.
     [switch]$Json,
 
-    # Only include jobs with Failed, Warning, or Stopped last session.
+    # Only include jobs with Failed, Warning, Error, or Stopped last session.
     [switch]$OnlyFailures,
 
     # Enable detailed script-level diagnostic/debug logging.
@@ -1687,7 +1687,7 @@ Write-DebugMessage '[Main] Phase 6 — Get-VBRSession fallback'
 if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
     try {
         $housekeepingTerms = @('Offload', 'Capacity', 'Archive', 'Repository', 'Object', 'SOBR', 'Sync', 'Config', 'Configuration')
-        $housekeepingPattern = 'Offload|Capacity|Archive|Repository|Object|SOBR|Sync|Config|Configuration'
+        $housekeepingPattern = (($housekeepingTerms | ForEach-Object { [regex]::Escape($_) }) -join '|')
         $fallbackCandidates = New-Object 'System.Collections.Generic.List[object]'
 
         # Try -Type enum discovery first when available.
