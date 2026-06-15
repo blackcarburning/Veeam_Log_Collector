@@ -1,10 +1,12 @@
 # Veeam_Log_Collector
 
-A focused PowerShell script that reports the **last error text** from the most recent session for every Veeam backup, replication, backup-copy, agent, and SOBR capacity-tier offload job.
+A focused PowerShell script that reports the **last error text** from the most recent session for every Veeam backup, replication, backup-copy, agent, SOBR capacity-tier offload, configuration backup, and repository offload job.
 
 ## What it does
 
-For every backup/replication/offload job it finds the **most recent session within the last N hours**, extracts the last error/warning text, and produces a compact, LLM-friendly report.  No log bundles are created — the output is small enough to paste directly into an LLM prompt or pipe to `jq`.
+For every backup/replication/offload/housekeeping job it finds the **most recent session within the last N hours**, extracts the last error/warning text, and produces a compact, LLM-friendly report.  No log bundles are created — the output is small enough to paste directly into an LLM prompt or pipe to `jq`.
+
+Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available.  If a cmdlet is absent the phase is skipped gracefully with a progress/debug message.
 
 ## Requirements
 

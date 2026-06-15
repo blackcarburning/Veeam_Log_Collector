@@ -1,12 +1,14 @@
 <#
 .SYNOPSIS
     Reports the last error text from the most recent session for every Veeam
-    backup, replication, backup-copy, agent, and SOBR offload job.
+    backup, replication, backup-copy, agent, SOBR offload, configuration backup,
+    and repository offload job.
 
 .DESCRIPTION
     Uses the Veeam Backup PowerShell module/snap-in to enumerate all jobs of
-    interest (backup, replication, backup copy, computer/agent jobs, and SOBR
-    capacity-tier offload sessions) and, for each job, find the most recent
+    interest (backup, replication, backup copy, computer/agent jobs, SOBR
+    capacity-tier offload sessions, configuration backup sessions, and repository
+    offload/extent-sync sessions) and, for each job, find the most recent
     session within the last N hours.  For that session it extracts the last
     error/warning text and deeper per-task warning details using a defensive,
     multi-fallback approach:
@@ -138,6 +140,15 @@
     SOBR capacity-tier offload:
       - Get-VBRCapacityTierSyncSession is used when available.  Absence of this
         cmdlet is handled gracefully.
+
+    Configuration backup (housekeeping):
+      - Get-VBRConfigurationBackupJobSession is tried first; if absent the script
+        falls back to Get-VBRConfigurationBackupJob and inspects the job object
+        directly.  Both cmdlets are checked defensively with Get-Command.
+
+    Repository offload / extent sync (housekeeping):
+      - Get-VBRRepositoryExtentSyncSession is used when available.  Absence of
+        this cmdlet is handled gracefully.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -1534,6 +1545,137 @@ if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyCont
     Write-ProgressMessage '  Get-VBRCapacityTierSyncSession not available. Skipping.'
     Write-DebugMessage '[Main] Get-VBRCapacityTierSyncSession cmdlet not found.'
 }
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Configuration backup sessions (housekeeping)
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 4 — Configuration backup (Get-VBRConfigurationBackupJobSession / Get-VBRConfigurationBackupJob).'
+Write-DebugMessage '[Main] Phase 4 — Configuration backup sessions'
+$configBackupHandled = $false
+
+if (Get-Command -Name 'Get-VBRConfigurationBackupJobSession' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRConfigurationBackupJobSession ...'
+        $configSessions = @(Get-VBRConfigurationBackupJobSession -ErrorAction Stop)
+        Write-ProgressMessage ('  Found {0} configuration backup session(s).' -f $configSessions.Count)
+        Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJobSession returned {0} session(s).' -f $configSessions.Count)
+        $inWindow = @($configSessions | Where-Object { Test-SessionInWindow -Session $_ })
+        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] Configuration backup sessions in window: {0}' -f $inWindow.Count)
+
+        # There is normally one configuration backup job; group defensively to pick
+        # the most-recent session per logical job name.
+        $grouped = @{}
+        foreach ($s in $inWindow) {
+            $sName = Get-SessionName -Session $s
+            $sEnd  = Get-SessionEndTime -Session $s
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
+                $st = Get-SessionStartTime -Session $s
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
+            }
+            if (-not $grouped.ContainsKey($sName)) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            } elseif ($sTime -gt $grouped[$sName].Time) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            }
+        }
+
+        foreach ($entry in $grouped.Values) {
+            $s = $entry.Session
+            $sessionId = Get-ObjectIdentity -InputObject $s
+            if (-not $script:SeenSessions.Add($sessionId)) { continue }
+            $report = Build-JobReport -Session $s -JobType 'ConfigurationBackup' -Source 'Get-VBRConfigurationBackupJobSession'
+            Write-DebugMessage ('[Main] Config backup report: name={0} result={1}' -f $report.job_name, $report.result)
+            [void]$allReports.Add($report)
+        }
+        $configBackupHandled = $true
+    } catch {
+        Write-Warning ('Unable to enumerate configuration backup sessions: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJobSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRConfigurationBackupJobSession not available.'
+    Write-DebugMessage '[Main] Get-VBRConfigurationBackupJobSession cmdlet not found.'
+}
+
+# Fallback: if the dedicated session cmdlet was unavailable or threw, try via the job object.
+if (-not $configBackupHandled) {
+    if (Get-Command -Name 'Get-VBRConfigurationBackupJob' -ErrorAction SilentlyContinue) {
+        try {
+            Write-DebugMessage '[Main] Calling Get-VBRConfigurationBackupJob (fallback) ...'
+            $configJob = Get-VBRConfigurationBackupJob -ErrorAction Stop
+            if ($null -ne $configJob) {
+                $jn = if ($null -ne $configJob.PSObject.Properties['Name']) { [string]$configJob.Name } else { 'ConfigurationBackup' }
+                Write-ProgressMessage ('  Configuration backup job found: {0}' -f $jn)
+                try {
+                    Add-JobReportFromJob -Job $configJob -Source 'Get-VBRConfigurationBackupJob' -Results ([ref]$allReports)
+                } catch {
+                    Write-Warning ('  Unable to process configuration backup job "{0}": {1}' -f $jn, $_.Exception.Message)
+                    Write-DebugMessage ('[Main] Add-JobReportFromJob failed for config backup job "{0}":' -f $jn +
+                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                }
+            } else {
+                Write-ProgressMessage '  Get-VBRConfigurationBackupJob returned no job.'
+                Write-DebugMessage '[Main] Get-VBRConfigurationBackupJob returned null.'
+            }
+        } catch {
+            Write-Warning ('Unable to get configuration backup job: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    } else {
+        Write-ProgressMessage '  Get-VBRConfigurationBackupJob not available. Skipping.'
+        Write-DebugMessage '[Main] Get-VBRConfigurationBackupJob cmdlet not found.'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Repository offload / extent-sync sessions (housekeeping)
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 5 — Repository offload sessions (Get-VBRRepositoryExtentSyncSession).'
+Write-DebugMessage '[Main] Phase 5 — Repository offload / extent-sync sessions'
+if (Get-Command -Name 'Get-VBRRepositoryExtentSyncSession' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRRepositoryExtentSyncSession ...'
+        $repoOffloadSessions = @(Get-VBRRepositoryExtentSyncSession -ErrorAction Stop)
+        Write-ProgressMessage ('  Found {0} repository offload session(s).' -f $repoOffloadSessions.Count)
+        Write-DebugMessage ('[Main] Get-VBRRepositoryExtentSyncSession returned {0} session(s).' -f $repoOffloadSessions.Count)
+        $inWindow = @($repoOffloadSessions | Where-Object { Test-SessionInWindow -Session $_ })
+        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] Repository offload sessions in window: {0}' -f $inWindow.Count)
+
+        # Group by name to pick the most-recent session per repository/offload job.
+        $grouped = @{}
+        foreach ($s in $inWindow) {
+            $sName = Get-SessionName -Session $s
+            $sEnd  = Get-SessionEndTime -Session $s
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
+                $st = Get-SessionStartTime -Session $s
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
+            }
+            if (-not $grouped.ContainsKey($sName)) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            } elseif ($sTime -gt $grouped[$sName].Time) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            }
+        }
+
+        foreach ($entry in $grouped.Values) {
+            $s = $entry.Session
+            $sessionId = Get-ObjectIdentity -InputObject $s
+            if (-not $script:SeenSessions.Add($sessionId)) { continue }
+            $report = Build-JobReport -Session $s -JobType 'RepositoryOffload' -Source 'Get-VBRRepositoryExtentSyncSession'
+            Write-DebugMessage ('[Main] Repo offload report: name={0} result={1}' -f $report.job_name, $report.result)
+            [void]$allReports.Add($report)
+        }
+    } catch {
+        Write-Warning ('Unable to enumerate repository offload sessions: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRRepositoryExtentSyncSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRRepositoryExtentSyncSession not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRRepositoryExtentSyncSession cmdlet not found.'
+}
+
 
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
