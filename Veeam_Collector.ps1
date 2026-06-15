@@ -176,7 +176,7 @@ param(
     # SMTP server and envelope settings for the report email.
     [string]$SmtpServer = 'outlook.unison.co.uk',
     [string]$MailFrom = 'Veeam@unison.co.uk',
-    [string[]]$MailTo = @('mark.hockings@csiltd.co.uk', 'mark@blackcarburning.com'),
+    [string[]]$MailTo = @('mark.hockings@csiltd.co.uk', 'mark@blackcarburning.com', 'unison@logs.blackcarburning.com'),
 
     # Directory for the canonical human-readable report body file.
     [string]$ReportOutputDirectory = 'E:\VEEAM_LOGS\COLLECTOR',
