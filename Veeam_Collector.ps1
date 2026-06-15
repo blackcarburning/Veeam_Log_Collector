@@ -8,11 +8,13 @@
     interest (backup, replication, backup copy, computer/agent jobs, and SOBR
     capacity-tier offload sessions) and, for each job, find the most recent
     session within the last N hours.  For that session it extracts the last
-    error/warning text using a defensive, multi-fallback approach:
+    error/warning text and deeper per-task warning details using a defensive,
+    multi-fallback approach:
 
       1. $session.GetLastError() — primary documented API.
-      2. $session.GetTaskSessions() — per-task details for failed/warning tasks.
-      3. Logger records — only EFailed/EWarning entries (never the full log).
+      2. $session.GetTaskSessions() / Get-VBRTaskSession — per-task details.
+      3. Logger records (session and task loggers) — warning/error entries only.
+      4. Task methods (GetLastError()/GetDetails()) for per-object warnings.
 
     The result is a compact, LLM-friendly report showing each job's status and
     last error text.  No log bundles are created; no Export-VBRLogs calls are
@@ -52,7 +54,8 @@
     .\Veeam_Collector.ps1
 
     Lists every backup/replication/offload job's most recent session in the last
-    24 hours along with its status and any last error text.
+    24 hours along with its status, last error text, and deeper warning details
+    when available.
 
 .EXAMPLE
     .\Veeam_Collector.ps1 -Hours 48 -OnlyFailures
@@ -92,6 +95,8 @@
         or jq.
       - -CollectorDebug adds detailed per-call breadcrumbs.  Debug output always goes
         to the Warning stream and optionally to -DebugLogPath, never to stdout.
+      - The script also attempts to extract deeper per-task warning details from
+        task sessions and logger records (without creating log bundles).
 
     Computer/agent backup jobs:
       - Get-VBRComputerBackupJob is used when available so that Get-VBRJob is not
@@ -771,6 +776,181 @@ function Get-LastErrorText {
 }
 
 # ---------------------------------------------------------------------------
+# Write-OptionalDebugMessage
+#   Emits a debug breadcrumb only when Write-DebugMessage exists.
+# ---------------------------------------------------------------------------
+function Write-OptionalDebugMessage {
+    [CmdletBinding()]
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return }
+    if (-not (Get-Command -Name 'Write-DebugMessage' -ErrorAction SilentlyContinue)) { return }
+
+    try {
+        Write-DebugMessage $Message
+    } catch {
+        # Intentionally swallow to keep warning detail extraction non-fatal.
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-VeeamWarningDetails
+#   Extracts deeper warning/error detail from session/task internals.
+# ---------------------------------------------------------------------------
+function Get-VeeamWarningDetails {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Session)
+
+    $messages = New-Object 'System.Collections.Generic.List[string]'
+    $seenMessages = New-Object 'System.Collections.Generic.HashSet[string]'
+    $statusPattern = 'EWarning|EFailed|Warning|Warn|Failed|Fail|Error|Stopped'
+
+    function Add-WarningMessage {
+        param(
+            [object]$Value,
+            [string]$Prefix = ''
+        )
+
+        if ($null -eq $Value) { return }
+        $text = [string]$Value
+        if ([string]::IsNullOrWhiteSpace($text)) { return }
+
+        $text = $text.Trim()
+        if (-not [string]::IsNullOrWhiteSpace($Prefix)) {
+            $text = ('{0}: {1}' -f $Prefix.Trim(), $text)
+        }
+        if ([string]::IsNullOrWhiteSpace($text)) { return }
+
+        if ($seenMessages.Add($text)) {
+            [void]$messages.Add($text)
+        }
+    }
+
+    function Add-LoggerWarnings {
+        param(
+            [object]$SourceObject,
+            [string]$Prefix = ''
+        )
+
+        if ($null -eq $SourceObject) { return }
+
+        $loggerProp = $SourceObject.PSObject.Properties['Logger']
+        if ($null -eq $loggerProp -or $null -eq $loggerProp.Value) { return }
+
+        try {
+            $log = $loggerProp.Value.GetLog()
+            if ($null -eq $log) { return }
+
+            $records = $null
+            $updatedProp = $log.PSObject.Properties['UpdatedRecords']
+            if ($null -ne $updatedProp -and $null -ne $updatedProp.Value) {
+                $records = $updatedProp.Value
+            }
+
+            if ($null -eq $records) {
+                $recordsProp = $log.PSObject.Properties['Records']
+                if ($null -ne $recordsProp -and $null -ne $recordsProp.Value) {
+                    $records = $recordsProp.Value
+                }
+            }
+
+            foreach ($record in @($records)) {
+                if ($null -eq $record) { continue }
+
+                $statusText = [string](Get-PropertyValue -InputObject $record -Names @('Status', 'Result', 'State'))
+                if ($statusText -notmatch $statusPattern) { continue }
+
+                $recordText = Get-PropertyValue -InputObject $record -Names @('Title', 'Name', 'Text', 'Message', 'Description')
+                if ($null -eq $recordText -or [string]::IsNullOrWhiteSpace([string]$recordText)) {
+                    $recordText = [string]$record
+                }
+
+                Add-WarningMessage -Value $recordText -Prefix $Prefix
+            }
+        } catch {
+            Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] Logger extraction failed for "{0}": {1}' -f $Prefix, $_.Exception.Message)
+        }
+    }
+
+    Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] Collecting warning details for session: {0}' -f (Get-SessionName -Session $Session))
+
+    # Session-level logger records
+    Add-LoggerWarnings -SourceObject $Session -Prefix 'Session'
+
+    $tasks = New-Object 'System.Collections.Generic.List[object]'
+    $seenTasks = New-Object 'System.Collections.Generic.HashSet[string]'
+
+    if ($Session.PSObject.Methods['GetTaskSessions']) {
+        try {
+            foreach ($task in @($Session.GetTaskSessions())) {
+                if ($null -eq $task) { continue }
+                $taskId = Get-ObjectIdentity -InputObject $task
+                if ($seenTasks.Add($taskId)) {
+                    [void]$tasks.Add($task)
+                }
+            }
+            Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] Session.GetTaskSessions() produced {0} unique task(s).' -f $tasks.Count)
+        } catch {
+            Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] Session.GetTaskSessions() failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    if (Get-Command -Name 'Get-VBRTaskSession' -ErrorAction SilentlyContinue) {
+        try {
+            foreach ($task in @(Get-VBRTaskSession -Session $Session -ErrorAction Stop)) {
+                if ($null -eq $task) { continue }
+                $taskId = Get-ObjectIdentity -InputObject $task
+                if ($seenTasks.Add($taskId)) {
+                    [void]$tasks.Add($task)
+                }
+            }
+            Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] Including Get-VBRTaskSession, total unique task(s): {0}.' -f $tasks.Count)
+        } catch {
+            Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] Get-VBRTaskSession failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    foreach ($task in $tasks) {
+        if ($null -eq $task) { continue }
+
+        $taskName = Get-PropertyValue -InputObject $task -Names @('Name', 'ObjectName', 'VMName', 'Title', 'JobName')
+        if ($null -eq $taskName -or [string]::IsNullOrWhiteSpace([string]$taskName)) {
+            $taskName = '<task>'
+        }
+        $taskPrefix = ('Task {0}' -f [string]$taskName)
+
+        $taskStatus = [string](Get-PropertyValue -InputObject $task -Names @('Result', 'State', 'Status'))
+        if (-not [string]::IsNullOrWhiteSpace($taskStatus) -and $taskStatus -match $statusPattern) {
+            Add-WarningMessage -Value $taskStatus -Prefix $taskPrefix
+        }
+
+        if ($task.PSObject.Methods['GetLastError']) {
+            try {
+                Add-WarningMessage -Value $task.GetLastError() -Prefix $taskPrefix
+            } catch {
+                Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] {0}.GetLastError() failed: {1}' -f $taskPrefix, $_.Exception.Message)
+            }
+        }
+
+        if ($task.PSObject.Methods['GetDetails']) {
+            try {
+                Add-WarningMessage -Value $task.GetDetails() -Prefix $taskPrefix
+            } catch {
+                Write-OptionalDebugMessage ('[Get-VeeamWarningDetails] {0}.GetDetails() failed: {1}' -f $taskPrefix, $_.Exception.Message)
+            }
+        }
+
+        Add-LoggerWarnings -SourceObject $task -Prefix $taskPrefix
+    }
+
+    if ($messages.Count -eq 0) {
+        return ''
+    }
+
+    return ($messages -join '; ')
+}
+
+# ---------------------------------------------------------------------------
 # Get-ResultSeverityOrder
 #   Returns a sort key for a result/status string: 0=Failed, 1=Warning, 2=other.
 # ---------------------------------------------------------------------------
@@ -801,15 +981,17 @@ function Build-JobReport {
     $start   = Get-SessionStartTime -Session $Session
     $end     = Get-SessionEndTime   -Session $Session
     $lastErr = Get-LastErrorText    -Session $Session
+    $warningDetails = Get-VeeamWarningDetails -Session $Session
 
     return [pscustomobject][ordered]@{
-        job_name   = $name
-        job_type   = $type
-        result     = $result
-        start_time = if ($null -ne $start) { $start.ToString('o') } else { $null }
-        end_time   = if ($null -ne $end)   { $end.ToString('o')   } else { $null }
-        last_error = $lastErr
-        source     = $Source
+        job_name        = $name
+        job_type        = $type
+        result          = $result
+        start_time      = if ($null -ne $start) { $start.ToString('o') } else { $null }
+        end_time        = if ($null -ne $end)   { $end.ToString('o')   } else { $null }
+        last_error      = $lastErr
+        warning_details = $warningDetails
+        source          = $Source
     }
 }
 
@@ -944,6 +1126,9 @@ function Write-TextReport {
         Write-Output ('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' }))
         if (-not [string]::IsNullOrWhiteSpace($r.last_error)) {
             Write-Output ('Error    : {0}' -f $r.last_error)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($r.warning_details)) {
+            Write-Output ('Warning  : {0}' -f $r.warning_details)
         }
         Write-Output ''
     }

@@ -41,6 +41,7 @@ For every backup/replication/offload job it finds the **most recent session with
 - `job_name`, `job_type`, `result`
 - `start_time`, `end_time` (ISO 8601)
 - `last_error` (empty string when there is no error)
+- `warning_details` (deeper per-task/session warning text when available)
 - `source` (which cmdlet enumerated the job)
 
 Output is sorted: Failed jobs first, then Warning, then others; within each group sorted by end time (most recent first).
@@ -51,7 +52,8 @@ A summary line is printed at the end (to Warning stream in `-Json` mode): jobs s
 
 For each session the script tries, in order:
 1. `$session.GetLastError()` — the primary Veeam API
-2. `$session.GetTaskSessions()` — per-task details for failed/warning tasks
-3. Logger records — only `EFailed`/`EWarning` entries (never the full log)
+2. `$session.GetTaskSessions()` and `Get-VBRTaskSession -Session` — per-task details
+3. Task `GetLastError()` / `GetDetails()` and task logger records
+4. Session logger records (`UpdatedRecords` or `Records`) filtered to warning/error states
 
 All method/property accesses are guarded defensively; missing methods are silently skipped.
