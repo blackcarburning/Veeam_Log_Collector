@@ -1305,28 +1305,200 @@ function Get-DJStandardJobType {
 }
 
 # ---------------------------------------------------------------------------
+# Get-DJSessionResult
+#   Extracts the actual result of a session (Success/Warning/Failed/None).
+#   Prefers result fields over state fields so a "Stopped" state does not mask
+#   a "Warning" or "Success" result.
+# ---------------------------------------------------------------------------
+function Get-DJSessionResult {
+    [CmdletBinding()]
+    param([object]$Session)
+
+    if ($null -eq $Session) { return '' }
+
+    foreach ($path in @('Result', 'LastResult', 'Info.Result', 'Info.LastResult')) {
+        $val = Get-DJPropertyPathValue -Object $Session -Path $path
+        if ($null -ne $val) {
+            $s = [string]$val
+            if (-not [string]::IsNullOrWhiteSpace($s)) { return $s }
+        }
+    }
+    return ''
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJSessionStateValue
+#   Returns the current state of a session (Running/Stopped/Idle/etc.).
+#   Checks State then Status; returns empty string when neither exists.
+# ---------------------------------------------------------------------------
+function Get-DJSessionStateValue {
+    [CmdletBinding()]
+    param([object]$Session)
+
+    if ($null -eq $Session) { return '' }
+
+    foreach ($path in @('State', 'Status')) {
+        $val = Get-DJPropertyPathValue -Object $Session -Path $path
+        if ($null -ne $val) {
+            $s = [string]$val
+            if (-not [string]::IsNullOrWhiteSpace($s)) { return $s }
+        }
+    }
+    return ''
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJLatestSessionFromList
+#   Given a list of candidate sessions, returns the one with the latest end
+#   time (or start time when end time is absent).
+# ---------------------------------------------------------------------------
+function Get-DJLatestSessionFromList {
+    [CmdletBinding()]
+    param([object[]]$Sessions)
+
+    if ($null -eq $Sessions -or $Sessions.Count -eq 0) { return $null }
+
+    $best     = $null
+    $bestTick = [long]::MinValue
+
+    foreach ($s in $Sessions) {
+        $endTime   = Get-SessionEndTime   -Session $s
+        $startTime = Get-SessionStartTime -Session $s
+        # Sessions with no timestamp at all are skipped — they should never
+        # beat a session that has a real end or start time.
+        if ($null -eq $endTime -and $null -eq $startTime) { continue }
+        $t = if ($null -ne $endTime) { Get-SortableTicks -Value $endTime } `
+             else                    { Get-SortableTicks -Value $startTime }
+        if ($t -gt $bestTick) { $bestTick = $t; $best = $s }
+    }
+
+    return $best
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJSessionMatchScore
+#   Returns > 0 when $Session can be matched to $Job; 0 means no match.
+#   Tries (highest to lowest): GUID IDs → job-name equality → session-name prefix.
+# ---------------------------------------------------------------------------
+function Get-DJSessionMatchScore {
+    [CmdletBinding()]
+    param(
+        [object]$Session,
+        [object]$Job
+    )
+
+    if ($null -eq $Session -or $null -eq $Job) { return 0 }
+
+    $jobId   = Get-DJPropertyPathValue -Object $Job -Path 'Id'
+    $jobName = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { $null }
+
+    if ($null -ne $jobId) {
+        $jobIdStr = [string]$jobId
+        foreach ($path in @('JobId', 'Info.JobId', 'Info.Id')) {
+            $val = Get-DJPropertyPathValue -Object $Session -Path $path
+            if ($null -ne $val -and [string]$val -eq $jobIdStr) { return 3 }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($jobName)) {
+        foreach ($path in @('JobName', 'Info.JobName')) {
+            $val = Get-DJPropertyPathValue -Object $Session -Path $path
+            if ($null -ne $val -and [string]$val -ieq $jobName) { return 2 }
+        }
+        $sesName = Get-DJPropertyPathValue -Object $Session -Path 'Name'
+        if ($null -ne $sesName) {
+            $sn = [string]$sesName
+            if ($sn -ieq $jobName -or $sn -ilike "$jobName@*" -or $sn -ilike "$jobName *") { return 1 }
+        }
+    }
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJLatestSessionForJob
+#   Returns the latest session object for a job using type-specific cmdlets.
+#   Uses pre-cached session arrays (populated by Get-DefinedJobsReport before
+#   the per-job loops) to avoid repeated expensive cmdlet calls.
+#   TypeOverride controls which retrieval path is attempted first.
+# ---------------------------------------------------------------------------
+function Get-DJLatestSessionForJob {
+    [CmdletBinding()]
+    param(
+        [object]$Job,
+        [string]$TypeOverride
+    )
+
+    $jobName = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { $null }
+
+    # -- Agent / computer backup jobs --
+    if ($TypeOverride -eq 'Agent' -and $null -ne $script:DJCachedAgentSessions) {
+        $matched = @($script:DJCachedAgentSessions | Where-Object { (Get-DJSessionMatchScore -Session $_ -Job $Job) -gt 0 })
+        if ($matched.Count -gt 0) { return Get-DJLatestSessionFromList -Sessions $matched }
+    }
+
+    # -- Application backup jobs --
+    if ($TypeOverride -eq 'Application' -and $null -ne $script:DJCachedAppSessions) {
+        $matched = @($script:DJCachedAppSessions | Where-Object { (Get-DJSessionMatchScore -Session $_ -Job $Job) -gt 0 })
+        if ($matched.Count -gt 0) { return Get-DJLatestSessionFromList -Sessions $matched }
+    }
+
+    # -- File / NAS / unstructured jobs --
+    if ($TypeOverride -eq 'File/NAS') {
+        if (Get-Command -Name 'Get-VBRUnstructuredBackupSession' -ErrorAction SilentlyContinue) {
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($jobName)) {
+                    $sessions = @(Get-VBRUnstructuredBackupSession -Name "$($jobName)*" -ErrorAction SilentlyContinue)
+                    if ($sessions.Count -gt 0) { return Get-DJLatestSessionFromList -Sessions $sessions }
+                }
+            } catch {
+                Write-DebugMessage ('[Get-DJLatestSessionForJob] Get-VBRUnstructuredBackupSession failed for "{0}": {1}' -f $jobName, $_.Exception.Message)
+            }
+        }
+    }
+
+    # -- Standard VBR jobs: FindLastSession() first (most accurate) --
+    if ($Job.PSObject.Methods['FindLastSession']) {
+        try {
+            $s = $Job.FindLastSession()
+            if ($null -ne $s) { return $s }
+        } catch {}
+    }
+
+    # -- Generic fallback: match against pre-cached VBR backup sessions --
+    if ($null -ne $script:DJCachedVBRSessions) {
+        $matched = @($script:DJCachedVBRSessions | Where-Object { (Get-DJSessionMatchScore -Session $_ -Job $Job) -gt 0 })
+        if ($matched.Count -gt 0) { return Get-DJLatestSessionFromList -Sessions $matched }
+    }
+
+    return $null
+}
+
+# ---------------------------------------------------------------------------
 # Get-DJLastRunForJob
-#   Returns a hash-table @{ LastRun = <string>; Status = <string> } for a job.
-#   Tries job.FindLastSession() first, then direct LastRun / LastResult properties.
+#   Returns a hash-table @{ LastRun; Status; LastResult } for a job.
+#   Uses Get-DJLatestSessionForJob (type-specific cmdlets + FindLastSession) so
+#   that Agent, Application, and File/NAS jobs return populated values.
+#   Status  = current session state (Running/Stopped/Idle).
+#   LastResult = actual job result (Success/Warning/Failed/None).
 # ---------------------------------------------------------------------------
 function Get-DJLastRunForJob {
     [CmdletBinding()]
-    param([object]$Job)
+    param(
+        [object]$Job,
+        [string]$TypeOverride = ''
+    )
 
-    $lastSession = $null
-
-    if ($Job.PSObject.Methods['FindLastSession']) {
-        try { $lastSession = $Job.FindLastSession() } catch {}
-    }
+    $lastSession = Get-DJLatestSessionForJob -Job $Job -TypeOverride $TypeOverride
 
     if ($null -ne $lastSession) {
         $endTime   = Get-SessionEndTime   -Session $lastSession
         $startTime = Get-SessionStartTime -Session $lastSession
         $runTime   = if ($null -ne $endTime) { $endTime } elseif ($null -ne $startTime) { $startTime } else { $null }
-        $state     = Get-SessionState -Session $lastSession
         return @{
-            LastRun = if ($null -ne $runTime) { $runTime.ToString($script:DJDateFormat) } else { '' }
-            Status  = $state
+            LastRun    = if ($null -ne $runTime) { $runTime.ToString($script:DJDateFormat) } else { '' }
+            Status     = Get-DJSessionStateValue -Session $lastSession
+            LastResult = Get-DJSessionResult     -Session $lastSession
         }
     }
 
@@ -1338,8 +1510,9 @@ function Get-DJLastRunForJob {
     $lastResult = Get-DJPropertyPathValue -Object $Job -Path 'LastResult'
 
     return @{
-        LastRun = if ($null -ne $lastRun) { $lastRun.ToString($script:DJDateFormat) } else { '' }
-        Status  = if ($null -ne $lastResult) { [string]$lastResult } else { '' }
+        LastRun    = if ($null -ne $lastRun) { $lastRun.ToString($script:DJDateFormat) } else { '' }
+        Status     = ''
+        LastResult = if ($null -ne $lastResult) { [string]$lastResult } else { '' }
     }
 }
 
@@ -1400,15 +1573,16 @@ function New-DJJobReportRow {
     $jobName      = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
     $schedEnabled = Get-DJScheduleEnabled  -Job $Job
     $schedDisplay = Get-DJScheduleDisplay  -Job $Job
-    $lastRunInfo  = Get-DJLastRunForJob    -Job $Job
+    $lastRunInfo  = Get-DJLastRunForJob    -Job $Job -TypeOverride $TypeOverride
 
     return [pscustomobject][ordered]@{
-        Job      = $jobName
-        Type     = $TypeOverride
-        On       = if ($schedEnabled) { 'Yes' } else { 'No' }
-        Schedule = $schedDisplay
-        LastRun  = $lastRunInfo.LastRun
-        Status   = $lastRunInfo.Status
+        Job        = $jobName
+        Type       = $TypeOverride
+        On         = if ($schedEnabled) { 'Yes' } else { 'No' }
+        Schedule   = $schedDisplay
+        LastRun    = $lastRunInfo.LastRun
+        Status     = $lastRunInfo.Status
+        LastResult = $lastRunInfo.LastResult
     }
 }
 
@@ -1426,6 +1600,44 @@ function Get-DefinedJobsReport {
 
     $rows      = New-Object 'System.Collections.Generic.List[object]'
     $seenNames = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+
+    # Pre-fetch sessions once per type to avoid repeated cmdlet calls in the
+    # per-job row-builder. $null means the cmdlet is unavailable; @() means it
+    # returned no sessions.  Get-DJLatestSessionForJob checks for $null before
+    # using a cache so missing cmdlets are handled gracefully.
+
+    $script:DJCachedAgentSessions = $null
+    if (Get-Command -Name 'Get-VBRComputerBackupJobSession' -ErrorAction SilentlyContinue) {
+        try {
+            $script:DJCachedAgentSessions = @(Get-VBRComputerBackupJobSession -ErrorAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Cached {0} agent session(s).' -f $script:DJCachedAgentSessions.Count)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRComputerBackupJobSession cache failed: {0}' -f $_.Exception.Message)
+            $script:DJCachedAgentSessions = @()
+        }
+    }
+
+    $script:DJCachedAppSessions = $null
+    if (Get-Command -Name 'Get-VBRApplicationBackupJobSession' -ErrorAction SilentlyContinue) {
+        try {
+            $script:DJCachedAppSessions = @(Get-VBRApplicationBackupJobSession -ErrorAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Cached {0} application session(s).' -f $script:DJCachedAppSessions.Count)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRApplicationBackupJobSession cache failed: {0}' -f $_.Exception.Message)
+            $script:DJCachedAppSessions = @()
+        }
+    }
+
+    $script:DJCachedVBRSessions = $null
+    if (Get-Command -Name 'Get-VBRBackupSession' -ErrorAction SilentlyContinue) {
+        try {
+            $script:DJCachedVBRSessions = @(Get-VBRBackupSession -ErrorAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Cached {0} VBR backup session(s).' -f $script:DJCachedVBRSessions.Count)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRBackupSession cache failed: {0}' -f $_.Exception.Message)
+            $script:DJCachedVBRSessions = @()
+        }
+    }
 
     # ---- Agent / computer backup jobs ----
     if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) {
@@ -1552,47 +1764,51 @@ function New-DefinedJobsSectionText {
         Write-DebugMessage ('[New-DefinedJobsSectionText] Collection complete: {0} row(s).' -f $rows.Count)
 
         # Column widths
-        $wJob  = 38
-        $wType = 11
-        $wOn   = 3
-        $wSch  = 18
-        $wLast = 16
-        $wRes  = 8
+        $wJob    = 38
+        $wType   = 11
+        $wOn     = 3
+        $wSch    = 18
+        $wLast   = 16
+        $wStat   = 11
+        $wResult = 11
 
         $lines = New-Object 'System.Collections.Generic.List[string]'
         [void]$lines.Add('############### Defined Jobs BEGIN ###################')
 
         # Header row
-        [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f
+        [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6}' -f
             'Job'.PadRight($wJob),
             'Type'.PadRight($wType),
             'On'.PadRight($wOn),
             'Next / schedule'.PadRight($wSch),
             'Last run'.PadRight($wLast),
-            'Status'.PadRight($wRes)))
+            'Status'.PadRight($wStat),
+            'Last Result'.PadRight($wResult)))
 
         # Separator
-        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wRes + 5))
+        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wStat + $wResult + 6))
 
         if ($rows.Count -eq 0) {
             [void]$lines.Add('(no defined jobs found)')
         } else {
             foreach ($r in $rows) {
-                $jobCol  = [string]$r.Job
-                $typCol  = [string]$r.Type
-                $onCol   = [string]$r.On
-                $schCol  = [string]$r.Schedule
-                $lastCol = [string]$r.LastRun
-                $resCol  = [string]$r.Status
+                $jobCol    = [string]$r.Job
+                $typCol    = [string]$r.Type
+                $onCol     = [string]$r.On
+                $schCol    = [string]$r.Schedule
+                $lastCol   = [string]$r.LastRun
+                $statCol   = [string]$r.Status
+                $resultCol = [string]$r.LastResult
 
-                $jobField  = if ($jobCol.Length  -gt $wJob)  { $jobCol.Substring(0, $wJob)   } else { $jobCol.PadRight($wJob)   }
-                $typeField = if ($typCol.Length  -gt $wType) { $typCol.Substring(0, $wType)  } else { $typCol.PadRight($wType)  }
-                $onField   = if ($onCol.Length   -gt $wOn)   { $onCol.Substring(0, $wOn)     } else { $onCol.PadRight($wOn)     }
-                $schField  = if ($schCol.Length  -gt $wSch)  { $schCol.Substring(0, $wSch)   } else { $schCol.PadRight($wSch)   }
-                $lastField = if ($lastCol.Length -gt $wLast) { $lastCol.Substring(0, $wLast) } else { $lastCol.PadRight($wLast) }
-                $resField  = if ($resCol.Length  -gt $wRes)  { $resCol.Substring(0, $wRes)   } else { $resCol.PadRight($wRes)   }
+                $jobField    = if ($jobCol.Length    -gt $wJob)    { $jobCol.Substring(0, $wJob)       } else { $jobCol.PadRight($wJob)       }
+                $typeField   = if ($typCol.Length    -gt $wType)   { $typCol.Substring(0, $wType)      } else { $typCol.PadRight($wType)      }
+                $onField     = if ($onCol.Length     -gt $wOn)     { $onCol.Substring(0, $wOn)         } else { $onCol.PadRight($wOn)         }
+                $schField    = if ($schCol.Length    -gt $wSch)    { $schCol.Substring(0, $wSch)       } else { $schCol.PadRight($wSch)       }
+                $lastField   = if ($lastCol.Length   -gt $wLast)   { $lastCol.Substring(0, $wLast)     } else { $lastCol.PadRight($wLast)     }
+                $statField   = if ($statCol.Length   -gt $wStat)   { $statCol.Substring(0, $wStat)     } else { $statCol.PadRight($wStat)     }
+                $resultField = if ($resultCol.Length -gt $wResult) { $resultCol.Substring(0, $wResult) } else { $resultCol.PadRight($wResult) }
 
-                [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f $jobField, $typeField, $onField, $schField, $lastField, $resField))
+                [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6}' -f $jobField, $typeField, $onField, $schField, $lastField, $statField, $resultField))
             }
         }
 

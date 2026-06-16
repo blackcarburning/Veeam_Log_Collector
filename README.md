@@ -10,10 +10,10 @@ In normal text mode the report begins with a **Defined Jobs baseline** section s
 
 ```
 ############### Defined Jobs BEGIN ###################
-Job                                    Type        On  Next / schedule    Last run         Status
--------------------------------------------------------------------------------------------------
-VMware_Daily_Backup                    VM          Yes Daily 23:00        16/06/2026 02:26 Warning
-VMware_Daily_CATCHALL                  VM          Yes Daily 04:00        16/06/2026 02:45 Warning
+Job                                    Type        On  Next / schedule    Last run         Status      Last Result
+------------------------------------------------------------------------------------------------------------------
+VMware_Daily_Backup                    VM          Yes Daily 23:00        16/06/2026 02:26 Stopped     Warning
+VMware_Daily_CATCHALL                  VM          Yes Daily 04:00        16/06/2026 02:45 Stopped     Warning
 ############### Defined Jobs END ###################
 ```
 
@@ -83,7 +83,17 @@ Columns (fixed width):
 | On | 3 | `Yes` if scheduling is enabled, `No` otherwise |
 | Next / schedule | 18 | Next scheduled run (if in the future) or a schedule description such as `Daily 22:00` |
 | Last run | 16 | End time of the most recent session (`dd/MM/yyyy HH:mm`) |
-| Status | 8 | Result of the most recent session (e.g. `Success`, `Warning`, `Failed`) |
+| Status | 11 | Current session state (e.g. `Running`, `Stopped`, `Idle`) |
+| Last Result | 11 | Actual result of the most recent session (e.g. `Success`, `Warning`, `Failed`) |
+
+Session retrieval per job type:
+
+| Job type | Session cmdlet used |
+|----------|---------------------|
+| Agent | `Get-VBRComputerBackupJobSession` (pre-fetched once, matched by ID/name) |
+| Application | `Get-VBRApplicationBackupJobSession` (pre-fetched once, matched by ID/name) |
+| File/NAS | `Get-VBRUnstructuredBackupSession -Name "$($Job.Name)*"` |
+| Standard VBR | `FindLastSession()` on the job object; falls back to `Get-VBRBackupSession` |
 
 ## How errors are extracted
 
