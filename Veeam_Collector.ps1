@@ -22,6 +22,20 @@
     last error text.  No log bundles are created; no Export-VBRLogs calls are
     made.
 
+    In normal text mode the report begins with a **Defined Jobs** baseline
+    section delimited by:
+
+        ############### Defined Jobs BEGIN ###################
+        ...
+        ############### Defined Jobs END ###################
+
+    This section lists all defined backup jobs (agent, application, unstructured,
+    and standard backup types) with their schedule, enabled status, next scheduled
+    run or schedule description, last run time, and last result.  It gives
+    operators and LLMs a quick reference for what jobs should be running and when.
+    The Defined Jobs block is omitted from JSON (-Json) mode so that stdout
+    remains a pure JSON array.
+
     Progress messages are printed throughout.  In default (human-readable) mode
     they go to the console (Write-Host).  In -Json mode they go to the Warning
     stream so that standard output remains pure JSON.
@@ -132,6 +146,18 @@
       - After the report is built, the same human-readable body is written to
         E:\VEEAM_LOGS\COLLECTOR by default, emailed by default, and old
         collector-created files in that directory are removed after 7 days.
+
+    Defined Jobs baseline (text mode only):
+      - In normal text mode the report opens with a Defined Jobs section showing
+        every defined backup job (agent, application, unstructured, and standard
+        backup) with its schedule, enabled status, next run / schedule description,
+        last run time, and last result.
+      - The block is delimited with:
+            ############### Defined Jobs BEGIN ###################
+            ############### Defined Jobs END ###################
+      - The block is omitted from -Json mode; stdout remains a pure JSON array.
+      - If Defined Jobs collection fails, a warning is printed and the rest of the
+        report continues normally.
 
     Computer/agent backup jobs:
       - Get-VBRComputerBackupJob is used when available so that Get-VBRJob is not
@@ -423,6 +449,7 @@ $script:EndTime      = Get-Date
 $script:StartTime    = $script:EndTime.AddHours(-[Math]::Abs($Hours))
 $script:Cutoff       = $script:StartTime
 $script:SeenSessions = New-Object 'System.Collections.Generic.HashSet[string]'
+$script:DJDateFormat = 'dd/MM/yyyy HH:mm'
 
 # ---------------------------------------------------------------------------
 # Write-ProgressMessage
@@ -1032,6 +1059,542 @@ function Get-ResultSeverityOrder {
     return [int]2
 }
 
+# ===========================================================================
+# Defined Jobs baseline — helper functions
+#   All functions carry the DJ (Defined Jobs) prefix to avoid collisions with
+#   existing collector helpers.  These functions are intentionally defensive:
+#   every Veeam property access uses try/catch or PSObject.Properties so that
+#   version-specific schema differences do not crash the baseline collection.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Get-DJPropertyPathValue
+#   Navigate a dotted property path on a PSObject (e.g. "ScheduleOptions.NextRun").
+#   Returns $null at the first missing segment.
+# ---------------------------------------------------------------------------
+function Get-DJPropertyPathValue {
+    [CmdletBinding()]
+    param(
+        [object]$Object,
+        [string]$Path
+    )
+
+    if ($null -eq $Object) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $parts   = $Path -split '\.'
+    $current = $Object
+    foreach ($part in $parts) {
+        if ($null -eq $current) { return $null }
+        try {
+            $prop = $current.PSObject.Properties[$part]
+            if ($null -eq $prop) { return $null }
+            $current = $prop.Value
+        } catch {
+            return $null
+        }
+    }
+    return $current
+}
+
+# ---------------------------------------------------------------------------
+# ConvertTo-DJValidDate
+#   Converts a value to [datetime] when possible and when the year > 1900.
+#   Returns $null for null, empty, or unrepresentable inputs.
+# ---------------------------------------------------------------------------
+function ConvertTo-DJValidDate {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    try {
+        $dt = [datetime]$Value
+        # Year > 1900 filters out default/epoch DateTime values (e.g. DateTime.MinValue year 1,
+        # or Veeam objects that return 01/01/0001 when a date is not set).
+        if ($dt.Year -gt 1900) { return $dt }
+        return $null
+    } catch {
+        return $null
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJFirstValidDate
+#   Returns the first non-null valid [datetime] from an array of candidate values.
+# ---------------------------------------------------------------------------
+function Get-DJFirstValidDate {
+    [CmdletBinding()]
+    param([object[]]$Values)
+
+    foreach ($v in $Values) {
+        $dt = ConvertTo-DJValidDate -Value $v
+        if ($null -ne $dt) { return $dt }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# ConvertTo-DJNullableBoolean
+#   Converts a value to [bool] when possible, otherwise returns $null.
+# ---------------------------------------------------------------------------
+function ConvertTo-DJNullableBoolean {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    try { return [bool]$Value } catch { return $null }
+}
+
+# ---------------------------------------------------------------------------
+# Format-DJTimeOnly
+#   Returns "HH:mm" from a DateTime or TimeSpan value; empty string on failure.
+# ---------------------------------------------------------------------------
+function Format-DJTimeOnly {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return '' }
+    try {
+        if ($Value -is [timespan]) {
+            return ('{0:D2}:{1:D2}' -f [int]$Value.Hours, [int]$Value.Minutes)
+        }
+        $dt = ConvertTo-DJValidDate -Value $Value
+        if ($null -ne $dt) { return $dt.ToString('HH:mm') }
+        return ''
+    } catch {
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Format-DJDayList
+#   Converts a day-flags value (e.g. an enum or bit-field string) to a compact
+#   comma-separated abbreviation list such as "Mon,Wed,Fri".
+# ---------------------------------------------------------------------------
+function Format-DJDayList {
+    [CmdletBinding()]
+    param([object]$DayFlags)
+
+    if ($null -eq $DayFlags) { return '' }
+
+    $flagStr = [string]$DayFlags
+    $dayPairs = @(
+        @{ Name = 'Sunday';    Short = 'Sun' },
+        @{ Name = 'Monday';    Short = 'Mon' },
+        @{ Name = 'Tuesday';   Short = 'Tue' },
+        @{ Name = 'Wednesday'; Short = 'Wed' },
+        @{ Name = 'Thursday';  Short = 'Thu' },
+        @{ Name = 'Friday';    Short = 'Fri' },
+        @{ Name = 'Saturday';  Short = 'Sat' }
+    )
+
+    $result = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($pair in $dayPairs) {
+        if ($flagStr -match $pair.Name) { [void]$result.Add($pair.Short) }
+    }
+
+    if ($result.Count -eq 0) { return $flagStr }
+    return ($result -join ',')
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJScheduleEnabled
+#   Returns $true when the job has an active schedule trigger.
+#   Tries multiple property paths used across Veeam versions.
+# ---------------------------------------------------------------------------
+function Get-DJScheduleEnabled {
+    [CmdletBinding()]
+    param([object]$Job)
+
+    foreach ($path in @('IsScheduleEnabled', 'ScheduleEnabled', 'ScheduleOptions.Enabled')) {
+        $val = Get-DJPropertyPathValue -Object $Job -Path $path
+        $b   = ConvertTo-DJNullableBoolean -Value $val
+        if ($null -ne $b) { return $b }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJPeriodicallyText
+#   Converts a VBR periodically-schedule options object to a string such as
+#   "every 4h" or "every 30m".  FullPeriod is treated as minutes.
+# ---------------------------------------------------------------------------
+function Get-DJPeriodicallyText {
+    [CmdletBinding()]
+    param([object]$Options)
+
+    if ($null -eq $Options) { return '' }
+    try {
+        $period = Get-DJPropertyPathValue -Object $Options -Path 'FullPeriod'
+        if ($null -eq $period) { return '' }
+        $mins = [int]$period
+        if ($mins -le 0) { return '' }
+        $h = [int][Math]::Floor($mins / 60)
+        $m = $mins % 60
+        if ($h -gt 0 -and $m -gt 0) { return ('every {0}h {1}m' -f $h, $m) }
+        if ($h -gt 0)                { return ('every {0}h'      -f $h) }
+        return ('every {0}m' -f $m)
+    } catch {
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJScheduleDisplay
+#   Returns a compact human-readable schedule string for a job.
+#   Tries: next-run datetime → periodically → daily → monthly → chain → type.
+# ---------------------------------------------------------------------------
+function Get-DJScheduleDisplay {
+    [CmdletBinding()]
+    param([object]$Job)
+
+    try {
+        $schedOpts = Get-DJPropertyPathValue -Object $Job -Path 'ScheduleOptions'
+
+        # Next run (prefer showing the concrete next execution time)
+        $nextRun = Get-DJFirstValidDate -Values @(
+            (Get-DJPropertyPathValue -Object $schedOpts -Path 'NextRun'),
+            (Get-DJPropertyPathValue -Object $Job        -Path 'NextRun')
+        )
+        if ($null -ne $nextRun -and $nextRun -gt (Get-Date)) {
+            return $nextRun.ToString($script:DJDateFormat)
+        }
+
+        if ($null -eq $schedOpts) {
+            return if ($null -ne $nextRun) { $nextRun.ToString($script:DJDateFormat) } else { '' }
+        }
+
+        # Periodically schedule
+        $periodOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsPeriodically'
+        if ($null -ne $periodOpts) {
+            $txt = Get-DJPeriodicallyText -Options $periodOpts
+            if (-not [string]::IsNullOrWhiteSpace($txt)) { return $txt }
+        }
+
+        # Daily schedule
+        $dailyOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsDaily'
+        if ($null -ne $dailyOpts) {
+            $kind = [string](Get-DJPropertyPathValue -Object $dailyOpts -Path 'Kind')
+            $time = Format-DJTimeOnly -Value (Get-DJPropertyPathValue -Object $dailyOpts -Path 'Time')
+            # Veeam enum values use an 'E' prefix (e.g. EEveryDay); also match plain variants
+            # for older/alternative schema representations.
+            if ($kind -match 'EEveryDay|EveryDay|Everyday') {
+                return ('Daily {0}' -f $time).Trim()
+            }
+            $days = Get-DJPropertyPathValue -Object $dailyOpts -Path 'DaysSrv'
+            if ($null -ne $days) {
+                $dayStr = Format-DJDayList -DayFlags $days
+                if (-not [string]::IsNullOrWhiteSpace($dayStr)) {
+                    return ('{0} {1}' -f $dayStr, $time).Trim()
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($kind)) {
+                return ('{0} {1}' -f $kind, $time).Trim()
+            }
+            if (-not [string]::IsNullOrWhiteSpace($time)) {
+                return ('Daily {0}' -f $time)
+            }
+        }
+
+        # Monthly schedule
+        $monthlyOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsMonthly'
+        if ($null -ne $monthlyOpts) {
+            $time = Format-DJTimeOnly -Value (Get-DJPropertyPathValue -Object $monthlyOpts -Path 'Time')
+            return ('Monthly {0}' -f $time).Trim()
+        }
+
+        # After-job chain
+        $afterOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsScheduleAfterJob'
+        if ($null -ne $afterOpts -and $null -ne (Get-DJPropertyPathValue -Object $afterOpts -Path 'JobId')) {
+            return 'After job'
+        }
+
+        # Last fallback: schedule type string
+        $schedType = [string](Get-DJPropertyPathValue -Object $schedOpts -Path 'Type')
+        if (-not [string]::IsNullOrWhiteSpace($schedType)) { return $schedType }
+
+        # Fall back to stale next-run
+        if ($null -ne $nextRun) { return $nextRun.ToString($script:DJDateFormat) }
+
+        return ''
+    } catch {
+        Write-DebugMessage ('[Get-DJScheduleDisplay] Failed: {0}' -f $_.Exception.Message)
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJStandardJobType
+#   Returns a short type string for a job, used in the Type column.
+# ---------------------------------------------------------------------------
+function Get-DJStandardJobType {
+    [CmdletBinding()]
+    param([object]$Job)
+
+    $type = Get-PropertyValue -InputObject $Job -Names @('JobType', 'PolicyType', 'Type')
+    if ($null -ne $type) { return [string]$type }
+    return $Job.GetType().Name
+}
+
+# ---------------------------------------------------------------------------
+# Get-DJLastRunForJob
+#   Returns a hash-table @{ LastRun = <string>; Status = <string> } for a job.
+#   Tries job.FindLastSession() first, then direct LastRun / LastResult properties.
+# ---------------------------------------------------------------------------
+function Get-DJLastRunForJob {
+    [CmdletBinding()]
+    param([object]$Job)
+
+    $lastSession = $null
+
+    if ($Job.PSObject.Methods['FindLastSession']) {
+        try { $lastSession = $Job.FindLastSession() } catch {}
+    }
+
+    if ($null -ne $lastSession) {
+        $endTime   = Get-SessionEndTime   -Session $lastSession
+        $startTime = Get-SessionStartTime -Session $lastSession
+        $runTime   = if ($null -ne $endTime) { $endTime } elseif ($null -ne $startTime) { $startTime } else { $null }
+        $state     = Get-SessionState -Session $lastSession
+        return @{
+            LastRun = if ($null -ne $runTime) { $runTime.ToString($script:DJDateFormat) } else { '' }
+            Status  = $state
+        }
+    }
+
+    # Fall back to direct job properties
+    $lastRun = Get-DJFirstValidDate -Values @(
+        (Get-DJPropertyPathValue -Object $Job -Path 'LastRun'),
+        (Get-DJPropertyPathValue -Object $Job -Path 'LastRunTime')
+    )
+    $lastResult = Get-DJPropertyPathValue -Object $Job -Path 'LastResult'
+
+    return @{
+        LastRun = if ($null -ne $lastRun) { $lastRun.ToString($script:DJDateFormat) } else { '' }
+        Status  = if ($null -ne $lastResult) { [string]$lastResult } else { '' }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# New-DJJobReportRow
+#   Builds one [pscustomobject] row for the Defined Jobs table.
+# ---------------------------------------------------------------------------
+function New-DJJobReportRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$Job,
+        [Parameter(Mandatory)] [string]$TypeOverride
+    )
+
+    $jobName      = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
+    $schedEnabled = Get-DJScheduleEnabled -Job $Job
+    $schedDisplay = Get-DJScheduleDisplay -Job $Job
+    $lastRunInfo  = Get-DJLastRunForJob   -Job $Job
+
+    return [pscustomobject][ordered]@{
+        Job      = $jobName
+        Type     = $TypeOverride
+        On       = if ($schedEnabled) { 'Yes' } else { 'No' }
+        Schedule = $schedDisplay
+        LastRun  = $lastRunInfo.LastRun
+        Status   = $lastRunInfo.Status
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-DefinedJobsReport
+#   Enumerates all defined backup jobs and returns an array of report rows
+#   sorted by job name.  Collects specialised job types first (agent,
+#   application, unstructured) then remaining standard backup jobs, excluding
+#   replication/copy/tape/SureBackup types.  Every optional cmdlet is guarded
+#   with Get-Command and wrapped in try/catch so failures are non-fatal.
+# ---------------------------------------------------------------------------
+function Get-DefinedJobsReport {
+    [CmdletBinding()]
+    param()
+
+    $rows      = New-Object 'System.Collections.Generic.List[object]'
+    $seenNames = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+
+    # ---- Agent / computer backup jobs ----
+    if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRComputerBackupJob.'
+        try {
+            $agentJobs = @(Get-VBRComputerBackupJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Agent jobs: {0}' -f $agentJobs.Count)
+            foreach ($job in $agentJobs) {
+                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
+                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
+                if (-not $seenNames.Add($jn)) { continue }
+                try {
+                    $row = New-DJJobReportRow -Job $job -TypeOverride 'Agent'
+                    [void]$rows.Add($row)
+                } catch {
+                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for agent job "{0}": {1}' -f $jn, $_.Exception.Message)
+                }
+            }
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRComputerBackupJob failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    # ---- Application backup jobs ----
+    if (Get-Command -Name 'Get-VBRApplicationBackupJob' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRApplicationBackupJob.'
+        try {
+            $appJobs = @(Get-VBRApplicationBackupJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Application jobs: {0}' -f $appJobs.Count)
+            foreach ($job in $appJobs) {
+                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
+                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
+                if (-not $seenNames.Add($jn)) { continue }
+                try {
+                    $row = New-DJJobReportRow -Job $job -TypeOverride 'AppBackup'
+                    [void]$rows.Add($row)
+                } catch {
+                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for app job "{0}": {1}' -f $jn, $_.Exception.Message)
+                }
+            }
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRApplicationBackupJob failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    # ---- Unstructured backup jobs ----
+    if (Get-Command -Name 'Get-VBRUnstructuredBackupJob' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRUnstructuredBackupJob.'
+        try {
+            $unstrJobs = @(Get-VBRUnstructuredBackupJob -Name '*' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Unstructured jobs: {0}' -f $unstrJobs.Count)
+            foreach ($job in $unstrJobs) {
+                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
+                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
+                if (-not $seenNames.Add($jn)) { continue }
+                try {
+                    $row = New-DJJobReportRow -Job $job -TypeOverride 'Unstructured'
+                    [void]$rows.Add($row)
+                } catch {
+                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for unstructured job "{0}": {1}' -f $jn, $_.Exception.Message)
+                }
+            }
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRUnstructuredBackupJob failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    # ---- Remaining standard VBR jobs (excluding replication/copy/tape/SureBackup) ----
+    # These non-backup job types are excluded because they are either captured by dedicated
+    # phases in the collector (replication, backup copy, tape) or are infrastructure-only
+    # jobs whose sessions are not meaningfully surfaced as backup job sessions.
+    if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRJob (standard).'
+        try {
+            $vbrJobs       = @(Get-VBRJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            $excludePattern = 'Replica|Replication|BackupSync|BackupCopy|FileCopy|VmCopy|Tape|SureBackup'
+            Write-DebugMessage ('[Get-DefinedJobsReport] Standard VBR jobs: {0}' -f $vbrJobs.Count)
+            foreach ($job in $vbrJobs) {
+                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
+                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
+                if (-not $seenNames.Add($jn)) { continue }
+                $jType = Get-DJStandardJobType -Job $job
+                if ($jType -match $excludePattern) {
+                    Write-DebugMessage ('[Get-DefinedJobsReport] Skipping excluded type "{0}" for job "{1}".' -f $jType, $jn)
+                    continue
+                }
+                try {
+                    $row = New-DJJobReportRow -Job $job -TypeOverride $jType
+                    [void]$rows.Add($row)
+                } catch {
+                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for VBR job "{0}": {1}' -f $jn, $_.Exception.Message)
+                }
+            }
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRJob failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    Write-DebugMessage ('[Get-DefinedJobsReport] Total rows collected: {0}' -f $rows.Count)
+    $sorted = @($rows | Sort-Object -Property Job)
+    return $sorted
+}
+
+# ---------------------------------------------------------------------------
+# New-DefinedJobsSectionText
+#   Builds and returns the Defined Jobs baseline block as a single string.
+#   The block is delimited with the required markers and contains a fixed-width
+#   table with columns: Job(38), Type(11), On(3), Schedule(18), LastRun(16),
+#   Status(8).  Returns empty string in JSON mode or when collection fails.
+# ---------------------------------------------------------------------------
+function New-DefinedJobsSectionText {
+    [CmdletBinding()]
+    param()
+
+    if ($Json) { return '' }
+
+    try {
+        Write-ProgressMessage 'Defined Jobs — collecting job inventory...'
+        Write-DebugMessage '[New-DefinedJobsSectionText] Starting Defined Jobs collection.'
+
+        $rows = Get-DefinedJobsReport
+
+        Write-ProgressMessage ('Defined Jobs — {0} job(s) found.' -f $rows.Count)
+        Write-DebugMessage ('[New-DefinedJobsSectionText] Collection complete: {0} row(s).' -f $rows.Count)
+
+        # Column widths from spec
+        $wJob  = 38
+        $wType = 11
+        $wOn   = 3
+        $wSch  = 18
+        $wLast = 16
+        $wStat = 8
+
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        [void]$lines.Add('############### Defined Jobs BEGIN ###################')
+
+        # Header row
+        [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f
+            'Job'.PadRight($wJob),
+            'Type'.PadRight($wType),
+            'On'.PadRight($wOn),
+            'Next / schedule'.PadRight($wSch),
+            'Last run'.PadRight($wLast),
+            'Status'.PadRight($wStat)))
+
+        # Separator
+        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wStat + 5))
+
+        if ($rows.Count -eq 0) {
+            [void]$lines.Add('(no defined jobs found)')
+        } else {
+            foreach ($r in $rows) {
+                $jobCol  = [string]$r.Job
+                $typCol  = [string]$r.Type
+                $onCol   = [string]$r.On
+                $schCol  = [string]$r.Schedule
+                $lastCol = [string]$r.LastRun
+                $statCol = [string]$r.Status
+
+                $jobField  = if ($jobCol.Length  -gt $wJob)  { $jobCol.Substring(0, $wJob)   } else { $jobCol.PadRight($wJob)   }
+                $typeField = if ($typCol.Length  -gt $wType) { $typCol.Substring(0, $wType)  } else { $typCol.PadRight($wType)  }
+                $onField   = if ($onCol.Length   -gt $wOn)   { $onCol.Substring(0, $wOn)     } else { $onCol.PadRight($wOn)     }
+                $schField  = if ($schCol.Length  -gt $wSch)  { $schCol.Substring(0, $wSch)   } else { $schCol.PadRight($wSch)   }
+                $lastField = if ($lastCol.Length -gt $wLast) { $lastCol.Substring(0, $wLast) } else { $lastCol.PadRight($wLast) }
+                $statField = if ($statCol.Length -gt $wStat) { $statCol.Substring(0, $wStat) } else { $statCol.PadRight($wStat) }
+
+                [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f $jobField, $typeField, $onField, $schField, $lastField, $statField))
+            }
+        }
+
+        [void]$lines.Add('############### Defined Jobs END ###################')
+
+        return ($lines -join [Environment]::NewLine)
+    } catch {
+        Write-Warning ('Defined Jobs baseline failed to build: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[New-DefinedJobsSectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Build-JobReport
 #   Given a session and metadata, builds one report [pscustomobject].
@@ -1208,7 +1771,9 @@ function New-CollectorReportBody {
         [Parameter(Mandatory)] [int]$FailedCount,
         [Parameter(Mandatory)] [int]$WarnCount,
         [Parameter(Mandatory)] [int]$SuccessCount,
-        [Parameter(Mandatory)] [int]$WithError
+        [Parameter(Mandatory)] [int]$WithError,
+        # Optional Defined Jobs baseline block (text mode only; empty in JSON mode).
+        [string]$DefinedJobsSection = ''
     )
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -1221,6 +1786,12 @@ function New-CollectorReportBody {
     [void]$lines.Add(('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion))
     [void]$lines.Add('============================================================')
     [void]$lines.Add('')
+
+    # Defined Jobs baseline (text mode only — never populated in JSON mode)
+    if (-not [string]::IsNullOrWhiteSpace($DefinedJobsSection)) {
+        [void]$lines.Add($DefinedJobsSection)
+        [void]$lines.Add('')
+    }
 
     if ($Reports.Count -eq 0) {
         if ($OnlyFailures) {
@@ -1436,6 +2007,24 @@ Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(
 
 Import-VeeamPowerShell
 Write-EnvironmentDiagnostics
+
+# ---------------------------------------------------------------------------
+# Defined Jobs baseline — collected once immediately after Veeam PowerShell
+# loads so it reflects the current job inventory.  Skipped in JSON mode to
+# keep stdout a pure JSON array.
+# ---------------------------------------------------------------------------
+$definedJobsSection = ''
+if (-not $Json) {
+    Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
+    try {
+        $definedJobsSection = New-DefinedJobsSectionText
+        Write-DebugMessage ('[Main] Defined Jobs section ready, {0} char(s).' -f $definedJobsSection.Length)
+    } catch {
+        Write-Warning ('Defined Jobs baseline failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Defined Jobs baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $definedJobsSection = ''
+    }
+}
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
 
@@ -1905,7 +2494,8 @@ Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3
 
 $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
-    -SuccessCount $successCount -WithError $withError
+    -SuccessCount $successCount -WithError $withError `
+    -DefinedJobsSection $definedJobsSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------

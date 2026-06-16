@@ -6,6 +6,19 @@ A focused PowerShell script that reports the **last error text** from the most r
 
 For every backup/replication/offload/housekeeping job it finds the **most recent session within the last N hours**, extracts the last error/warning text, and produces a compact, LLM-friendly report.  No log bundles are created — the output is small enough to paste directly into an LLM prompt or pipe to `jq`.
 
+In normal text mode the report begins with a **Defined Jobs baseline** section showing all currently defined backup jobs together with their schedule, enabled status, next scheduled run, last run time, and last result.  This gives operators (and LLMs) immediate context for which jobs exist and when they are expected to run.  The section is clearly delimited:
+
+```
+############### Defined Jobs BEGIN ###################
+Job                                    Type        On  Next / schedule    Last run         Status
+----------------------------------------------------------------------
+VMware_Daily_Backup                    Backup      Yes 17/06/2026 22:00   16/06/2026 22:47 Success
+VMware_Daily_CATCHALL                  Backup      Yes Daily 22:00        16/06/2026 02:47 Warning
+############### Defined Jobs END ###################
+```
+
+The Defined Jobs block is **omitted in `-Json` mode** so that stdout remains a pure JSON array.
+
 Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available. If dedicated housekeeping session cmdlets are unavailable, the script also uses a `Get-VBRSession` fallback pass to discover relevant offload/repository/configuration sessions.
 
 ## Requirements
@@ -18,12 +31,14 @@ Housekeeping-style processes (configuration backup and repository offload/extent
 
 ```powershell
 # Default: show all jobs' last session in the last 24 hours
+# Output starts with the Defined Jobs baseline, followed by per-job session details
 .\Veeam_Collector.ps1
 
 # Show only failed/warning jobs in the last 48 hours
 .\Veeam_Collector.ps1 -Hours 48 -OnlyFailures
 
 # Emit JSON (parseable by ConvertFrom-Json / jq); progress goes to Warning stream
+# The Defined Jobs text block is skipped so stdout stays valid JSON
 .\Veeam_Collector.ps1 -Json
 ```
 
@@ -37,7 +52,7 @@ Housekeeping-style processes (configuration backup and repository offload/extent
 
 ## Output
 
-**Text mode** (default): one concise block per job showing name, type, result, end time, and last error text (empty when successful).
+**Text mode** (default): the report starts with a Defined Jobs baseline table, followed by one concise block per job showing name, type, result, end time, and last error text (empty when successful).
 
 **JSON mode** (`-Json`): a single JSON array, one object per job, with fields:
 - `job_name`, `job_type`, `result`
@@ -49,6 +64,26 @@ Housekeeping-style processes (configuration backup and repository offload/extent
 Output is sorted: Failed jobs first, then Warning, then others; within each group sorted by end time (most recent first).
 
 A summary line is printed at the end (to Warning stream in `-Json` mode): jobs scanned, failed, warning, success, and how many had error text.
+
+## Defined Jobs baseline
+
+The Defined Jobs section is built from four job sources (collected in this order with case-insensitive de-duplication):
+
+1. **Agent/computer backup jobs** (`Get-VBRComputerBackupJob`) — shown as type `Agent`
+2. **Application backup jobs** (`Get-VBRApplicationBackupJob`) — shown as type `AppBackup`
+3. **Unstructured backup jobs** (`Get-VBRUnstructuredBackupJob`) — shown as type `Unstructured`
+4. **Standard VBR backup jobs** (`Get-VBRJob`) — shown with the Veeam job type string; replication, backup-copy, tape, and SureBackup jobs are excluded from this section
+
+Columns (fixed width):
+
+| Column | Width | Description |
+|--------|-------|-------------|
+| Job | 38 | Job name |
+| Type | 11 | Job type |
+| On | 3 | `Yes` if scheduling is enabled, `No` otherwise |
+| Next / schedule | 18 | Next scheduled run (if in the future) or a schedule description such as `Daily 22:00` or `every 4h` |
+| Last run | 16 | End time of the most recent session (`dd/MM/yyyy HH:mm`) |
+| Status | 8 | Result of the most recent session |
 
 ## How errors are extracted
 
