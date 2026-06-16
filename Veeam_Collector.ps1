@@ -149,9 +149,14 @@
     Repository offload / extent sync (housekeeping):
       - Get-VBRRepositoryExtentSyncSession is used when available.  Absence of
         this cmdlet is handled gracefully.
-      - When dedicated housekeeping session cmdlets are unavailable, the script
-        also uses a Get-VBRSession fallback to find repository/offload/
-        configuration housekeeping sessions.
+
+    SOBR archive backup / offload sessions:
+      - Phase 6 uses Get-VBRSession -Type ArchiveBackup to collect SOBR
+        archive-tier backup and offload sessions.  Messages are extracted from
+        both the session-level logger and per-task loggers (via
+        Get-VBRTaskSession) so that individual object errors surface in the
+        report.  The cmdlet and its -Type parameter are checked defensively;
+        the phase is skipped gracefully when either is unavailable.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -1434,8 +1439,7 @@ Write-EnvironmentDiagnostics
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
 
-# Job objects collected from Phase 1/2 for use as Get-VBRSession -Job arguments
-# when bare Get-VBRSession invocation is unsafe (mandatory -Job parameter set).
+# Job objects collected from Phase 1/2 (retained for potential future use).
 $sessionFallbackJobs = New-Object 'System.Collections.Generic.List[object]'
 
 # ---------------------------------------------------------------------------
@@ -1688,147 +1692,148 @@ if (Get-Command -Name 'Get-VBRRepositoryExtentSyncSession' -ErrorAction Silently
 }
 
 # ---------------------------------------------------------------------------
-# Phase 6 — Generic housekeeping fallback via Get-VBRSession
+# Phase 6 — SOBR archive backup / offload sessions (Get-VBRSession -Type ArchiveBackup)
 # ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 6 — Housekeeping fallback (Get-VBRSession).'
-Write-DebugMessage '[Main] Phase 6 — Get-VBRSession fallback'
+Write-ProgressMessage 'Phase 6 — SOBR archive backup sessions (Get-VBRSession -Type ArchiveBackup).'
+Write-DebugMessage '[Main] Phase 6 — Get-VBRSession -Type ArchiveBackup'
 if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
-    try {
-        $housekeepingTerms = @('Offload', 'Capacity', 'Archive', 'Repository', 'Object', 'SOBR', 'Sync', 'Config', 'Configuration')
-        $housekeepingPattern = (($housekeepingTerms | ForEach-Object { [regex]::Escape($_) }) -join '|')
-        $fallbackCandidates = New-Object 'System.Collections.Generic.List[object]'
+    if (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Type') {
+        try {
+            Write-DebugMessage '[Main] Calling Get-VBRSession -Type ArchiveBackup ...'
+            $archiveSessions = @(
+                Get-VBRSession -Type ArchiveBackup -ErrorAction Stop |
+                    Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) } |
+                    Sort-Object CreationTime -Descending
+            )
+            Write-ProgressMessage ('  Found {0} SOBR archive session(s) in window.' -f $archiveSessions.Count)
+            Write-DebugMessage ('[Main] Get-VBRSession -Type ArchiveBackup returned {0} session(s) in window.' -f $archiveSessions.Count)
 
-        $canInvokeGetVBRSessionBare = Test-CmdletCanInvokeWithoutArguments -CmdletName 'Get-VBRSession'
-        $hasGetVBRSessionJob = Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Job'
-        Write-DebugMessage ('[Main] Get-VBRSession: canInvokeBare={0} hasJobParam={1} sessionFallbackJobs.Count={2}' -f $canInvokeGetVBRSessionBare, $hasGetVBRSessionJob, $sessionFallbackJobs.Count)
+            foreach ($Session in $archiveSessions) {
+                $sessionId = Get-ObjectIdentity -InputObject $Session
+                if (-not $script:SeenSessions.Add($sessionId)) { continue }
 
-        if ($canInvokeGetVBRSessionBare) {
-            Write-DebugMessage '[Main] Get-VBRSession can be invoked without arguments; using bare/type-enum path.'
+                $sName = Get-SessionName -Session $Session
+                Write-DebugMessage ('[Main] Processing SOBR archive session: {0}' -f $sName)
 
-            # Try -Type enum discovery first when available.
-            try {
-                $sessionCommand = Get-Command -Name 'Get-VBRSession' -ErrorAction Stop
-                $typeParameter = $sessionCommand.Parameters['Type']
-                $typeNames = @()
-                if ($null -ne $typeParameter) {
-                    $typeParameterType = $typeParameter.ParameterType
-                    if ($typeParameterType.IsArray) {
-                        $typeParameterType = $typeParameterType.GetElementType()
-                    }
-                    if ($null -ne $typeParameterType -and $typeParameterType.IsEnum) {
-                        $typeNames = [enum]::GetNames($typeParameterType)
-                    }
-                }
+                # Collect messages: session-level logger records
+                $messages = New-Object 'System.Collections.Generic.List[string]'
 
-                $matchingTypes = @($typeNames | Where-Object {
-                    $typeName = [string]$_
-                    $housekeepingTerms | Where-Object { $typeName -imatch [regex]::Escape($_) }
-                } | Select-Object -Unique)
-
-                foreach ($typeName in $matchingTypes) {
-                    try {
-                        Write-DebugMessage ('[Main] Get-VBRSession fallback querying -Type {0}' -f $typeName)
-                        $typedSessions = @(Get-VBRSession -Type $typeName -ErrorAction Stop)
-                        foreach ($s in $typedSessions) {
-                            if ($null -ne $s) { [void]$fallbackCandidates.Add($s) }
-                        }
-                    } catch {
-                        Write-DebugMessage ('[Main] Get-VBRSession -Type {0} threw:' -f $typeName +
-                            [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                    }
-                }
-            } catch {
-                Write-DebugMessage ('[Main] Get-VBRSession -Type discovery failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-            }
-
-            # Conservative text-match fallback over generic session properties.
-            try {
-                Write-DebugMessage '[Main] Calling Get-VBRSession (no arguments) for text-match fallback.'
-                $allSessions = @(Get-VBRSession -ErrorAction Stop)
-                foreach ($s in $allSessions) {
-                    if ($null -eq $s) { continue }
-                    $fields = @(
-                        Get-PropertyValue -InputObject $s -Names @('Name'),
-                        Get-PropertyValue -InputObject $s -Names @('JobName'),
-                        Get-PropertyValue -InputObject $s -Names @('SessionName'),
-                        Get-PropertyValue -InputObject $s -Names @('SessionType'),
-                        Get-PropertyValue -InputObject $s -Names @('JobType'),
-                        Get-PropertyValue -InputObject $s -Names @('Type'),
-                        Get-PropertyValue -InputObject $s -Names @('Operation'),
-                        Get-PropertyValue -InputObject $s -Names @('Description')
-                    )
-                    $searchText = (($fields | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ' ')
-                    if (-not [string]::IsNullOrWhiteSpace($searchText) -and $searchText -imatch $housekeepingPattern) {
-                        [void]$fallbackCandidates.Add($s)
-                    }
-                }
-            } catch {
-                Write-Warning ('Unable to enumerate Get-VBRSession fallback sessions: {0}' -f $_.Exception.Message)
-                Write-DebugMessage ('[Main] Get-VBRSession fallback enumeration threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-            }
-        } elseif ($hasGetVBRSessionJob -and $sessionFallbackJobs.Count -gt 0) {
-            # Bare invocation is unsafe (mandatory -Job parameter set); use job-scoped querying.
-            Write-ProgressMessage ('  Get-VBRSession requires -Job; querying {0} known job(s) individually.' -f $sessionFallbackJobs.Count)
-            Write-DebugMessage ('[Main] Get-VBRSession bare call unsafe; using job-scoped fallback with {0} job(s).' -f $sessionFallbackJobs.Count)
-            foreach ($job in $sessionFallbackJobs) {
-                $jn = if ($null -ne $job -and $null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '<unnamed>' }
-                Write-DebugMessage ('[Main] Calling Get-VBRSession -Job "{0}".' -f $jn)
                 try {
-                    $jobSessions = @(Get-VBRSession -Job $job -ErrorAction Stop)
-                    Write-DebugMessage ('[Main] Get-VBRSession -Job "{0}" returned {1} session(s).' -f $jn, $jobSessions.Count)
-                    foreach ($s in $jobSessions) {
-                        if ($null -ne $s) { [void]$fallbackCandidates.Add($s) }
+                    Write-DebugMessage ('[Main] Reading session logger for: {0}' -f $sName)
+                    $sessionLog = if ($null -ne $Session.Logger) { $Session.Logger.GetLog() } else { $null }
+                    if ($null -ne $sessionLog) {
+                        foreach ($Record in $sessionLog.UpdatedRecords) {
+                            if (
+                                [string]$Record.Status -match 'Fail|Error|Warning' -or
+                                $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
+                            ) {
+                                if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
+                                    [void]$messages.Add($Record.Title)
+                                }
+                            }
+                        }
                     }
                 } catch {
-                    Write-DebugMessage ('[Main] Get-VBRSession -Job "{0}" threw:' -f $jn +
+                    Write-DebugMessage ('[Main] Session logger read failed for "{0}":' -f $sName +
+                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                    [void]$messages.Add("Unable to read session log: $($_.Exception.Message)")
+                }
+
+                # Collect messages: task sessions via Get-VBRTaskSession
+                try {
+                    Write-DebugMessage ('[Main] Calling Get-VBRTaskSession for: {0}' -f $sName)
+                    $Tasks = @(Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue)
+                    Write-DebugMessage ('[Main] Get-VBRTaskSession returned {0} task(s) for: {1}' -f $Tasks.Count, $sName)
+
+                    foreach ($Task in $Tasks) {
+                        $taskName = if ($null -ne $Task -and $null -ne $Task.PSObject.Properties['Name']) { [string]$Task.Name } else { '<unnamed>' }
+
+                        # Task failure reason
+                        try {
+                            if (
+                                $null -ne $Task.Info -and
+                                -not [string]::IsNullOrWhiteSpace($Task.Info.Reason) -and
+                                $Task.Info.Reason -notmatch 'Success'
+                            ) {
+                                Write-DebugMessage ('[Main] Task "{0}" reason: {1}' -f $taskName, $Task.Info.Reason)
+                                [void]$messages.Add(('{0}: {1}' -f $taskName, $Task.Info.Reason))
+                            }
+                        } catch {
+                            Write-DebugMessage ('[Main] Task reason access failed for "{0}":' -f $taskName +
+                                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                        }
+
+                        # Task logger records
+                        try {
+                            Write-DebugMessage ('[Main] Reading task logger for: {0}' -f $taskName)
+                            $taskLog = if ($null -ne $Task.Logger) { $Task.Logger.GetLog() } else { $null }
+                            if ($null -ne $taskLog) {
+                                foreach ($Record in $taskLog.UpdatedRecords) {
+                                    if (
+                                        [string]$Record.Status -match 'Fail|Error|Warning' -or
+                                        $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
+                                    ) {
+                                        if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
+                                            [void]$messages.Add(('{0}: {1}' -f $taskName, $Record.Title))
+                                        }
+                                    }
+                                }
+                            }
+                        } catch {
+                            Write-DebugMessage ('[Main] Task logger read failed for "{0}":' -f $taskName +
+                                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                        }
+                    }
+                } catch {
+                    Write-DebugMessage ('[Main] Get-VBRTaskSession failed for "{0}":' -f $sName +
                         [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
                 }
-            }
-        } else {
-            Write-ProgressMessage '  Get-VBRSession cannot be invoked safely without mandatory parameters and no job-scoped fallback is available. Skipping.'
-            Write-DebugMessage ('[Main] Get-VBRSession skipped: canInvokeBare={0} hasJobParam={1} knownJobs={2}.' -f $canInvokeGetVBRSessionBare, $hasGetVBRSessionJob, $sessionFallbackJobs.Count)
-        }
 
-        Write-DebugMessage ('[Main] Get-VBRSession fallback candidate count before window filter: {0}' -f $fallbackCandidates.Count)
-        $inWindow = @($fallbackCandidates | Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) })
-        Write-ProgressMessage ('  {0} fallback housekeeping session candidate(s) in window.' -f $inWindow.Count)
-        Write-DebugMessage ('[Main] Get-VBRSession fallback candidates in window: {0}' -f $inWindow.Count)
+                # De-duplicate messages and build last_error string
+                $uniqueMessages = @(
+                    $messages |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                        Select-Object -Unique
+                )
 
-        # Group by logical name/type and keep the newest session per key.
-        $grouped = @{}
-        foreach ($s in $inWindow) {
-            $name = Get-SessionName -Session $s
-            $type = Get-SessionType -Session $s
-            $groupKey = ('{0}|{1}' -f $name, $type)
-            $sEnd  = Get-SessionEndTime -Session $s
-            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
-                $st = Get-SessionStartTime -Session $s
-                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
-            }
-            if (-not $grouped.ContainsKey($groupKey)) {
-                $grouped[$groupKey] = @{ Session = $s; Time = $sTime }
-            } elseif ($sTime -gt $grouped[$groupKey].Time) {
-                $grouped[$groupKey] = @{ Session = $s; Time = $sTime }
-            }
-        }
+                $sResult = Get-SessionState -Session $Session
+                $lastError = if ($uniqueMessages.Count -gt 0) {
+                    $uniqueMessages -join '; '
+                } elseif ($sResult -eq 'Success') {
+                    'None'
+                } else {
+                    ''
+                }
 
-        foreach ($entry in $grouped.Values) {
-            $s = $entry.Session
-            $sessionId = Get-ObjectIdentity -InputObject $s
-            if (-not $script:SeenSessions.Add($sessionId)) { continue }
-            $sessionType = Get-SessionType -Session $s
-            $fallbackJobType = if ([string]::IsNullOrWhiteSpace($sessionType)) { 'HousekeepingSessionFallback' } else { ('HousekeepingSessionFallback/{0}' -f $sessionType) }
-            $report = Build-JobReport -Session $s -JobType $fallbackJobType -Source 'Get-VBRSessionFallback'
-            Write-DebugMessage ('[Main] Fallback report: name={0} type={1} result={2}' -f $report.job_name, $report.job_type, $report.result)
-            [void]$allReports.Add($report)
+                $sStart         = Get-SessionStartTime   -Session $Session
+                $sEnd           = Get-SessionEndTime     -Session $Session
+                $warningDetails = Get-VeeamWarningDetails -Session $Session
+
+                $report = [pscustomobject][ordered]@{
+                    job_name        = $sName
+                    job_type        = 'SOBRArchiveBackup'
+                    result          = $sResult
+                    start_time      = if ($null -ne $sStart) { $sStart.ToString('o') } else { $null }
+                    end_time        = if ($null -ne $sEnd)   { $sEnd.ToString('o')   } else { $null }
+                    last_error      = $lastError
+                    warning_details = $warningDetails
+                    source          = 'Get-VBRSession-ArchiveBackup'
+                }
+
+                Write-DebugMessage ('[Main] SOBR archive report: name={0} result={1} last_error={2}' -f $report.job_name, $report.result, $report.last_error)
+                [void]$allReports.Add($report)
+            }
+        } catch {
+            Write-Warning ('Unable to enumerate SOBR archive backup sessions: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Main] Get-VBRSession -Type ArchiveBackup threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
-    } catch {
-        Write-Warning ('Unable to execute Get-VBRSession fallback phase: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Get-VBRSession fallback phase threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    } else {
+        Write-ProgressMessage '  Get-VBRSession does not support -Type parameter. Skipping SOBR archive phase.'
+        Write-DebugMessage '[Main] Get-VBRSession has no -Type parameter; skipping Phase 6.'
     }
 } else {
-    Write-ProgressMessage '  Get-VBRSession not available. Skipping fallback.'
-    Write-DebugMessage '[Main] Get-VBRSession cmdlet not found for fallback phase.'
+    Write-ProgressMessage '  Get-VBRSession not available. Skipping SOBR archive phase.'
+    Write-DebugMessage '[Main] Get-VBRSession cmdlet not found; skipping Phase 6.'
 }
 
 
