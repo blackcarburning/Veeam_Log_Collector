@@ -1401,7 +1401,7 @@ function New-DJJobReportRow {
     $schedEnabled = Get-DJScheduleEnabled  -Job $Job
     $schedDisplay = Get-DJScheduleDisplay  -Job $Job
     $lastRunInfo  = Get-DJLastRunForJob    -Job $Job
-    $repoName     = Get-DJJobRepository   -Job $Job
+    $repoName     = Get-DJJobRepository    -Job $Job
 
     return [pscustomobject][ordered]@{
         Job        = $jobName
