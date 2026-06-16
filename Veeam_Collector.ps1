@@ -1061,18 +1061,8 @@ function Get-ResultSeverityOrder {
 
 # ===========================================================================
 # Defined Jobs baseline — helper functions
-#   All functions carry the DJ (Defined Jobs) prefix to avoid collisions with
-#   existing collector helpers.  These functions are intentionally defensive:
-#   every Veeam property access uses try/catch or PSObject.Properties so that
-#   version-specific schema differences do not crash the baseline collection.
 # ===========================================================================
-
-# ---------------------------------------------------------------------------
-# Get-DJPropertyPathValue
-#   Navigate a dotted property path on a PSObject (e.g. "ScheduleOptions.NextRun").
-#   Returns $null at the first missing segment.
-# ---------------------------------------------------------------------------
-function Get-DJPropertyPathValue {
+function Get-PropertyPathValue {
     [CmdletBinding()]
     param(
         [object]$Object,
@@ -1082,12 +1072,11 @@ function Get-DJPropertyPathValue {
     if ($null -eq $Object) { return $null }
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
 
-    $parts   = $Path -split '\.'
     $current = $Object
-    foreach ($part in $parts) {
+    foreach ($segment in ($Path -split '\.')) {
         if ($null -eq $current) { return $null }
         try {
-            $prop = $current.PSObject.Properties[$part]
+            $prop = $current.PSObject.Properties[$segment]
             if ($null -eq $prop) { return $null }
             $current = $prop.Value
         } catch {
@@ -1097,47 +1086,30 @@ function Get-DJPropertyPathValue {
     return $current
 }
 
-# ---------------------------------------------------------------------------
-# ConvertTo-DJValidDate
-#   Converts a value to [datetime] when possible and when the year > 1900.
-#   Returns $null for null, empty, or unrepresentable inputs.
-# ---------------------------------------------------------------------------
-function ConvertTo-DJValidDate {
+function ConvertTo-ValidDate {
     [CmdletBinding()]
     param([object]$Value)
 
     if ($null -eq $Value) { return $null }
     try {
         $dt = [datetime]$Value
-        # Year > 1900 filters out default/epoch DateTime values (e.g. DateTime.MinValue year 1,
-        # or Veeam objects that return 01/01/0001 when a date is not set).
         if ($dt.Year -gt 1900) { return $dt }
-        return $null
-    } catch {
-        return $null
-    }
+    } catch {}
+    return $null
 }
 
-# ---------------------------------------------------------------------------
-# Get-DJFirstValidDate
-#   Returns the first non-null valid [datetime] from an array of candidate values.
-# ---------------------------------------------------------------------------
-function Get-DJFirstValidDate {
+function Get-FirstValidDate {
     [CmdletBinding()]
     param([object[]]$Values)
 
-    foreach ($v in $Values) {
-        $dt = ConvertTo-DJValidDate -Value $v
+    foreach ($value in $Values) {
+        $dt = ConvertTo-ValidDate -Value $value
         if ($null -ne $dt) { return $dt }
     }
     return $null
 }
 
-# ---------------------------------------------------------------------------
-# ConvertTo-DJNullableBoolean
-#   Converts a value to [bool] when possible, otherwise returns $null.
-# ---------------------------------------------------------------------------
-function ConvertTo-DJNullableBoolean {
+function ConvertTo-NullableBoolean {
     [CmdletBinding()]
     param([object]$Value)
 
@@ -1145,11 +1117,7 @@ function ConvertTo-DJNullableBoolean {
     try { return [bool]$Value } catch { return $null }
 }
 
-# ---------------------------------------------------------------------------
-# Format-DJTimeOnly
-#   Returns "HH:mm" from a DateTime or TimeSpan value; empty string on failure.
-# ---------------------------------------------------------------------------
-function Format-DJTimeOnly {
+function Format-TimeOnly {
     [CmdletBinding()]
     param([object]$Value)
 
@@ -1158,375 +1126,389 @@ function Format-DJTimeOnly {
         if ($Value -is [timespan]) {
             return ('{0:D2}:{1:D2}' -f [int]$Value.Hours, [int]$Value.Minutes)
         }
-        $dt = ConvertTo-DJValidDate -Value $Value
+        $dt = ConvertTo-ValidDate -Value $Value
         if ($null -ne $dt) { return $dt.ToString('HH:mm') }
-        return ''
-    } catch {
-        return ''
-    }
+    } catch {}
+    return ''
 }
 
-# ---------------------------------------------------------------------------
-# Format-DJDayList
-#   Converts a day-flags value (e.g. an enum or bit-field string) to a compact
-#   comma-separated abbreviation list such as "Mon,Wed,Fri".
-# ---------------------------------------------------------------------------
-function Format-DJDayList {
+function Format-DayList {
     [CmdletBinding()]
     param([object]$DayFlags)
 
     if ($null -eq $DayFlags) { return '' }
 
-    $flagStr = [string]$DayFlags
-    $dayPairs = @(
-        @{ Name = 'Sunday';    Short = 'Sun' },
-        @{ Name = 'Monday';    Short = 'Mon' },
-        @{ Name = 'Tuesday';   Short = 'Tue' },
+    $flagValue = [string]$DayFlags
+    $days = @(
+        @{ Name = 'Sunday'; Short = 'Sun' },
+        @{ Name = 'Monday'; Short = 'Mon' },
+        @{ Name = 'Tuesday'; Short = 'Tue' },
         @{ Name = 'Wednesday'; Short = 'Wed' },
-        @{ Name = 'Thursday';  Short = 'Thu' },
-        @{ Name = 'Friday';    Short = 'Fri' },
-        @{ Name = 'Saturday';  Short = 'Sat' }
+        @{ Name = 'Thursday'; Short = 'Thu' },
+        @{ Name = 'Friday'; Short = 'Fri' },
+        @{ Name = 'Saturday'; Short = 'Sat' }
     )
-
     $result = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($pair in $dayPairs) {
-        if ($flagStr -match $pair.Name) { [void]$result.Add($pair.Short) }
+    foreach ($day in $days) {
+        if ($flagValue -match $day.Name) { [void]$result.Add($day.Short) }
     }
-
-    if ($result.Count -eq 0) { return $flagStr }
+    if ($result.Count -eq 0) { return $flagValue }
     return ($result -join ',')
 }
 
-# ---------------------------------------------------------------------------
-# Get-DJScheduleEnabled
-#   Returns $true when the job has an active schedule trigger.
-#   Tries multiple property paths used across Veeam versions.
-# ---------------------------------------------------------------------------
-function Get-DJScheduleEnabled {
+function Get-ScheduleEnabled {
     [CmdletBinding()]
     param([object]$Job)
 
     foreach ($path in @('IsScheduleEnabled', 'ScheduleEnabled', 'ScheduleOptions.Enabled')) {
-        $val = Get-DJPropertyPathValue -Object $Job -Path $path
-        $b   = ConvertTo-DJNullableBoolean -Value $val
-        if ($null -ne $b) { return $b }
+        $value = Get-PropertyPathValue -Object $Job -Path $path
+        $boolValue = ConvertTo-NullableBoolean -Value $value
+        if ($null -ne $boolValue) { return $boolValue }
     }
     return $false
 }
 
-# ---------------------------------------------------------------------------
-# Get-DJScheduleDisplay
-#   Returns a compact human-readable schedule string for a job.
-#   Tries: next-run datetime → daily → monthly → chain → type.
-# ---------------------------------------------------------------------------
-function Get-DJScheduleDisplay {
+function Get-ScheduleDisplay {
     [CmdletBinding()]
     param([object]$Job)
 
     try {
-        $schedOpts = Get-DJPropertyPathValue -Object $Job -Path 'ScheduleOptions'
-
-        # Next run (prefer showing the concrete next execution time)
-        $nextRun = Get-DJFirstValidDate -Values @(
-            (Get-DJPropertyPathValue -Object $schedOpts -Path 'NextRun'),
-            (Get-DJPropertyPathValue -Object $Job        -Path 'NextRun')
+        $scheduleOptions = Get-PropertyPathValue -Object $Job -Path 'ScheduleOptions'
+        $nextRun = Get-FirstValidDate -Values @(
+            (Get-PropertyPathValue -Object $scheduleOptions -Path 'NextRun'),
+            (Get-PropertyPathValue -Object $Job -Path 'NextRun')
         )
         if ($null -ne $nextRun -and $nextRun -gt (Get-Date)) {
             return $nextRun.ToString($script:DJDateFormat)
         }
 
-        if ($null -eq $schedOpts) {
-            return if ($null -ne $nextRun) { $nextRun.ToString($script:DJDateFormat) } else { '' }
-        }
-
-        # Daily schedule
-        $dailyOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsDaily'
-        if ($null -ne $dailyOpts) {
-            $kind = [string](Get-DJPropertyPathValue -Object $dailyOpts -Path 'Kind')
-            $time = Format-DJTimeOnly -Value (Get-DJPropertyPathValue -Object $dailyOpts -Path 'Time')
-            # Veeam enum values use an 'E' prefix (e.g. EEveryDay); also match plain variants
-            # for older/alternative schema representations.
+        $daily = Get-PropertyPathValue -Object $scheduleOptions -Path 'OptionsDaily'
+        if ($null -ne $daily) {
+            $kind = [string](Get-PropertyPathValue -Object $daily -Path 'Kind')
+            $time = Format-TimeOnly -Value (Get-PropertyPathValue -Object $daily -Path 'Time')
             if ($kind -match 'EEveryDay|EveryDay|Everyday') {
                 return ('Daily {0}' -f $time).Trim()
             }
-            $days = Get-DJPropertyPathValue -Object $dailyOpts -Path 'DaysSrv'
+
+            $days = Get-PropertyPathValue -Object $daily -Path 'DaysSrv'
             if ($null -ne $days) {
-                $dayStr = Format-DJDayList -DayFlags $days
-                if (-not [string]::IsNullOrWhiteSpace($dayStr)) {
-                    return ('{0} {1}' -f $dayStr, $time).Trim()
+                $dayText = Format-DayList -DayFlags $days
+                if (-not [string]::IsNullOrWhiteSpace($dayText)) {
+                    return ('{0} {1}' -f $dayText, $time).Trim()
                 }
             }
-            if (-not [string]::IsNullOrWhiteSpace($kind)) {
-                return ('{0} {1}' -f $kind, $time).Trim()
-            }
-            if (-not [string]::IsNullOrWhiteSpace($time)) {
-                return ('Daily {0}' -f $time)
-            }
+
+            if (-not [string]::IsNullOrWhiteSpace($kind)) { return ('{0} {1}' -f $kind, $time).Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($time)) { return ('Daily {0}' -f $time).Trim() }
         }
 
-        # Monthly schedule
-        $monthlyOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsMonthly'
-        if ($null -ne $monthlyOpts) {
-            $time = Format-DJTimeOnly -Value (Get-DJPropertyPathValue -Object $monthlyOpts -Path 'Time')
+        $monthly = Get-PropertyPathValue -Object $scheduleOptions -Path 'OptionsMonthly'
+        if ($null -ne $monthly) {
+            $time = Format-TimeOnly -Value (Get-PropertyPathValue -Object $monthly -Path 'Time')
             return ('Monthly {0}' -f $time).Trim()
         }
 
-        # After-job chain
-        $afterOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsScheduleAfterJob'
-        if ($null -ne $afterOpts -and $null -ne (Get-DJPropertyPathValue -Object $afterOpts -Path 'JobId')) {
+        $after = Get-PropertyPathValue -Object $scheduleOptions -Path 'OptionsScheduleAfterJob'
+        if ($null -ne $after -and $null -ne (Get-PropertyPathValue -Object $after -Path 'JobId')) {
             return 'After job'
         }
 
-        # Last fallback: schedule type string
-        $schedType = [string](Get-DJPropertyPathValue -Object $schedOpts -Path 'Type')
-        if (-not [string]::IsNullOrWhiteSpace($schedType)) { return $schedType }
-
-        # Fall back to stale next-run
+        $scheduleType = [string](Get-PropertyPathValue -Object $scheduleOptions -Path 'Type')
+        if (-not [string]::IsNullOrWhiteSpace($scheduleType)) { return $scheduleType }
         if ($null -ne $nextRun) { return $nextRun.ToString($script:DJDateFormat) }
-
-        return ''
     } catch {
-        Write-DebugMessage ('[Get-DJScheduleDisplay] Failed: {0}' -f $_.Exception.Message)
-        return ''
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Get-DJStandardJobType
-#   Returns a short type string for a job, used in the Type column.
-# ---------------------------------------------------------------------------
-function Get-DJStandardJobType {
-    [CmdletBinding()]
-    param([object]$Job)
-
-    $type = Get-PropertyValue -InputObject $Job -Names @('JobType', 'PolicyType', 'Type')
-    if ($null -ne $type) { return [string]$type }
-    return $Job.GetType().Name
-}
-
-# ---------------------------------------------------------------------------
-# Get-DJLastRunForJob
-#   Returns a hash-table @{ LastRun = <string>; Status = <string> } for a job.
-#   Tries job.FindLastSession() first, then direct LastRun / LastResult properties.
-# ---------------------------------------------------------------------------
-function Get-DJLastRunForJob {
-    [CmdletBinding()]
-    param([object]$Job)
-
-    $lastSession = $null
-
-    if ($Job.PSObject.Methods['FindLastSession']) {
-        try { $lastSession = $Job.FindLastSession() } catch {}
-    }
-
-    if ($null -ne $lastSession) {
-        $endTime   = Get-SessionEndTime   -Session $lastSession
-        $startTime = Get-SessionStartTime -Session $lastSession
-        $runTime   = if ($null -ne $endTime) { $endTime } elseif ($null -ne $startTime) { $startTime } else { $null }
-        $state     = Get-SessionState -Session $lastSession
-        return @{
-            LastRun = if ($null -ne $runTime) { $runTime.ToString($script:DJDateFormat) } else { '' }
-            Status  = $state
-        }
-    }
-
-    # Fall back to direct job properties
-    $lastRun = Get-DJFirstValidDate -Values @(
-        (Get-DJPropertyPathValue -Object $Job -Path 'LastRun'),
-        (Get-DJPropertyPathValue -Object $Job -Path 'LastRunTime')
-    )
-    $lastResult = Get-DJPropertyPathValue -Object $Job -Path 'LastResult'
-
-    return @{
-        LastRun = if ($null -ne $lastRun) { $lastRun.ToString($script:DJDateFormat) } else { '' }
-        Status  = if ($null -ne $lastResult) { [string]$lastResult } else { '' }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Get-DJJobRepository
-#   Returns the target repository name for a job.
-#   Tries GetTargetRepository() method first, then multiple property paths.
-#   Returns empty string when the repository cannot be determined.
-# ---------------------------------------------------------------------------
-function Get-DJJobRepository {
-    [CmdletBinding()]
-    param([object]$Job)
-
-    if ($null -eq $Job) { return '' }
-
-    # Try GetTargetRepository() method (most reliable for standard VBR jobs)
-    if ($Job.PSObject.Methods['GetTargetRepository']) {
-        try {
-            $repo = $Job.GetTargetRepository()
-            if ($null -ne $repo) {
-                $rName = Get-DJPropertyPathValue -Object $repo -Path 'Name'
-                if (-not [string]::IsNullOrWhiteSpace([string]$rName)) { return [string]$rName }
-            }
-        } catch {}
-    }
-
-    # Try common property paths across job types and versions
-    foreach ($path in @(
-        'TargetRepository.Name',
-        'Repository.Name',
-        'BackupStorageOptions.RepositoryFriendlyName',
-        'BackupStorageOptions.Repository.Name',
-        'Info.BackupTargetOptions.RepositoryName',
-        'BackupTarget.Repository.Name',
-        'BackupTarget.Name',
-        'RepositoryName'
-    )) {
-        try {
-            $val = Get-DJPropertyPathValue -Object $Job -Path $path
-            if (-not [string]::IsNullOrWhiteSpace([string]$val)) { return [string]$val }
-        } catch {}
+        Write-DebugMessage ('[Get-ScheduleDisplay] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
     }
 
     return ''
 }
 
-# ---------------------------------------------------------------------------
-# New-DJJobReportRow
-#   Builds one [pscustomobject] row for the Defined Jobs table.
-# ---------------------------------------------------------------------------
-function New-DJJobReportRow {
+function Find-MatchingJob {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] [object]$Job,
-        [Parameter(Mandatory)] [string]$TypeOverride
+        [Parameter(Mandatory)] [object]$Session
     )
 
-    $jobName      = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
-    $schedEnabled = Get-DJScheduleEnabled  -Job $Job
-    $schedDisplay = Get-DJScheduleDisplay  -Job $Job
-    $lastRunInfo  = Get-DJLastRunForJob    -Job $Job
+    $jobIds = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($path in @('Id', 'JobId', 'Info.Id', 'Uid')) {
+        $value = Get-PropertyPathValue -Object $Job -Path $path
+        if ($null -ne $value) {
+            $text = [string]$value
+            if (-not [string]::IsNullOrWhiteSpace($text)) { [void]$jobIds.Add($text) }
+        }
+    }
+
+    foreach ($path in @('Id', 'JobId', 'Info.Id', 'OrigJobId', 'JobUid', 'Info.JobId')) {
+        $value = Get-PropertyPathValue -Object $Session -Path $path
+        if ($null -ne $value) {
+            $sessionId = [string]$value
+            foreach ($jobId in $jobIds) {
+                if ($sessionId -eq $jobId) { return $true }
+            }
+        }
+    }
+
+    $jobName = [string](Get-PropertyPathValue -Object $Job -Path 'Name')
+    if ([string]::IsNullOrWhiteSpace($jobName)) { return $false }
+
+    foreach ($path in @('Name', 'JobName', 'Info.Name', 'Info.JobName', 'JobSessionName', 'SessionName')) {
+        $value = Get-PropertyPathValue -Object $Session -Path $path
+        if ($null -eq $value) { continue }
+        $sessionName = [string]$value
+        if ([string]::IsNullOrWhiteSpace($sessionName)) { continue }
+        if ($sessionName -ieq $jobName) { return $true }
+        if ($sessionName -like "$jobName*") { return $true }
+        if ($sessionName -like "*$jobName*") { return $true }
+    }
+
+    return $false
+}
+
+function Get-LatestSessionForJob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$Job,
+        [object[]]$Sessions
+    )
+
+    if ($null -eq $Sessions -or $Sessions.Count -eq 0) { return $null }
+
+    $latestSession = $null
+    $latestTicks = [long]0
+    foreach ($session in $Sessions) {
+        if ($null -eq $session) { continue }
+        if (-not (Find-MatchingJob -Job $Job -Session $session)) { continue }
+        $sessionTime = Get-FirstValidDate -Values @(
+            (Get-SessionEndTime -Session $session),
+            (Get-SessionStartTime -Session $session),
+            (Get-PropertyPathValue -Object $session -Path 'CreationTime'),
+            (Get-PropertyPathValue -Object $session -Path 'LastRun')
+        )
+        $ticks = Get-SortableTicks -Value $sessionTime
+        if ($null -eq $latestSession -or $ticks -gt $latestTicks) {
+            $latestSession = $session
+            $latestTicks = $ticks
+        }
+    }
+    return $latestSession
+}
+
+function Get-LastRunInformation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$Job,
+        [object]$Session
+    )
+
+    $effectiveSession = $Session
+    if ($null -eq $effectiveSession -and $Job.PSObject.Methods['FindLastSession']) {
+        try { $effectiveSession = $Job.FindLastSession() } catch {}
+    }
+
+    $lastRunTime = $null
+    $status = ''
+
+    if ($null -ne $effectiveSession) {
+        $lastRunTime = Get-FirstValidDate -Values @(
+            (Get-SessionEndTime -Session $effectiveSession),
+            (Get-SessionStartTime -Session $effectiveSession),
+            (Get-PropertyPathValue -Object $effectiveSession -Path 'CreationTime')
+        )
+
+        foreach ($path in @('Result', 'LastResult', 'Info.Result', 'Info.LastResult')) {
+            $resultValue = Get-PropertyPathValue -Object $effectiveSession -Path $path
+            if ($null -ne $resultValue -and -not [string]::IsNullOrWhiteSpace([string]$resultValue)) {
+                $status = [string]$resultValue
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($status)) {
+            foreach ($path in @('State', 'Status')) {
+                $stateValue = Get-PropertyPathValue -Object $effectiveSession -Path $path
+                if ($null -ne $stateValue -and -not [string]::IsNullOrWhiteSpace([string]$stateValue)) {
+                    $status = [string]$stateValue
+                    break
+                }
+            }
+        }
+    }
+
+    if ($null -eq $lastRunTime) {
+        $lastRunTime = Get-FirstValidDate -Values @(
+            (Get-PropertyPathValue -Object $Job -Path 'LastRun'),
+            (Get-PropertyPathValue -Object $Job -Path 'LastRunTime'),
+            (Get-PropertyPathValue -Object $Job -Path 'Info.LastRun')
+        )
+    }
+
+    if ([string]::IsNullOrWhiteSpace($status)) {
+        foreach ($path in @('LastResult', 'Result', 'Info.LastResult', 'Info.Result', 'State', 'Status')) {
+            $value = Get-PropertyPathValue -Object $Job -Path $path
+            if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+                $status = [string]$value
+                break
+            }
+        }
+    }
+
+    return @{
+        LastRun = if ($null -ne $lastRunTime) { $lastRunTime.ToString($script:DJDateFormat) } else { '' }
+        Status  = $status
+    }
+}
+
+function Get-StandardJobType {
+    [CmdletBinding()]
+    param([object]$Job)
+
+    $type = Get-PropertyValue -InputObject $Job -Names @('JobType', 'PolicyType', 'Type')
+    if ($null -eq $type) { return $Job.GetType().Name }
+    $typeText = [string]$type
+    if ($typeText -match 'BackupCopy|BackupSync') { return 'Copy' }
+    if ($typeText -match 'Backup') { return 'Backup' }
+    return $typeText
+}
+
+function New-JobReportRow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$Job,
+        [Parameter(Mandatory)] [string]$TypeOverride,
+        [object]$Session
+    )
+
+    $jobName = [string](Get-PropertyPathValue -Object $Job -Path 'Name')
+    if ([string]::IsNullOrWhiteSpace($jobName)) { $jobName = '<unnamed>' }
+    $scheduleEnabled = Get-ScheduleEnabled -Job $Job
+    $scheduleDisplay = Get-ScheduleDisplay -Job $Job
+    $lastRun = Get-LastRunInformation -Job $Job -Session $Session
 
     return [pscustomobject][ordered]@{
         Job      = $jobName
         Type     = $TypeOverride
-        On       = if ($schedEnabled) { 'Yes' } else { 'No' }
-        Schedule = $schedDisplay
-        LastRun  = $lastRunInfo.LastRun
-        Status   = $lastRunInfo.Status
+        On       = if ($scheduleEnabled) { 'Yes' } else { 'No' }
+        Schedule = $scheduleDisplay
+        LastRun  = $lastRun.LastRun
+        Status   = $lastRun.Status
     }
 }
 
-# ---------------------------------------------------------------------------
-# Get-DefinedJobsReport
-#   Enumerates all defined backup jobs and returns an array of report rows
-#   sorted by job name.  Collects specialised job types first (agent,
-#   application, unstructured) then remaining standard backup jobs, excluding
-#   replication/copy/tape/SureBackup types.  Every optional cmdlet is guarded
-#   with Get-Command and wrapped in try/catch so failures are non-fatal.
-# ---------------------------------------------------------------------------
 function Get-DefinedJobsReport {
     [CmdletBinding()]
     param()
 
-    $rows      = New-Object 'System.Collections.Generic.List[object]'
+    $rows = New-Object 'System.Collections.Generic.List[object]'
     $seenNames = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
 
-    # ---- Agent / computer backup jobs ----
+    $allBackupSessions = @()
+    if (Get-Command -Name 'Get-VBRBackupSession' -ErrorAction SilentlyContinue) {
+        try {
+            $allBackupSessions = @(Get-VBRBackupSession -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Backup sessions loaded: {0}' -f $allBackupSessions.Count)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRBackupSession failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    }
+
+    $computerSessions = @()
+    if (Get-Command -Name 'Get-VBRComputerBackupJobSession' -ErrorAction SilentlyContinue) {
+        try {
+            $computerSessions = @(Get-VBRComputerBackupJobSession -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Computer sessions loaded: {0}' -f $computerSessions.Count)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRComputerBackupJobSession failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    }
+
+    $applicationSessions = @()
+    if (Get-Command -Name 'Get-VBRApplicationBackupJobSession' -ErrorAction SilentlyContinue) {
+        try {
+            $applicationSessions = @(Get-VBRApplicationBackupJobSession -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Application sessions loaded: {0}' -f $applicationSessions.Count)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRApplicationBackupJobSession failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    }
+
     if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) {
-        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRComputerBackupJob.'
         try {
-            $agentJobs = @(Get-VBRComputerBackupJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-            Write-DebugMessage ('[Get-DefinedJobsReport] Agent jobs: {0}' -f $agentJobs.Count)
-            foreach ($job in $agentJobs) {
-                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
-                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
-                if (-not $seenNames.Add($jn)) { continue }
-                try {
-                    $row = New-DJJobReportRow -Job $job -TypeOverride 'Agent'
-                    [void]$rows.Add($row)
-                } catch {
-                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for agent job "{0}": {1}' -f $jn, $_.Exception.Message)
-                }
+            foreach ($job in @(Get-VBRComputerBackupJob -WarningAction SilentlyContinue -ErrorAction SilentlyContinue)) {
+                $jobName = [string](Get-PropertyPathValue -Object $job -Path 'Name')
+                if ([string]::IsNullOrWhiteSpace($jobName)) { continue }
+                if (-not $seenNames.Add($jobName)) { continue }
+                $session = Get-LatestSessionForJob -Job $job -Sessions $computerSessions
+                if ($null -eq $session) { $session = Get-LatestSessionForJob -Job $job -Sessions $allBackupSessions }
+                [void]$rows.Add((New-JobReportRow -Job $job -TypeOverride 'Agent' -Session $session))
             }
         } catch {
-            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRComputerBackupJob failed: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRComputerBackupJob failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
     }
 
-    # ---- Application backup jobs ----
     if (Get-Command -Name 'Get-VBRApplicationBackupJob' -ErrorAction SilentlyContinue) {
-        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRApplicationBackupJob.'
         try {
-            $appJobs = @(Get-VBRApplicationBackupJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-            Write-DebugMessage ('[Get-DefinedJobsReport] Application jobs: {0}' -f $appJobs.Count)
-            foreach ($job in $appJobs) {
-                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
-                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
-                if (-not $seenNames.Add($jn)) { continue }
-                try {
-                    $row = New-DJJobReportRow -Job $job -TypeOverride 'Application'
-                    [void]$rows.Add($row)
-                } catch {
-                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for app job "{0}": {1}' -f $jn, $_.Exception.Message)
-                }
+            foreach ($job in @(Get-VBRApplicationBackupJob -WarningAction SilentlyContinue -ErrorAction SilentlyContinue)) {
+                $jobName = [string](Get-PropertyPathValue -Object $job -Path 'Name')
+                if ([string]::IsNullOrWhiteSpace($jobName)) { continue }
+                if (-not $seenNames.Add($jobName)) { continue }
+                $session = Get-LatestSessionForJob -Job $job -Sessions $applicationSessions
+                if ($null -eq $session) { $session = Get-LatestSessionForJob -Job $job -Sessions $allBackupSessions }
+                [void]$rows.Add((New-JobReportRow -Job $job -TypeOverride 'Application' -Session $session))
             }
         } catch {
-            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRApplicationBackupJob failed: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRApplicationBackupJob failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
     }
 
-    # ---- Unstructured backup jobs ----
     if (Get-Command -Name 'Get-VBRUnstructuredBackupJob' -ErrorAction SilentlyContinue) {
-        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRUnstructuredBackupJob.'
         try {
-            $unstrJobs = @(Get-VBRUnstructuredBackupJob -Name '*' -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-            Write-DebugMessage ('[Get-DefinedJobsReport] Unstructured jobs: {0}' -f $unstrJobs.Count)
-            foreach ($job in $unstrJobs) {
-                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
-                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
-                if (-not $seenNames.Add($jn)) { continue }
-                try {
-                    $row = New-DJJobReportRow -Job $job -TypeOverride 'File/NAS'
-                    [void]$rows.Add($row)
-                } catch {
-                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for unstructured job "{0}": {1}' -f $jn, $_.Exception.Message)
+            foreach ($job in @(Get-VBRUnstructuredBackupJob -Name '*' -WarningAction SilentlyContinue -ErrorAction SilentlyContinue)) {
+                $jobName = [string](Get-PropertyPathValue -Object $job -Path 'Name')
+                if ([string]::IsNullOrWhiteSpace($jobName)) { continue }
+                if (-not $seenNames.Add($jobName)) { continue }
+
+                $session = $null
+                if (Get-Command -Name 'Get-VBRUnstructuredBackupSession' -ErrorAction SilentlyContinue) {
+                    try {
+                        $unstructuredSessions = @(Get-VBRUnstructuredBackupSession -Name "$($job.Name)*" -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+                        $session = Get-LatestSessionForJob -Job $job -Sessions $unstructuredSessions
+                    } catch {
+                        Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRUnstructuredBackupSession failed for "{0}":{1}{2}' -f $jobName, [Environment]::NewLine, (Format-ErrorRecord -ErrorRecord $_))
+                    }
                 }
+                if ($null -eq $session) { $session = Get-LatestSessionForJob -Job $job -Sessions $allBackupSessions }
+                [void]$rows.Add((New-JobReportRow -Job $job -TypeOverride 'File/NAS' -Session $session))
             }
         } catch {
-            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRUnstructuredBackupJob failed: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRUnstructuredBackupJob failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
     }
 
-    # ---- Remaining standard VBR jobs (excluding replication/copy/tape/SureBackup) ----
-    # These non-backup job types are excluded because they are either captured by dedicated
-    # phases in the collector (replication, backup copy, tape) or are infrastructure-only
-    # jobs whose sessions are not meaningfully surfaced as backup job sessions.
     if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
-        Write-DebugMessage '[Get-DefinedJobsReport] Enumerating Get-VBRJob (standard).'
         try {
-            $vbrJobs       = @(Get-VBRJob -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-            $excludePattern = 'Replica|Replication|BackupSync|BackupCopy|FileCopy|VmCopy|Tape|SureBackup'
-            Write-DebugMessage ('[Get-DefinedJobsReport] Standard VBR jobs: {0}' -f $vbrJobs.Count)
-            foreach ($job in $vbrJobs) {
-                $jn = if ($null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '' }
-                if ([string]::IsNullOrWhiteSpace($jn)) { continue }
-                if (-not $seenNames.Add($jn)) { continue }
-                $jType = Get-DJStandardJobType -Job $job
-                if ($jType -match $excludePattern) {
-                    Write-DebugMessage ('[Get-DefinedJobsReport] Skipping excluded type "{0}" for job "{1}".' -f $jType, $jn)
-                    continue
+            foreach ($job in @(Get-VBRJob -WarningAction SilentlyContinue -ErrorAction SilentlyContinue)) {
+                $jobName = [string](Get-PropertyPathValue -Object $job -Path 'Name')
+                if ([string]::IsNullOrWhiteSpace($jobName)) { continue }
+                if (-not $seenNames.Add($jobName)) { continue }
+                $jobType = Get-StandardJobType -Job $job
+
+                $session = $null
+                if ($job.PSObject.Methods['FindLastSession']) {
+                    try { $session = $job.FindLastSession() } catch {}
                 }
-                try {
-                    $row = New-DJJobReportRow -Job $job -TypeOverride $jType
-                    [void]$rows.Add($row)
-                } catch {
-                    Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for VBR job "{0}": {1}' -f $jn, $_.Exception.Message)
+                if ($null -eq $session) {
+                    $session = Get-LatestSessionForJob -Job $job -Sessions $allBackupSessions
                 }
+
+                [void]$rows.Add((New-JobReportRow -Job $job -TypeOverride $jobType -Session $session))
             }
         } catch {
-            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRJob failed: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Get-DefinedJobsReport] Get-VBRJob failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
     }
 
-    Write-DebugMessage ('[Get-DefinedJobsReport] Total rows collected: {0}' -f $rows.Count)
-    $sorted = @($rows | Sort-Object -Property Job)
-    return $sorted
+    return @($rows | Sort-Object -Property Job)
 }
 
 # ---------------------------------------------------------------------------
