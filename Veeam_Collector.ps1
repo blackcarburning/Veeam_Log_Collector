@@ -31,7 +31,7 @@
 
     This section lists all defined backup jobs (agent, application, unstructured,
     and standard backup types) with their schedule, enabled status, next scheduled
-    run or schedule description, last run time, last result, and target repository.
+    run or schedule description, last run time, and last result.
     It gives operators and LLMs a quick reference for what jobs should be running
     and when.  The Defined Jobs block is omitted from JSON (-Json) mode so that
     stdout remains a pure JSON array.
@@ -1401,16 +1401,14 @@ function New-DJJobReportRow {
     $schedEnabled = Get-DJScheduleEnabled  -Job $Job
     $schedDisplay = Get-DJScheduleDisplay  -Job $Job
     $lastRunInfo  = Get-DJLastRunForJob    -Job $Job
-    $repoName     = Get-DJJobRepository    -Job $Job
 
     return [pscustomobject][ordered]@{
-        Job        = $jobName
-        Type       = $TypeOverride
-        On         = if ($schedEnabled) { 'Yes' } else { 'No' }
-        Schedule   = $schedDisplay
-        LastRun    = $lastRunInfo.LastRun
-        LastResult = $lastRunInfo.Status
-        Repository = $repoName
+        Job      = $jobName
+        Type     = $TypeOverride
+        On       = if ($schedEnabled) { 'Yes' } else { 'No' }
+        Schedule = $schedDisplay
+        LastRun  = $lastRunInfo.LastRun
+        Status   = $lastRunInfo.Status
     }
 }
 
@@ -1462,7 +1460,7 @@ function Get-DefinedJobsReport {
                 if ([string]::IsNullOrWhiteSpace($jn)) { continue }
                 if (-not $seenNames.Add($jn)) { continue }
                 try {
-                    $row = New-DJJobReportRow -Job $job -TypeOverride 'AppBackup'
+                    $row = New-DJJobReportRow -Job $job -TypeOverride 'Application'
                     [void]$rows.Add($row)
                 } catch {
                     Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for app job "{0}": {1}' -f $jn, $_.Exception.Message)
@@ -1484,7 +1482,7 @@ function Get-DefinedJobsReport {
                 if ([string]::IsNullOrWhiteSpace($jn)) { continue }
                 if (-not $seenNames.Add($jn)) { continue }
                 try {
-                    $row = New-DJJobReportRow -Job $job -TypeOverride 'Unstructured'
+                    $row = New-DJJobReportRow -Job $job -TypeOverride 'File/NAS'
                     [void]$rows.Add($row)
                 } catch {
                     Write-DebugMessage ('[Get-DefinedJobsReport] Row build failed for unstructured job "{0}": {1}' -f $jn, $_.Exception.Message)
@@ -1559,24 +1557,22 @@ function New-DefinedJobsSectionText {
         $wOn   = 3
         $wSch  = 18
         $wLast = 16
-        $wRes  = 11
-        $wRepo = 20
+        $wRes  = 8
 
         $lines = New-Object 'System.Collections.Generic.List[string]'
         [void]$lines.Add('############### Defined Jobs BEGIN ###################')
 
         # Header row
-        [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6}' -f
+        [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f
             'Job'.PadRight($wJob),
             'Type'.PadRight($wType),
             'On'.PadRight($wOn),
             'Next / schedule'.PadRight($wSch),
             'Last run'.PadRight($wLast),
-            'Last Result'.PadRight($wRes),
-            'Repository'.PadRight($wRepo)))
+            'Status'.PadRight($wRes)))
 
         # Separator
-        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wRes + $wRepo + 6))
+        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wRes + 5))
 
         if ($rows.Count -eq 0) {
             [void]$lines.Add('(no defined jobs found)')
@@ -1587,8 +1583,7 @@ function New-DefinedJobsSectionText {
                 $onCol   = [string]$r.On
                 $schCol  = [string]$r.Schedule
                 $lastCol = [string]$r.LastRun
-                $resCol  = [string]$r.LastResult
-                $repoCol = [string]$r.Repository
+                $resCol  = [string]$r.Status
 
                 $jobField  = if ($jobCol.Length  -gt $wJob)  { $jobCol.Substring(0, $wJob)   } else { $jobCol.PadRight($wJob)   }
                 $typeField = if ($typCol.Length  -gt $wType) { $typCol.Substring(0, $wType)  } else { $typCol.PadRight($wType)  }
@@ -1596,9 +1591,8 @@ function New-DefinedJobsSectionText {
                 $schField  = if ($schCol.Length  -gt $wSch)  { $schCol.Substring(0, $wSch)   } else { $schCol.PadRight($wSch)   }
                 $lastField = if ($lastCol.Length -gt $wLast) { $lastCol.Substring(0, $wLast) } else { $lastCol.PadRight($wLast) }
                 $resField  = if ($resCol.Length  -gt $wRes)  { $resCol.Substring(0, $wRes)   } else { $resCol.PadRight($wRes)   }
-                $repoField = if ($repoCol.Length -gt $wRepo) { $repoCol.Substring(0, $wRepo) } else { $repoCol.PadRight($wRepo) }
 
-                [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6}' -f $jobField, $typeField, $onField, $schField, $lastField, $resField, $repoField))
+                [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f $jobField, $typeField, $onField, $schField, $lastField, $resField))
             }
         }
 
