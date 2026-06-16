@@ -10,10 +10,10 @@ In normal text mode the report begins with a **Defined Jobs baseline** section s
 
 ```
 ############### Defined Jobs BEGIN ###################
-Job                                    Type        On  Next / schedule    Last run         Last Result Repository
------------------------------------------------------------------------------------------------------------------
-VMware_Daily_Backup                    Backup      Yes 17/06/2026 22:00   16/06/2026 22:47 Success     BackupRepo01
-VMware_Daily_CATCHALL                  Backup      Yes Daily 22:00        16/06/2026 02:47 Warning     BackupRepo01
+Job                                    Type        On  Next / schedule    Last run         Status
+-------------------------------------------------------------------------------------------------
+VMware_Daily_Backup                    VM          Yes Daily 23:00        16/06/2026 02:26 Warning
+VMware_Daily_CATCHALL                  VM          Yes Daily 04:00        16/06/2026 02:45 Warning
 ############### Defined Jobs END ###################
 ```
 
@@ -70,8 +70,8 @@ A summary line is printed at the end (to Warning stream in `-Json` mode): jobs s
 The Defined Jobs section is built from four job sources (collected in this order with case-insensitive de-duplication):
 
 1. **Agent/computer backup jobs** (`Get-VBRComputerBackupJob`) — shown as type `Agent`
-2. **Application backup jobs** (`Get-VBRApplicationBackupJob`) — shown as type `AppBackup`
-3. **Unstructured backup jobs** (`Get-VBRUnstructuredBackupJob`) — shown as type `Unstructured`
+2. **Application backup jobs** (`Get-VBRApplicationBackupJob`) — shown as type `Application`
+3. **Unstructured backup jobs** (`Get-VBRUnstructuredBackupJob`) — shown as type `File/NAS`
 4. **Standard VBR backup jobs** (`Get-VBRJob`) — shown with the Veeam job type string; replication, backup-copy, tape, and SureBackup jobs are excluded from this section
 
 Columns (fixed width):
@@ -83,8 +83,7 @@ Columns (fixed width):
 | On | 3 | `Yes` if scheduling is enabled, `No` otherwise |
 | Next / schedule | 18 | Next scheduled run (if in the future) or a schedule description such as `Daily 22:00` |
 | Last run | 16 | End time of the most recent session (`dd/MM/yyyy HH:mm`) |
-| Last Result | 11 | Result of the most recent session (e.g. `Success`, `Warning`, `Failed`) |
-| Repository | 20 | Target repository name |
+| Status | 8 | Result of the most recent session (e.g. `Success`, `Warning`, `Failed`) |
 
 ## How errors are extracted
 
