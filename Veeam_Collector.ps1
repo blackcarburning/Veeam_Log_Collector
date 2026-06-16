@@ -1434,6 +1434,10 @@ Write-EnvironmentDiagnostics
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
 
+# Job objects collected from Phase 1/2 for use as Get-VBRSession -Job arguments
+# when bare Get-VBRSession invocation is unsafe (mandatory -Job parameter set).
+$sessionFallbackJobs = New-Object 'System.Collections.Generic.List[object]'
+
 # ---------------------------------------------------------------------------
 # Phase 1 — Regular VBR jobs via Get-VBRJob
 # ---------------------------------------------------------------------------
@@ -1457,6 +1461,8 @@ if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
                 Write-DebugMessage ('[Main] Add-JobReportFromJob failed for "{0}":' -f $jn +
                     [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
             }
+            [void]$sessionFallbackJobs.Add($job)
+            Write-DebugMessage ('[Main] Added Phase 1 job "{0}" to sessionFallbackJobs (count={1}).' -f $jn, $sessionFallbackJobs.Count)
         }
     } catch {
         Write-Warning ('Unable to enumerate jobs via Get-VBRJob: {0}' -f $_.Exception.Message)
@@ -1490,6 +1496,8 @@ if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) 
                 Write-DebugMessage ('[Main] Add-JobReportFromJob failed for computer job "{0}":' -f $jn +
                     [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
             }
+            [void]$sessionFallbackJobs.Add($job)
+            Write-DebugMessage ('[Main] Added Phase 2 job "{0}" to sessionFallbackJobs (count={1}).' -f $jn, $sessionFallbackJobs.Count)
         }
     } catch {
         Write-Warning ('Unable to enumerate computer backup jobs: {0}' -f $_.Exception.Message)
@@ -1690,65 +1698,95 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
         $housekeepingPattern = (($housekeepingTerms | ForEach-Object { [regex]::Escape($_) }) -join '|')
         $fallbackCandidates = New-Object 'System.Collections.Generic.List[object]'
 
-        # Try -Type enum discovery first when available.
-        try {
-            $sessionCommand = Get-Command -Name 'Get-VBRSession' -ErrorAction Stop
-            $typeParameter = $sessionCommand.Parameters['Type']
-            $typeNames = @()
-            if ($null -ne $typeParameter) {
-                $typeParameterType = $typeParameter.ParameterType
-                if ($typeParameterType.IsArray) {
-                    $typeParameterType = $typeParameterType.GetElementType()
+        $canInvokeGetVBRSessionBare = Test-CmdletCanInvokeWithoutArguments -CmdletName 'Get-VBRSession'
+        $hasGetVBRSessionJob = Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Job'
+        Write-DebugMessage ('[Main] Get-VBRSession: canInvokeBare={0} hasJobParam={1} sessionFallbackJobs.Count={2}' -f $canInvokeGetVBRSessionBare, $hasGetVBRSessionJob, $sessionFallbackJobs.Count)
+
+        if ($canInvokeGetVBRSessionBare) {
+            Write-DebugMessage '[Main] Get-VBRSession can be invoked without arguments; using bare/type-enum path.'
+
+            # Try -Type enum discovery first when available.
+            try {
+                $sessionCommand = Get-Command -Name 'Get-VBRSession' -ErrorAction Stop
+                $typeParameter = $sessionCommand.Parameters['Type']
+                $typeNames = @()
+                if ($null -ne $typeParameter) {
+                    $typeParameterType = $typeParameter.ParameterType
+                    if ($typeParameterType.IsArray) {
+                        $typeParameterType = $typeParameterType.GetElementType()
+                    }
+                    if ($null -ne $typeParameterType -and $typeParameterType.IsEnum) {
+                        $typeNames = [enum]::GetNames($typeParameterType)
+                    }
                 }
-                if ($null -ne $typeParameterType -and $typeParameterType.IsEnum) {
-                    $typeNames = [enum]::GetNames($typeParameterType)
+
+                $matchingTypes = @($typeNames | Where-Object {
+                    $typeName = [string]$_
+                    $housekeepingTerms | Where-Object { $typeName -imatch [regex]::Escape($_) }
+                } | Select-Object -Unique)
+
+                foreach ($typeName in $matchingTypes) {
+                    try {
+                        Write-DebugMessage ('[Main] Get-VBRSession fallback querying -Type {0}' -f $typeName)
+                        $typedSessions = @(Get-VBRSession -Type $typeName -ErrorAction Stop)
+                        foreach ($s in $typedSessions) {
+                            if ($null -ne $s) { [void]$fallbackCandidates.Add($s) }
+                        }
+                    } catch {
+                        Write-DebugMessage ('[Main] Get-VBRSession -Type {0} threw:' -f $typeName +
+                            [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                    }
                 }
+            } catch {
+                Write-DebugMessage ('[Main] Get-VBRSession -Type discovery failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
             }
 
-            $matchingTypes = @($typeNames | Where-Object {
-                $typeName = [string]$_
-                $housekeepingTerms | Where-Object { $typeName -imatch [regex]::Escape($_) }
-            } | Select-Object -Unique)
-
-            foreach ($typeName in $matchingTypes) {
+            # Conservative text-match fallback over generic session properties.
+            try {
+                Write-DebugMessage '[Main] Calling Get-VBRSession (no arguments) for text-match fallback.'
+                $allSessions = @(Get-VBRSession -ErrorAction Stop)
+                foreach ($s in $allSessions) {
+                    if ($null -eq $s) { continue }
+                    $fields = @(
+                        Get-PropertyValue -InputObject $s -Names @('Name'),
+                        Get-PropertyValue -InputObject $s -Names @('JobName'),
+                        Get-PropertyValue -InputObject $s -Names @('SessionName'),
+                        Get-PropertyValue -InputObject $s -Names @('SessionType'),
+                        Get-PropertyValue -InputObject $s -Names @('JobType'),
+                        Get-PropertyValue -InputObject $s -Names @('Type'),
+                        Get-PropertyValue -InputObject $s -Names @('Operation'),
+                        Get-PropertyValue -InputObject $s -Names @('Description')
+                    )
+                    $searchText = (($fields | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ' ')
+                    if (-not [string]::IsNullOrWhiteSpace($searchText) -and $searchText -imatch $housekeepingPattern) {
+                        [void]$fallbackCandidates.Add($s)
+                    }
+                }
+            } catch {
+                Write-Warning ('Unable to enumerate Get-VBRSession fallback sessions: {0}' -f $_.Exception.Message)
+                Write-DebugMessage ('[Main] Get-VBRSession fallback enumeration threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+            }
+        } elseif ($hasGetVBRSessionJob -and $sessionFallbackJobs.Count -gt 0) {
+            # Bare invocation is unsafe (mandatory -Job parameter set); use job-scoped querying.
+            Write-ProgressMessage ('  Get-VBRSession requires -Job; querying {0} known job(s) individually.' -f $sessionFallbackJobs.Count)
+            Write-DebugMessage ('[Main] Get-VBRSession bare call unsafe; using job-scoped fallback with {0} job(s).' -f $sessionFallbackJobs.Count)
+            foreach ($job in $sessionFallbackJobs) {
+                $jn = if ($null -ne $job -and $null -ne $job.PSObject.Properties['Name']) { [string]$job.Name } else { '<unnamed>' }
+                Write-DebugMessage ('[Main] Calling Get-VBRSession -Job "{0}".' -f $jn)
                 try {
-                    Write-DebugMessage ('[Main] Get-VBRSession fallback querying -Type {0}' -f $typeName)
-                    $typedSessions = @(Get-VBRSession -Type $typeName -ErrorAction Stop)
-                    foreach ($s in $typedSessions) {
+                    $jobSessions = @(Get-VBRSession -Job $job -ErrorAction Stop)
+                    Write-DebugMessage ('[Main] Get-VBRSession -Job "{0}" returned {1} session(s).' -f $jn, $jobSessions.Count)
+                    foreach ($s in $jobSessions) {
                         if ($null -ne $s) { [void]$fallbackCandidates.Add($s) }
                     }
                 } catch {
-                    Write-DebugMessage ('[Main] Get-VBRSession -Type {0} threw:' -f $typeName +
+                    Write-DebugMessage ('[Main] Get-VBRSession -Job "{0}" threw:' -f $jn +
                         [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
                 }
             }
-        } catch {
-            Write-DebugMessage ('[Main] Get-VBRSession -Type discovery failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-
-        # Conservative text-match fallback over generic session properties.
-        try {
-            $allSessions = @(Get-VBRSession -ErrorAction Stop)
-            foreach ($s in $allSessions) {
-                if ($null -eq $s) { continue }
-                $fields = @(
-                    Get-PropertyValue -InputObject $s -Names @('Name'),
-                    Get-PropertyValue -InputObject $s -Names @('JobName'),
-                    Get-PropertyValue -InputObject $s -Names @('SessionName'),
-                    Get-PropertyValue -InputObject $s -Names @('SessionType'),
-                    Get-PropertyValue -InputObject $s -Names @('JobType'),
-                    Get-PropertyValue -InputObject $s -Names @('Type'),
-                    Get-PropertyValue -InputObject $s -Names @('Operation'),
-                    Get-PropertyValue -InputObject $s -Names @('Description')
-                )
-                $searchText = (($fields | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) -join ' ')
-                if (-not [string]::IsNullOrWhiteSpace($searchText) -and $searchText -imatch $housekeepingPattern) {
-                    [void]$fallbackCandidates.Add($s)
-                }
-            }
-        } catch {
-            Write-Warning ('Unable to enumerate Get-VBRSession fallback sessions: {0}' -f $_.Exception.Message)
-            Write-DebugMessage ('[Main] Get-VBRSession fallback enumeration threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        } else {
+            Write-ProgressMessage '  Get-VBRSession cannot be invoked safely without mandatory parameters and no job-scoped fallback is available. Skipping.'
+            Write-DebugMessage ('[Main] Get-VBRSession skipped: canInvokeBare={0} hasJobParam={1} knownJobs={2}.' -f $canInvokeGetVBRSessionBare, $hasGetVBRSessionJob, $sessionFallbackJobs.Count)
         }
 
         Write-DebugMessage ('[Main] Get-VBRSession fallback candidate count before window filter: {0}' -f $fallbackCandidates.Count)
