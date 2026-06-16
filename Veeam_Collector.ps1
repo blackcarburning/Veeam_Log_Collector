@@ -1359,14 +1359,16 @@ function Get-DJLatestSessionFromList {
     if ($null -eq $Sessions -or $Sessions.Count -eq 0) { return $null }
 
     $best     = $null
-    $bestTick = [long]-1
+    $bestTick = [long]::MinValue
 
     foreach ($s in $Sessions) {
         $endTime   = Get-SessionEndTime   -Session $s
         $startTime = Get-SessionStartTime -Session $s
-        $t = if ($null -ne $endTime)      { Get-SortableTicks -Value $endTime   } `
-             elseif ($null -ne $startTime) { Get-SortableTicks -Value $startTime } `
-             else                          { [long]0 }
+        # Sessions with no timestamp at all are skipped — they should never
+        # beat a session that has a real end or start time.
+        if ($null -eq $endTime -and $null -eq $startTime) { continue }
+        $t = if ($null -ne $endTime) { Get-SortableTicks -Value $endTime } `
+             else                    { Get-SortableTicks -Value $startTime }
         if ($t -gt $bestTick) { $bestTick = $t; $best = $s }
     }
 
