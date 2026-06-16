@@ -31,10 +31,10 @@
 
     This section lists all defined backup jobs (agent, application, unstructured,
     and standard backup types) with their schedule, enabled status, next scheduled
-    run or schedule description, last run time, and last result.  It gives
-    operators and LLMs a quick reference for what jobs should be running and when.
-    The Defined Jobs block is omitted from JSON (-Json) mode so that stdout
-    remains a pure JSON array.
+    run or schedule description, last run time, last result, and target repository.
+    It gives operators and LLMs a quick reference for what jobs should be running
+    and when.  The Defined Jobs block is omitted from JSON (-Json) mode so that
+    stdout remains a pure JSON array.
 
     Progress messages are printed throughout.  In default (human-readable) mode
     they go to the console (Write-Host).  In -Json mode they go to the Warning
@@ -1215,34 +1215,9 @@ function Get-DJScheduleEnabled {
 }
 
 # ---------------------------------------------------------------------------
-# Get-DJPeriodicallyText
-#   Converts a VBR periodically-schedule options object to a string such as
-#   "every 4h" or "every 30m".  FullPeriod is treated as minutes.
-# ---------------------------------------------------------------------------
-function Get-DJPeriodicallyText {
-    [CmdletBinding()]
-    param([object]$Options)
-
-    if ($null -eq $Options) { return '' }
-    try {
-        $period = Get-DJPropertyPathValue -Object $Options -Path 'FullPeriod'
-        if ($null -eq $period) { return '' }
-        $mins = [int]$period
-        if ($mins -le 0) { return '' }
-        $h = [int][Math]::Floor($mins / 60)
-        $m = $mins % 60
-        if ($h -gt 0 -and $m -gt 0) { return ('every {0}h {1}m' -f $h, $m) }
-        if ($h -gt 0)                { return ('every {0}h'      -f $h) }
-        return ('every {0}m' -f $m)
-    } catch {
-        return ''
-    }
-}
-
-# ---------------------------------------------------------------------------
 # Get-DJScheduleDisplay
 #   Returns a compact human-readable schedule string for a job.
-#   Tries: next-run datetime → periodically → daily → monthly → chain → type.
+#   Tries: next-run datetime → daily → monthly → chain → type.
 # ---------------------------------------------------------------------------
 function Get-DJScheduleDisplay {
     [CmdletBinding()]
@@ -1262,13 +1237,6 @@ function Get-DJScheduleDisplay {
 
         if ($null -eq $schedOpts) {
             return if ($null -ne $nextRun) { $nextRun.ToString($script:DJDateFormat) } else { '' }
-        }
-
-        # Periodically schedule
-        $periodOpts = Get-DJPropertyPathValue -Object $schedOpts -Path 'OptionsPeriodically'
-        if ($null -ne $periodOpts) {
-            $txt = Get-DJPeriodicallyText -Options $periodOpts
-            if (-not [string]::IsNullOrWhiteSpace($txt)) { return $txt }
         }
 
         # Daily schedule
@@ -1376,6 +1344,49 @@ function Get-DJLastRunForJob {
 }
 
 # ---------------------------------------------------------------------------
+# Get-DJJobRepository
+#   Returns the target repository name for a job.
+#   Tries GetTargetRepository() method first, then multiple property paths.
+#   Returns empty string when the repository cannot be determined.
+# ---------------------------------------------------------------------------
+function Get-DJJobRepository {
+    [CmdletBinding()]
+    param([object]$Job)
+
+    if ($null -eq $Job) { return '' }
+
+    # Try GetTargetRepository() method (most reliable for standard VBR jobs)
+    if ($Job.PSObject.Methods['GetTargetRepository']) {
+        try {
+            $repo = $Job.GetTargetRepository()
+            if ($null -ne $repo) {
+                $rName = Get-DJPropertyPathValue -Object $repo -Path 'Name'
+                if (-not [string]::IsNullOrWhiteSpace([string]$rName)) { return [string]$rName }
+            }
+        } catch {}
+    }
+
+    # Try common property paths across job types and versions
+    foreach ($path in @(
+        'TargetRepository.Name',
+        'Repository.Name',
+        'BackupStorageOptions.RepositoryFriendlyName',
+        'BackupStorageOptions.Repository.Name',
+        'Info.BackupTargetOptions.RepositoryName',
+        'BackupTarget.Repository.Name',
+        'BackupTarget.Name',
+        'RepositoryName'
+    )) {
+        try {
+            $val = Get-DJPropertyPathValue -Object $Job -Path $path
+            if (-not [string]::IsNullOrWhiteSpace([string]$val)) { return [string]$val }
+        } catch {}
+    }
+
+    return ''
+}
+
+# ---------------------------------------------------------------------------
 # New-DJJobReportRow
 #   Builds one [pscustomobject] row for the Defined Jobs table.
 # ---------------------------------------------------------------------------
@@ -1387,17 +1398,19 @@ function New-DJJobReportRow {
     )
 
     $jobName      = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
-    $schedEnabled = Get-DJScheduleEnabled -Job $Job
-    $schedDisplay = Get-DJScheduleDisplay -Job $Job
-    $lastRunInfo  = Get-DJLastRunForJob   -Job $Job
+    $schedEnabled = Get-DJScheduleEnabled  -Job $Job
+    $schedDisplay = Get-DJScheduleDisplay  -Job $Job
+    $lastRunInfo  = Get-DJLastRunForJob    -Job $Job
+    $repoName     = Get-DJJobRepository    -Job $Job
 
     return [pscustomobject][ordered]@{
-        Job      = $jobName
-        Type     = $TypeOverride
-        On       = if ($schedEnabled) { 'Yes' } else { 'No' }
-        Schedule = $schedDisplay
-        LastRun  = $lastRunInfo.LastRun
-        Status   = $lastRunInfo.Status
+        Job        = $jobName
+        Type       = $TypeOverride
+        On         = if ($schedEnabled) { 'Yes' } else { 'No' }
+        Schedule   = $schedDisplay
+        LastRun    = $lastRunInfo.LastRun
+        LastResult = $lastRunInfo.Status
+        Repository = $repoName
     }
 }
 
@@ -1540,28 +1553,30 @@ function New-DefinedJobsSectionText {
         Write-ProgressMessage ('Defined Jobs — {0} job(s) found.' -f $rows.Count)
         Write-DebugMessage ('[New-DefinedJobsSectionText] Collection complete: {0} row(s).' -f $rows.Count)
 
-        # Column widths from spec
+        # Column widths
         $wJob  = 38
         $wType = 11
         $wOn   = 3
         $wSch  = 18
         $wLast = 16
-        $wStat = 8
+        $wRes  = 11
+        $wRepo = 20
 
         $lines = New-Object 'System.Collections.Generic.List[string]'
         [void]$lines.Add('############### Defined Jobs BEGIN ###################')
 
         # Header row
-        [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f
+        [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6}' -f
             'Job'.PadRight($wJob),
             'Type'.PadRight($wType),
             'On'.PadRight($wOn),
             'Next / schedule'.PadRight($wSch),
             'Last run'.PadRight($wLast),
-            'Status'.PadRight($wStat)))
+            'Last Result'.PadRight($wRes),
+            'Repository'.PadRight($wRepo)))
 
         # Separator
-        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wStat + 5))
+        [void]$lines.Add('-' * ($wJob + $wType + $wOn + $wSch + $wLast + $wRes + $wRepo + 6))
 
         if ($rows.Count -eq 0) {
             [void]$lines.Add('(no defined jobs found)')
@@ -1572,16 +1587,18 @@ function New-DefinedJobsSectionText {
                 $onCol   = [string]$r.On
                 $schCol  = [string]$r.Schedule
                 $lastCol = [string]$r.LastRun
-                $statCol = [string]$r.Status
+                $resCol  = [string]$r.LastResult
+                $repoCol = [string]$r.Repository
 
                 $jobField  = if ($jobCol.Length  -gt $wJob)  { $jobCol.Substring(0, $wJob)   } else { $jobCol.PadRight($wJob)   }
                 $typeField = if ($typCol.Length  -gt $wType) { $typCol.Substring(0, $wType)  } else { $typCol.PadRight($wType)  }
                 $onField   = if ($onCol.Length   -gt $wOn)   { $onCol.Substring(0, $wOn)     } else { $onCol.PadRight($wOn)     }
                 $schField  = if ($schCol.Length  -gt $wSch)  { $schCol.Substring(0, $wSch)   } else { $schCol.PadRight($wSch)   }
                 $lastField = if ($lastCol.Length -gt $wLast) { $lastCol.Substring(0, $wLast) } else { $lastCol.PadRight($wLast) }
-                $statField = if ($statCol.Length -gt $wStat) { $statCol.Substring(0, $wStat) } else { $statCol.PadRight($wStat) }
+                $resField  = if ($resCol.Length  -gt $wRes)  { $resCol.Substring(0, $wRes)   } else { $resCol.PadRight($wRes)   }
+                $repoField = if ($repoCol.Length -gt $wRepo) { $repoCol.Substring(0, $wRepo) } else { $repoCol.PadRight($wRepo) }
 
-                [void]$lines.Add(('{0} {1} {2} {3} {4} {5}' -f $jobField, $typeField, $onField, $schField, $lastField, $statField))
+                [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6}' -f $jobField, $typeField, $onField, $schField, $lastField, $resField, $repoField))
             }
         }
 

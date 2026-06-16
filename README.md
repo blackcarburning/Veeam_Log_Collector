@@ -10,10 +10,10 @@ In normal text mode the report begins with a **Defined Jobs baseline** section s
 
 ```
 ############### Defined Jobs BEGIN ###################
-Job                                    Type        On  Next / schedule    Last run         Status
-----------------------------------------------------------------------
-VMware_Daily_Backup                    Backup      Yes 17/06/2026 22:00   16/06/2026 22:47 Success
-VMware_Daily_CATCHALL                  Backup      Yes Daily 22:00        16/06/2026 02:47 Warning
+Job                                    Type        On  Next / schedule    Last run         Last Result Repository
+-----------------------------------------------------------------------------------------------------------------
+VMware_Daily_Backup                    Backup      Yes 17/06/2026 22:00   16/06/2026 22:47 Success     BackupRepo01
+VMware_Daily_CATCHALL                  Backup      Yes Daily 22:00        16/06/2026 02:47 Warning     BackupRepo01
 ############### Defined Jobs END ###################
 ```
 
@@ -81,9 +81,10 @@ Columns (fixed width):
 | Job | 38 | Job name |
 | Type | 11 | Job type |
 | On | 3 | `Yes` if scheduling is enabled, `No` otherwise |
-| Next / schedule | 18 | Next scheduled run (if in the future) or a schedule description such as `Daily 22:00` or `every 4h` |
+| Next / schedule | 18 | Next scheduled run (if in the future) or a schedule description such as `Daily 22:00` |
 | Last run | 16 | End time of the most recent session (`dd/MM/yyyy HH:mm`) |
-| Status | 8 | Result of the most recent session |
+| Last Result | 11 | Result of the most recent session (e.g. `Success`, `Warning`, `Failed`) |
+| Repository | 20 | Target repository name |
 
 ## How errors are extracted
 
