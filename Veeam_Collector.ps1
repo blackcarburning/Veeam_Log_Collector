@@ -1999,15 +1999,22 @@ function Format-DRUsedPercent {
 function Get-DRNonNegativeDifference {
     [CmdletBinding()]
     param(
-        [object]$TotalBytes,
-        [object]$UsedBytes
+        [Alias('TotalBytes')]
+        [AllowNull()]
+        [object]$Left,
+
+        [Alias('UsedBytes')]
+        [AllowNull()]
+        [object]$Right
     )
 
-    $total = ConvertTo-DRBytes -Value $TotalBytes
-    $used  = ConvertTo-DRBytes -Value $UsedBytes
+    $leftValue  = ConvertTo-DRBytes -Value $Left
+    $rightValue = ConvertTo-DRBytes -Value $Right
 
-    if ($null -eq $total -or $null -eq $used) { return $null }
-    return [Math]::Max([double]0, ([double]$total - [double]$used))
+    if ($null -eq $leftValue -or $null -eq $rightValue) { return $null }
+    [double]$result = [double]$leftValue - [double]$rightValue
+    if ($result -lt 0.0) { return [double]0.0 }
+    return $result
 }
 
 function Get-DRRepositoryName {
@@ -2162,10 +2169,10 @@ function Get-DRRepositorySpaceInfo {
     }
 
     if ($null -eq $used -and $null -ne $total -and $null -ne $free) {
-        $used = [Math]::Max([double]0, ([double]$total - [double]$free))
+        $used = Get-DRNonNegativeDifference -Left ([double]$total) -Right ([double]$free)
     }
     if ($null -eq $free -and $null -ne $total -and $null -ne $used) {
-        $free = [Math]::Max([double]0, ([double]$total - [double]$used))
+        $free = Get-DRNonNegativeDifference -Left ([double]$total) -Right ([double]$used)
     }
 
     return @{
@@ -2327,7 +2334,7 @@ function Get-DefinedRepositoryReport {
             if ($null -eq $perfUsed)  { $perfUsed  = $sobrSpace.UsedBytes  }
             $perfFree = $sobrSpace.FreeBytes
         } else {
-            $perfFree = Get-DRNonNegativeDifference -TotalBytes $perfTotal -UsedBytes $perfUsed
+            $perfFree = Get-DRNonNegativeDifference -Left $perfTotal -Right $perfUsed
         }
 
         [void]$rows.Add((New-DRRepositoryRow -Repository $sobrName -Tier 'Scale-Out' -Parent '' -Status $sobrStatus `
