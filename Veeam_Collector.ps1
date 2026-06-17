@@ -2266,7 +2266,28 @@ function Get-DefinedRepositoryReport {
     param()
 
     $rows = New-Object 'System.Collections.Generic.List[object]'
-    $attachedRepoKeys = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+
+    # Separate hash sets for physical extents attached to SOBRs and object extents
+    # attached to SOBRs (either as capacity extents or object-backed performance extents).
+    $attachedPhysRepoKeys = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+    $attachedObjRepoKeys  = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+
+    # Build the object repository key lookup upfront so the standard-repository pass
+    # can skip COS/S3 repos and prevent them from appearing as physical/standalone.
+    $objectRepoKeys = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+    $objectRepoList = @()
+    if (Get-Command -Name 'Get-VBRObjectStorageRepository' -ErrorAction SilentlyContinue) {
+        try {
+            $objectRepoList = @(Get-VBRObjectStorageRepository -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            foreach ($objR in $objectRepoList) {
+                $k = Get-DRRepositoryKey -Repository $objR
+                if (-not [string]::IsNullOrWhiteSpace($k)) { [void]$objectRepoKeys.Add($k) }
+            }
+        } catch {
+            Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRObjectStorageRepository (key build) failed: {0}' -f $_.Exception.Message)
+            $objectRepoList = @()
+        }
+    }
 
     $sobrList = @()
     if (Get-Command -Name 'Get-VBRBackupRepository' -ErrorAction SilentlyContinue) {
@@ -2281,7 +2302,7 @@ function Get-DefinedRepositoryReport {
     $sobrSort = 0
     foreach ($sobr in $sobrList) {
         $sobrSort++
-        $sobrName = Get-DRRepositoryName -Repository $sobr
+        $sobrName   = Get-DRRepositoryName   -Repository $sobr
         $sobrStatus = Get-DRRepositoryStatus -Repository $sobr
 
         $perfTotal = $null
@@ -2300,17 +2321,34 @@ function Get-DefinedRepositoryReport {
         $perfOrder = 0
         foreach ($extent in $perfExtents) {
             $perfOrder++
-            $extentRepo = Get-DRPropertyPathValue -Object $extent -Path 'Repository'
+            $extentRepo   = Get-DRPropertyPathValue -Object $extent -Path 'Repository'
             if ($null -eq $extentRepo) { $extentRepo = $extent }
-            $extentName = Get-DRRepositoryName -Repository $extentRepo
+            $extentName   = Get-DRRepositoryName   -Repository $extentRepo
             $extentStatus = Get-DRRepositoryStatus -Repository $extentRepo
-            $extentKey = Get-DRRepositoryKey -Repository $extentRepo
-            if (-not [string]::IsNullOrWhiteSpace($extentKey)) { [void]$attachedRepoKeys.Add($extentKey) }
+            $extentKey    = Get-DRRepositoryKey    -Repository $extentRepo
 
-            $space = Get-DRPhysicalRepositorySpace -Repository $extentRepo
-            [void]$rows.Add((New-DRRepositoryRow -Repository $extentName -Tier 'Performance' -Parent $sobrName -Status $extentStatus `
+            # Determine whether this performance extent is backed by object storage.
+            $extentIsObj = (-not [string]::IsNullOrWhiteSpace($extentKey)) -and $objectRepoKeys.Contains($extentKey)
+            if (-not [string]::IsNullOrWhiteSpace($extentKey)) {
+                if ($extentIsObj) {
+                    [void]$attachedObjRepoKeys.Add($extentKey)
+                } else {
+                    [void]$attachedPhysRepoKeys.Add($extentKey)
+                }
+            }
+
+            $extentTier = if ($extentIsObj) { 'Perf extent (Obj)' } else { 'Perf extent' }
+            $space = if ($extentIsObj) {
+                Get-DRObjectRepositorySpace   -Repository $extentRepo
+            } else {
+                Get-DRPhysicalRepositorySpace -Repository $extentRepo
+            }
+
+            [void]$rows.Add((New-DRRepositoryRow -Repository $extentName -Tier $extentTier -Parent $sobrName -Status $extentStatus `
                 -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 2 -SortOrder ($sobrSort * 1000 + $perfOrder)))
 
+            # Accumulate all performance extents (including object-backed) into the SOBR aggregate.
+            # Capacity extents are intentionally excluded from this aggregate.
             if ($null -ne $space.TotalBytes) { $perfTotal = if ($null -eq $perfTotal) { 0 } else { $perfTotal }; $perfTotal += $space.TotalBytes }
             if ($null -ne $space.UsedBytes)  { $perfUsed  = if ($null -eq $perfUsed)  { 0 } else { $perfUsed  }; $perfUsed  += $space.UsedBytes  }
         }
@@ -2328,12 +2366,12 @@ function Get-DefinedRepositoryReport {
         $capOrder = 0
         foreach ($cap in $capExtents) {
             $capOrder++
-            $capRepo = Get-DRPropertyPathValue -Object $cap -Path 'Repository'
+            $capRepo   = Get-DRPropertyPathValue -Object $cap -Path 'Repository'
             if ($null -eq $capRepo) { $capRepo = $cap }
-            $capName = Get-DRRepositoryName -Repository $capRepo
+            $capName   = Get-DRRepositoryName   -Repository $capRepo
             $capStatus = Get-DRRepositoryStatus -Repository $capRepo
-            $capKey = Get-DRRepositoryKey -Repository $capRepo
-            if (-not [string]::IsNullOrWhiteSpace($capKey)) { [void]$attachedRepoKeys.Add($capKey) }
+            $capKey    = Get-DRRepositoryKey    -Repository $capRepo
+            if (-not [string]::IsNullOrWhiteSpace($capKey)) { [void]$attachedObjRepoKeys.Add($capKey) }
 
             $capSpace = Get-DRObjectRepositorySpace -Repository $capRepo
             [void]$rows.Add((New-DRRepositoryRow -Repository $capName -Tier 'Capacity' -Parent $sobrName -Status $capStatus `
@@ -2349,7 +2387,7 @@ function Get-DefinedRepositoryReport {
             $perfFree = Get-DRNonNegativeDifference -Left $perfTotal -Right $perfUsed
         }
 
-        [void]$rows.Add((New-DRRepositoryRow -Repository $sobrName -Tier 'Scale-Out' -Parent '' -Status $sobrStatus `
+        [void]$rows.Add((New-DRRepositoryRow -Repository $sobrName -Tier 'SOBR' -Parent '' -Status $sobrStatus `
             -TotalBytes $perfTotal -UsedBytes $perfUsed -FreeBytes $perfFree -SortGroup 1 -SortOrder $sobrSort))
     }
 
@@ -2367,37 +2405,35 @@ function Get-DefinedRepositoryReport {
             if ($isScaleOut) { continue }
 
             $key = Get-DRRepositoryKey -Repository $repo
-            if (-not [string]::IsNullOrWhiteSpace($key) -and $attachedRepoKeys.Contains($key)) { continue }
+            # Skip repos attached to a SOBR as physical performance extents.
+            if (-not [string]::IsNullOrWhiteSpace($key) -and $attachedPhysRepoKeys.Contains($key)) { continue }
+            # Skip object-storage (COS/S3) repositories — they must not appear as physical/standalone.
+            # This is the critical fix: Get-VBRBackupRepository returns COS repos too, but they should
+            # only appear in the Object storage section, not as a second standalone Performance entry.
+            if (-not [string]::IsNullOrWhiteSpace($key) -and $objectRepoKeys.Contains($key)) { continue }
 
             $standardOrder++
-            $name = Get-DRRepositoryName -Repository $repo
+            $name   = Get-DRRepositoryName   -Repository $repo
             $status = Get-DRRepositoryStatus -Repository $repo
-            $space = Get-DRPhysicalRepositorySpace -Repository $repo
-            [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Standard' -Parent '' -Status $status `
+            $space  = Get-DRPhysicalRepositorySpace -Repository $repo
+            [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Performance' -Parent 'Standalone' -Status $status `
                 -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 4 -SortOrder $standardOrder))
         }
     }
 
-    if (Get-Command -Name 'Get-VBRObjectStorageRepository' -ErrorAction SilentlyContinue) {
-        try {
-            $objectRepos = @(Get-VBRObjectStorageRepository -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-        } catch {
-            Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRObjectStorageRepository failed: {0}' -f $_.Exception.Message)
-            $objectRepos = @()
-        }
+    # Process object-storage repositories using the list already collected above.
+    # Skip only those that are already represented as SOBR extents (performance or capacity).
+    $objectOrder = 0
+    foreach ($objRepo in $objectRepoList) {
+        $key = Get-DRRepositoryKey -Repository $objRepo
+        if (-not [string]::IsNullOrWhiteSpace($key) -and $attachedObjRepoKeys.Contains($key)) { continue }
 
-        $objectOrder = 0
-        foreach ($objRepo in $objectRepos) {
-            $key = Get-DRRepositoryKey -Repository $objRepo
-            if (-not [string]::IsNullOrWhiteSpace($key) -and $attachedRepoKeys.Contains($key)) { continue }
-
-            $objectOrder++
-            $name = Get-DRRepositoryName -Repository $objRepo
-            $status = Get-DRRepositoryStatus -Repository $objRepo
-            $space = Get-DRObjectRepositorySpace -Repository $objRepo
-            [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Object' -Parent '' -Status $status `
-                -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 5 -SortOrder $objectOrder))
-        }
+        $objectOrder++
+        $name   = Get-DRRepositoryName   -Repository $objRepo
+        $status = Get-DRRepositoryStatus -Repository $objRepo
+        $space  = Get-DRObjectRepositorySpace -Repository $objRepo
+        [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Object storage' -Parent 'Standalone' -Status $status `
+            -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 5 -SortOrder $objectOrder))
     }
 
     return @($rows | Sort-Object -Property SortGroup, SortOrder, Repository)
