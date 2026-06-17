@@ -2412,6 +2412,7 @@ function New-DefinedRepositorySectionText {
             $wUsed       = 11
             $wFree       = 11
             $wUsedPct    = 7
+            $separatorWidth = $wRepository + $wTier + $wParent + $wStatus + $wTotal + $wUsed + $wFree + $wUsedPct + 7
 
             [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6} {7}' -f `
                 (Format-DRFixedWidth -Value 'Repository' -Width $wRepository),
@@ -2422,7 +2423,7 @@ function New-DefinedRepositorySectionText {
                 (Format-DRFixedWidth -Value 'Used'       -Width $wUsed),
                 (Format-DRFixedWidth -Value 'Free'       -Width $wFree),
                 (Format-DRFixedWidth -Value 'Used %'     -Width $wUsedPct)))
-            [void]$lines.Add(('-' * 125))
+            [void]$lines.Add(('-' * $separatorWidth))
 
             foreach ($row in $rows) {
                 [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6} {7}' -f `
