@@ -6,7 +6,7 @@ A focused PowerShell script that reports the **last error text** from the most r
 
 For every backup/replication/offload/housekeeping job it finds the **most recent session within the last N hours**, extracts the last error/warning text, and produces a compact, LLM-friendly report.  No log bundles are created — the output is small enough to paste directly into an LLM prompt or pipe to `jq`.
 
-In normal text mode the report begins with a **Defined Jobs baseline** section showing all currently defined backup jobs together with their schedule, enabled status, next scheduled run, last run time, and last result.  This gives operators (and LLMs) immediate context for which jobs exist and when they are expected to run.  The section is clearly delimited:
+In normal text mode the report begins with a **Defined Jobs baseline** section showing all currently defined backup jobs together with their schedule, enabled status, next scheduled run, last run time, and last result.  It is followed immediately by a **Defined Repository** utilisation block showing repository, tier, parent, status, total, used, free, and used-percent columns.  These sections give operators (and LLMs) immediate context for which jobs and repositories exist and their current baseline state.  The sections are clearly delimited:
 
 ```
 ############### Defined Jobs BEGIN ###################
@@ -15,9 +15,13 @@ Job                                    Type        On  Next / schedule    Last r
 VMware_Daily_Backup                    VM          Yes Daily 23:00        16/06/2026 02:26 Stopped     Warning
 VMware_Daily_CATCHALL                  VM          Yes Daily 04:00        16/06/2026 02:45 Stopped     Warning
 ############### Defined Jobs END ###################
+############### Defined Repository BEGIN ###################
+Repository                     Tier             Parent               Status       Total       Used        Free        Used %
+...
+############### Defined Repository END ###################
 ```
 
-The Defined Jobs block is **omitted in `-Json` mode** so that stdout remains a pure JSON array.
+The Defined Jobs and Defined Repository blocks are **omitted in `-Json` mode** so that stdout remains a pure JSON array.
 
 Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available. If dedicated housekeeping session cmdlets are unavailable, the script also uses a `Get-VBRSession` fallback pass to discover relevant offload/repository/configuration sessions.
 
