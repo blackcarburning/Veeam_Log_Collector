@@ -166,6 +166,18 @@
       - If Defined Jobs collection fails, a warning is printed and the rest of the
         report continues normally.
 
+    Defined Repository baseline (text mode only):
+      - Immediately after the Defined Jobs block, the report includes a Defined
+        Repository section listing every Veeam backup repository (Scale-Out,
+        Performance, Capacity, Standard, and Object-storage tiers) with its tier,
+        parent SOBR name, status, total/used/free space, and used-% utilisation.
+      - The block is delimited with:
+            ############### Defined Repository BEGIN ###################
+            ############### Defined Repository END ###################
+      - The block is omitted from -Json mode; stdout remains a pure JSON array.
+      - If repository collection fails, a placeholder block is emitted and the
+        rest of the report continues normally.
+
     Computer/agent backup jobs:
       - Get-VBRComputerBackupJob is used when available so that Get-VBRJob is not
         asked to enumerate agent/computer jobs (which triggers a deprecation warning).
@@ -2625,7 +2637,7 @@ function Get-CollectorHostName {
 function New-CollectorReportBody {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)] [object[]]$Reports,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Reports,
         [Parameter(Mandatory)] [int]$TotalJobs,
         [Parameter(Mandatory)] [int]$FailedCount,
         [Parameter(Mandatory)] [int]$WarnCount,
