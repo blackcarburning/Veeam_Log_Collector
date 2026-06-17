@@ -1822,6 +1822,509 @@ function New-DefinedJobsSectionText {
     }
 }
 
+# ===========================================================================
+# Defined Repository baseline — helper functions
+#   These functions are repository-specific and DR-prefixed to avoid collisions
+#   with existing helpers from other collector phases.
+# ===========================================================================
+
+function Get-DRPropertyPathValue {
+    [CmdletBinding()]
+    param(
+        [object]$Object,
+        [string]$Path
+    )
+
+    if ($null -eq $Object) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+
+    $parts = $Path -split '\.'
+    $current = $Object
+    foreach ($part in $parts) {
+        if ($null -eq $current) { return $null }
+        try {
+            $prop = $current.PSObject.Properties[$part]
+            if ($null -eq $prop) { return $null }
+            $current = $prop.Value
+        } catch {
+            return $null
+        }
+    }
+
+    return $current
+}
+
+function ConvertTo-DRNullableBoolean {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+    try { return [bool]$Value } catch { return $null }
+}
+
+function ConvertTo-DRSizeBytes {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return $null }
+
+    if ($Value -is [byte] -or
+        $Value -is [int16] -or
+        $Value -is [int32] -or
+        $Value -is [int64] -or
+        $Value -is [uint16] -or
+        $Value -is [uint32] -or
+        $Value -is [uint64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]) {
+        return [double]$Value
+    }
+
+    foreach ($path in @('InBytes', 'Bytes', 'Value', 'Size', 'TotalBytes', 'UsedBytes', 'FreeBytes')) {
+        $nested = Get-DRPropertyPathValue -Object $Value -Path $path
+        if ($null -ne $nested -and -not [object]::ReferenceEquals($nested, $Value)) {
+            $converted = ConvertTo-DRSizeBytes -Value $nested
+            if ($null -ne $converted) { return $converted }
+        }
+    }
+
+    if ($Value.PSObject.Methods['ToBytes']) {
+        try {
+            $toBytes = $Value.ToBytes()
+            if ($null -ne $toBytes) { return [double]$toBytes }
+        } catch {}
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $text = $text.Trim()
+    $textNoComma = $text -replace ',', ''
+
+    $match = [regex]::Match($textNoComma, '^\s*(?<num>[-+]?\d+(\.\d+)?)\s*(?<unit>[KMGTP]?i?B)?\s*$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) { return $null }
+
+    try {
+        $num  = [double]$match.Groups['num'].Value
+        $unit = [string]$match.Groups['unit'].Value
+        if ([string]::IsNullOrWhiteSpace($unit)) { return $num }
+
+        switch -Regex ($unit.ToUpperInvariant()) {
+            '^B$'   { return $num }
+            '^KIB$' { return ($num * 1024) }
+            '^KB$'  { return ($num * 1024) }
+            '^MIB$' { return ($num * 1024 * 1024) }
+            '^MB$'  { return ($num * 1024 * 1024) }
+            '^GIB$' { return ($num * 1024 * 1024 * 1024) }
+            '^GB$'  { return ($num * 1024 * 1024 * 1024) }
+            '^TIB$' { return ($num * 1024 * 1024 * 1024 * 1024) }
+            '^TB$'  { return ($num * 1024 * 1024 * 1024 * 1024) }
+            '^PIB$' { return ($num * 1024 * 1024 * 1024 * 1024 * 1024) }
+            '^PB$'  { return ($num * 1024 * 1024 * 1024 * 1024 * 1024) }
+            default { return $null }
+        }
+    } catch {
+        return $null
+    }
+}
+
+function Get-DRFirstSizeBytes {
+    [CmdletBinding()]
+    param([object[]]$Values)
+
+    foreach ($v in $Values) {
+        $bytes = ConvertTo-DRSizeBytes -Value $v
+        if ($null -ne $bytes) { return [double]$bytes }
+    }
+    return $null
+}
+
+function Format-DRByteSize {
+    [CmdletBinding()]
+    param([object]$Bytes)
+
+    $value = ConvertTo-DRSizeBytes -Value $Bytes
+    if ($null -eq $value) { return '' }
+    if ($value -lt 0) { $value = 0 }
+
+    $units = @('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB')
+    $idx = 0
+    while ($value -ge 1024 -and $idx -lt ($units.Count - 1)) {
+        $value = $value / 1024
+        $idx++
+    }
+
+    if ($idx -eq 0) {
+        return ('{0:N0} {1}' -f $value, $units[$idx])
+    }
+    return ('{0:N2} {1}' -f $value, $units[$idx])
+}
+
+function Format-DRUsedPercent {
+    [CmdletBinding()]
+    param(
+        [object]$TotalBytes,
+        [object]$UsedBytes
+    )
+
+    $total = ConvertTo-DRSizeBytes -Value $TotalBytes
+    $used  = ConvertTo-DRSizeBytes -Value $UsedBytes
+
+    if ($null -eq $total -or $null -eq $used -or $total -le 0) { return '' }
+    $pct = ($used / $total) * 100
+    return ('{0:N2}%' -f $pct)
+}
+
+function Get-DRRepositoryName {
+    [CmdletBinding()]
+    param([object]$Repository)
+
+    if ($null -eq $Repository) { return '' }
+    foreach ($path in @('Name', 'FriendlyName')) {
+        $v = Get-DRPropertyPathValue -Object $Repository -Path $path
+        if (-not [string]::IsNullOrWhiteSpace([string]$v)) { return [string]$v }
+    }
+    return [string]$Repository
+}
+
+function Get-DRRepositoryKey {
+    [CmdletBinding()]
+    param([object]$Repository)
+
+    if ($null -eq $Repository) { return '' }
+    foreach ($path in @('Id', 'Uid', 'Info.Id', 'Name', 'FriendlyName')) {
+        $v = Get-DRPropertyPathValue -Object $Repository -Path $path
+        if (-not [string]::IsNullOrWhiteSpace([string]$v)) { return [string]$v }
+    }
+    return [string]$Repository.GetHashCode()
+}
+
+function Get-DRRepositoryStatus {
+    [CmdletBinding()]
+    param([object]$Repository)
+
+    if ($null -eq $Repository) { return '' }
+
+    $isUnavailable = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $Repository -Path 'IsUnavailable')
+    if ($isUnavailable) { return 'Unavailable' }
+
+    $isOutOfOrder = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $Repository -Path 'IsOutOfOrder')
+    if ($isOutOfOrder) { return 'OutOfOrder' }
+
+    $isMaintenance = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $Repository -Path 'IsMaintenanceMode')
+    if ($isMaintenance) { return 'Maintenance' }
+
+    foreach ($path in @('Status', 'State', 'Info.Status')) {
+        $s = Get-DRPropertyPathValue -Object $Repository -Path $path
+        if (-not [string]::IsNullOrWhiteSpace([string]$s)) { return [string]$s }
+    }
+
+    $enabled = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $Repository -Path 'Enabled')
+    if ($null -eq $enabled) {
+        $enabled = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $Repository -Path 'IsEnabled')
+    }
+    if ($enabled -eq $false) { return 'Disabled' }
+    if ($enabled -eq $true)  { return 'Ready' }
+
+    return ''
+}
+
+function Get-DRRepositorySpaceInfo {
+    [CmdletBinding()]
+    param(
+        [object]$Repository,
+        [switch]$ObjectStorage
+    )
+
+    if ($null -eq $Repository) {
+        return @{ TotalBytes = $null; UsedBytes = $null; FreeBytes = $null }
+    }
+
+    $container = $null
+    if ($Repository.PSObject.Methods['GetContainer']) {
+        try {
+            $container = $Repository.GetContainer()
+        } catch {
+            Write-DebugMessage ('[Get-DRRepositorySpaceInfo] GetContainer() failed for "{0}": {1}' -f (Get-DRRepositoryName -Repository $Repository), $_.Exception.Message)
+        }
+    }
+
+    $total = Get-DRFirstSizeBytes -Values @(
+        (Get-DRPropertyPathValue -Object $Repository -Path 'CachedTotalSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'TotalSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Container.TotalSpace'),
+        (Get-DRPropertyPathValue -Object $container  -Path 'CachedTotalSpace'),
+        (Get-DRPropertyPathValue -Object $container  -Path 'TotalSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Capacity'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Quota'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Info.TotalSpace')
+    )
+    $used = Get-DRFirstSizeBytes -Values @(
+        (Get-DRPropertyPathValue -Object $Repository -Path 'CachedUsedSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'UsedSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Container.UsedSpace'),
+        (Get-DRPropertyPathValue -Object $container  -Path 'CachedUsedSpace'),
+        (Get-DRPropertyPathValue -Object $container  -Path 'UsedSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'UsedSize'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Info.UsedSpace')
+    )
+    $free = Get-DRFirstSizeBytes -Values @(
+        (Get-DRPropertyPathValue -Object $Repository -Path 'CachedFreeSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'FreeSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Container.FreeSpace'),
+        (Get-DRPropertyPathValue -Object $container  -Path 'CachedFreeSpace'),
+        (Get-DRPropertyPathValue -Object $container  -Path 'FreeSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'AvailableSpace'),
+        (Get-DRPropertyPathValue -Object $Repository -Path 'Info.FreeSpace')
+    )
+
+    if ($ObjectStorage -and $null -eq $total) {
+        $sizeLimitEnabled = $null
+        foreach ($path in @(
+            'ObjectStorageSettings.SizeLimitEnabled',
+            'CapacityTierSettings.SizeLimitEnabled',
+            'SizeLimitEnabled',
+            'UseSizeLimit'
+        )) {
+            $sizeLimitEnabled = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $Repository -Path $path)
+            if ($null -ne $sizeLimitEnabled) { break }
+        }
+
+        if ($sizeLimitEnabled) {
+            $sizeLimit = Get-DRFirstSizeBytes -Values @(
+                (Get-DRPropertyPathValue -Object $Repository -Path 'ObjectStorageSettings.SizeLimit'),
+                (Get-DRPropertyPathValue -Object $Repository -Path 'CapacityTierSettings.SizeLimit'),
+                (Get-DRPropertyPathValue -Object $Repository -Path 'SizeLimit'),
+                (Get-DRPropertyPathValue -Object $Repository -Path 'StorageLimit')
+            )
+            if ($null -ne $sizeLimit) { $total = $sizeLimit }
+        }
+    }
+
+    if ($null -eq $used -and $null -ne $total -and $null -ne $free) {
+        $used = [Math]::Max(0, ($total - $free))
+    }
+    if ($null -eq $free -and $null -ne $total -and $null -ne $used) {
+        $free = [Math]::Max(0, ($total - $used))
+    }
+
+    return @{
+        TotalBytes = $total
+        UsedBytes  = $used
+        FreeBytes  = $free
+    }
+}
+
+function New-DRRepositoryRow {
+    [CmdletBinding()]
+    param(
+        [string]$Repository,
+        [string]$Tier,
+        [string]$Parent,
+        [string]$Status,
+        [object]$TotalBytes,
+        [object]$UsedBytes,
+        [object]$FreeBytes,
+        [int]$SortGroup,
+        [int]$SortOrder
+    )
+
+    return [pscustomobject][ordered]@{
+        Repository = $Repository
+        Tier       = $Tier
+        Parent     = $Parent
+        Status     = $Status
+        Total      = Format-DRByteSize    -Bytes $TotalBytes
+        Used       = Format-DRByteSize    -Bytes $UsedBytes
+        Free       = Format-DRByteSize    -Bytes $FreeBytes
+        'Used %'   = Format-DRUsedPercent -TotalBytes $TotalBytes -UsedBytes $UsedBytes
+        SortGroup  = $SortGroup
+        SortOrder  = $SortOrder
+    }
+}
+
+function Get-DefinedRepositoryReport {
+    [CmdletBinding()]
+    param()
+
+    $rows = New-Object 'System.Collections.Generic.List[object]'
+    $attachedRepoKeys = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+
+    $sobrList = @()
+    if (Get-Command -Name 'Get-VBRBackupRepository' -ErrorAction SilentlyContinue) {
+        try {
+            $sobrList = @(Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRBackupRepository -ScaleOut failed: {0}' -f $_.Exception.Message)
+            $sobrList = @()
+        }
+    }
+
+    $sobrSort = 0
+    foreach ($sobr in $sobrList) {
+        $sobrSort++
+        $sobrName = Get-DRRepositoryName -Repository $sobr
+        $sobrStatus = Get-DRRepositoryStatus -Repository $sobr
+
+        $perfTotal = $null
+        $perfUsed  = $null
+
+        $perfExtents = @()
+        if (Get-Command -Name 'Get-VBRRepositoryExtent' -ErrorAction SilentlyContinue) {
+            try {
+                $perfExtents = @(Get-VBRRepositoryExtent -Repository $sobr -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            } catch {
+                Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRRepositoryExtent failed for SOBR "{0}": {1}' -f $sobrName, $_.Exception.Message)
+                $perfExtents = @()
+            }
+        }
+
+        $perfOrder = 0
+        foreach ($extent in $perfExtents) {
+            $perfOrder++
+            $extentRepo = Get-DRPropertyPathValue -Object $extent -Path 'Repository'
+            if ($null -eq $extentRepo) { $extentRepo = $extent }
+            $extentName = Get-DRRepositoryName -Repository $extentRepo
+            $extentStatus = Get-DRRepositoryStatus -Repository $extentRepo
+            $extentKey = Get-DRRepositoryKey -Repository $extentRepo
+            if (-not [string]::IsNullOrWhiteSpace($extentKey)) { [void]$attachedRepoKeys.Add($extentKey) }
+
+            $space = Get-DRRepositorySpaceInfo -Repository $extentRepo
+            [void]$rows.Add((New-DRRepositoryRow -Repository $extentName -Tier 'Performance' -Parent $sobrName -Status $extentStatus `
+                -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 2 -SortOrder ($sobrSort * 1000 + $perfOrder)))
+
+            if ($null -ne $space.TotalBytes) { $perfTotal = if ($null -eq $perfTotal) { 0 } else { $perfTotal }; $perfTotal += $space.TotalBytes }
+            if ($null -ne $space.UsedBytes)  { $perfUsed  = if ($null -eq $perfUsed)  { 0 } else { $perfUsed  }; $perfUsed  += $space.UsedBytes  }
+        }
+
+        $capExtents = @()
+        if (Get-Command -Name 'Get-VBRCapacityExtent' -ErrorAction SilentlyContinue) {
+            try {
+                $capExtents = @(Get-VBRCapacityExtent -Repository $sobr -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            } catch {
+                Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRCapacityExtent failed for SOBR "{0}": {1}' -f $sobrName, $_.Exception.Message)
+                $capExtents = @()
+            }
+        }
+
+        $capOrder = 0
+        foreach ($cap in $capExtents) {
+            $capOrder++
+            $capRepo = Get-DRPropertyPathValue -Object $cap -Path 'Repository'
+            if ($null -eq $capRepo) { $capRepo = $cap }
+            $capName = Get-DRRepositoryName -Repository $capRepo
+            $capStatus = Get-DRRepositoryStatus -Repository $capRepo
+            $capKey = Get-DRRepositoryKey -Repository $capRepo
+            if (-not [string]::IsNullOrWhiteSpace($capKey)) { [void]$attachedRepoKeys.Add($capKey) }
+
+            $capSpace = Get-DRRepositorySpaceInfo -Repository $capRepo -ObjectStorage
+            [void]$rows.Add((New-DRRepositoryRow -Repository $capName -Tier 'Capacity' -Parent $sobrName -Status $capStatus `
+                -TotalBytes $capSpace.TotalBytes -UsedBytes $capSpace.UsedBytes -FreeBytes $capSpace.FreeBytes -SortGroup 3 -SortOrder ($sobrSort * 1000 + $capOrder)))
+        }
+
+        if ($null -eq $perfTotal -or $null -eq $perfUsed) {
+            $sobrSpace = Get-DRRepositorySpaceInfo -Repository $sobr
+            if ($null -eq $perfTotal) { $perfTotal = $sobrSpace.TotalBytes }
+            if ($null -eq $perfUsed)  { $perfUsed  = $sobrSpace.UsedBytes  }
+            $perfFree = $sobrSpace.FreeBytes
+        } else {
+            $perfFree = [Math]::Max(0, ($perfTotal - $perfUsed))
+        }
+
+        [void]$rows.Add((New-DRRepositoryRow -Repository $sobrName -Tier 'Scale-Out' -Parent '' -Status $sobrStatus `
+            -TotalBytes $perfTotal -UsedBytes $perfUsed -FreeBytes $perfFree -SortGroup 1 -SortOrder $sobrSort))
+    }
+
+    if (Get-Command -Name 'Get-VBRBackupRepository' -ErrorAction SilentlyContinue) {
+        try {
+            $standardRepos = @(Get-VBRBackupRepository -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRBackupRepository failed: {0}' -f $_.Exception.Message)
+            $standardRepos = @()
+        }
+
+        $standardOrder = 0
+        foreach ($repo in $standardRepos) {
+            $isScaleOut = ConvertTo-DRNullableBoolean -Value (Get-DRPropertyPathValue -Object $repo -Path 'IsScaleOut')
+            if ($isScaleOut) { continue }
+
+            $key = Get-DRRepositoryKey -Repository $repo
+            if (-not [string]::IsNullOrWhiteSpace($key) -and $attachedRepoKeys.Contains($key)) { continue }
+
+            $standardOrder++
+            $name = Get-DRRepositoryName -Repository $repo
+            $status = Get-DRRepositoryStatus -Repository $repo
+            $space = Get-DRRepositorySpaceInfo -Repository $repo
+            [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Standard' -Parent '' -Status $status `
+                -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 4 -SortOrder $standardOrder))
+        }
+    }
+
+    if (Get-Command -Name 'Get-VBRObjectStorageRepository' -ErrorAction SilentlyContinue) {
+        try {
+            $objectRepos = @(Get-VBRObjectStorageRepository -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+        } catch {
+            Write-DebugMessage ('[Get-DefinedRepositoryReport] Get-VBRObjectStorageRepository failed: {0}' -f $_.Exception.Message)
+            $objectRepos = @()
+        }
+
+        $objectOrder = 0
+        foreach ($objRepo in $objectRepos) {
+            $key = Get-DRRepositoryKey -Repository $objRepo
+            if (-not [string]::IsNullOrWhiteSpace($key) -and $attachedRepoKeys.Contains($key)) { continue }
+
+            $objectOrder++
+            $name = Get-DRRepositoryName -Repository $objRepo
+            $status = Get-DRRepositoryStatus -Repository $objRepo
+            $space = Get-DRRepositorySpaceInfo -Repository $objRepo -ObjectStorage
+            [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Object' -Parent '' -Status $status `
+                -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 5 -SortOrder $objectOrder))
+        }
+    }
+
+    return @($rows | Sort-Object -Property SortGroup, SortOrder, Repository)
+}
+
+function New-DefinedRepositorySectionText {
+    [CmdletBinding()]
+    param()
+
+    if ($Json) { return '' }
+
+    try {
+        Write-ProgressMessage 'Defined Repository — collecting repository utilisation...'
+        Write-DebugMessage '[New-DefinedRepositorySectionText] Starting Defined Repository collection.'
+
+        $rows = Get-DefinedRepositoryReport
+        Write-ProgressMessage ('Defined Repository — {0} repository row(s) found.' -f $rows.Count)
+        Write-DebugMessage ('[New-DefinedRepositorySectionText] Collection complete: {0} row(s).' -f $rows.Count)
+
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        [void]$lines.Add('############### Defined Repository BEGIN ###################')
+
+        if ($rows.Count -eq 0) {
+            [void]$lines.Add('(no repositories found)')
+        } else {
+            $displayRows = @($rows | Select-Object -Property Repository, Tier, Parent, Status, Total, Used, Free, 'Used %')
+            $tableText = (($displayRows | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd())
+            if (-not [string]::IsNullOrWhiteSpace($tableText)) {
+                foreach ($line in ($tableText -split "(`r`n|`n|`r)")) {
+                    [void]$lines.Add($line)
+                }
+            } else {
+                [void]$lines.Add('(no repositories found)')
+            }
+        }
+
+        [void]$lines.Add('############### Defined Repository END ###################')
+        return ($lines -join [Environment]::NewLine)
+    } catch {
+        Write-Warning ('Defined Repository baseline failed to build: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[New-DefinedRepositorySectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Build-JobReport
 #   Given a session and metadata, builds one report [pscustomobject].
@@ -2241,6 +2744,7 @@ Write-EnvironmentDiagnostics
 # keep stdout a pure JSON array.
 # ---------------------------------------------------------------------------
 $definedJobsSection = ''
+$definedRepositorySection = ''
 if (-not $Json) {
     Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
     try {
@@ -2251,7 +2755,26 @@ if (-not $Json) {
         Write-DebugMessage ('[Main] Defined Jobs baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         $definedJobsSection = ''
     }
+
+    Write-DebugMessage '[Main] Building Defined Repository baseline section.'
+    try {
+        $definedRepositorySection = New-DefinedRepositorySectionText
+        Write-DebugMessage ('[Main] Defined Repository section ready, {0} char(s).' -f $definedRepositorySection.Length)
+    } catch {
+        Write-Warning ('Defined Repository baseline failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Defined Repository baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $definedRepositorySection = ''
+    }
 }
+
+$definedBaselineSections = New-Object 'System.Collections.Generic.List[string]'
+if (-not [string]::IsNullOrWhiteSpace($definedJobsSection)) {
+    [void]$definedBaselineSections.Add($definedJobsSection)
+}
+if (-not [string]::IsNullOrWhiteSpace($definedRepositorySection)) {
+    [void]$definedBaselineSections.Add($definedRepositorySection)
+}
+$definedBaselineText = $definedBaselineSections -join [Environment]::NewLine
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
 
@@ -2722,7 +3245,7 @@ Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3
 $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
-    -DefinedJobsSection $definedJobsSection
+    -DefinedJobsSection $definedBaselineText
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
