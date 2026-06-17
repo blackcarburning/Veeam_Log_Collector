@@ -2907,15 +2907,6 @@ if (-not $Json) {
         $definedJobsSection = ''
     }
 
-    Write-DebugMessage '[Main] Building Defined Repository baseline section.'
-    try {
-        $definedRepositorySection = New-DefinedRepositorySectionText
-        Write-DebugMessage ('[Main] Defined Repository section ready, {0} char(s).' -f $definedRepositorySection.Length)
-    } catch {
-        Write-Warning ('Defined Repository baseline failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Defined Repository baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $definedRepositorySection = New-DefinedRepositoryPlaceholderSection -Message '(repository utilisation unavailable)'
-    }
 }
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
@@ -3317,6 +3308,24 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
     Write-DebugMessage '[Main] Get-VBRSession cmdlet not found; skipping Phase 6.'
 }
 
+# ---------------------------------------------------------------------------
+# Phase 7 — Defined Repository baseline (text mode only)
+#   Collects repository utilisation and stores it in $definedRepositorySection
+#   so it can be included in the human-readable report body.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 7 — Defined Repository baseline (repository utilisation).'
+Write-DebugMessage '[Main] Phase 7 — Defined Repository baseline.'
+if (-not $Json) {
+    try {
+        $definedRepositorySection = New-DefinedRepositorySectionText
+        Write-DebugMessage ('[Main] Defined Repository section ready, {0} char(s).' -f $definedRepositorySection.Length)
+    } catch {
+        Write-Warning ('Defined Repository baseline failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Defined Repository baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $definedRepositorySection = New-DefinedRepositoryPlaceholderSection -Message '(repository utilisation unavailable)'
+    }
+}
 
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
