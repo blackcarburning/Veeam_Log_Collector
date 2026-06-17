@@ -2007,7 +2007,9 @@ function Get-DRNonNegativeDifference {
     $used  = ConvertTo-DRBytes -Value $UsedBytes
 
     if ($null -eq $total -or $null -eq $used) { return $null }
-    return [Math]::Max([double]0, ([double]$total - [double]$used))
+    [double]$result = [double]$total - [double]$used
+    if ($result -lt 0.0) { return [double]0.0 }
+    return $result
 }
 
 function Get-DRRepositoryName {
@@ -2162,10 +2164,10 @@ function Get-DRRepositorySpaceInfo {
     }
 
     if ($null -eq $used -and $null -ne $total -and $null -ne $free) {
-        $used = [Math]::Max([double]0, ([double]$total - [double]$free))
+        $used = Get-DRNonNegativeDifference -TotalBytes ([double]$total) -UsedBytes ([double]$free)
     }
     if ($null -eq $free -and $null -ne $total -and $null -ne $used) {
-        $free = [Math]::Max([double]0, ([double]$total - [double]$used))
+        $free = Get-DRNonNegativeDifference -TotalBytes ([double]$total) -UsedBytes ([double]$used)
     }
 
     return @{
