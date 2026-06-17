@@ -1765,7 +1765,7 @@ function New-DefinedJobsSectionText {
         Write-ProgressMessage 'Defined Jobs — collecting job inventory...'
         Write-DebugMessage '[New-DefinedJobsSectionText] Starting Defined Jobs collection.'
 
-        $rows = Get-DefinedJobsReport
+        $rows = @(Get-DefinedJobsReport)
 
         Write-ProgressMessage ('Defined Jobs — {0} job(s) found.' -f $rows.Count)
         Write-DebugMessage ('[New-DefinedJobsSectionText] Collection complete: {0} row(s).' -f $rows.Count)
@@ -2401,7 +2401,7 @@ function New-DefinedRepositorySectionText {
         Write-ProgressMessage 'Defined Repository — collecting repository utilisation...'
         Write-DebugMessage '[New-DefinedRepositorySectionText] Starting Defined Repository collection.'
 
-        $rows = Get-DefinedRepositoryReport
+        $rows = @(Get-DefinedRepositoryReport)
         Write-ProgressMessage ('Defined Repository — {0} repository row(s) found.' -f $rows.Count)
         Write-DebugMessage ('[New-DefinedRepositorySectionText] Collection complete: {0} row(s).' -f $rows.Count)
 
