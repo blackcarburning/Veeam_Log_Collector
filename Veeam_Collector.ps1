@@ -32,9 +32,16 @@
     This section lists all defined backup jobs (agent, application, unstructured,
     and standard backup types) with their schedule, enabled status, next scheduled
     run or schedule description, last run time, and last result.
-    It gives operators and LLMs a quick reference for what jobs should be running
-    and when.  The Defined Jobs block is omitted from JSON (-Json) mode so that
-    stdout remains a pure JSON array.
+    It is followed immediately by a **Defined Repository** utilisation section
+    delimited by:
+
+        ############### Defined Repository BEGIN ###################
+        ...
+        ############### Defined Repository END ###################
+
+    That repository block lists repository, tier, parent, status, total, used,
+    free, and used-percent values.  Both text blocks are omitted from JSON (-Json)
+    mode so that stdout remains a pure JSON array.
 
     Progress messages are printed throughout.  In default (human-readable) mode
     they go to the console (Write-Host).  In -Json mode they go to the Warning
@@ -1939,11 +1946,25 @@ function Get-DRFirstSizeBytes {
     return $null
 }
 
+function ConvertTo-DRBytes {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    return (ConvertTo-DRSizeBytes -Value $Value)
+}
+
+function Get-DRFirstSizeValue {
+    [CmdletBinding()]
+    param([object[]]$Values)
+
+    return (Get-DRFirstSizeBytes -Values $Values)
+}
+
 function Format-DRByteSize {
     [CmdletBinding()]
     param([object]$Bytes)
 
-    $value = ConvertTo-DRSizeBytes -Value $Bytes
+    $value = ConvertTo-DRBytes -Value $Bytes
     if ($null -eq $value) { return '' }
     if ($value -lt 0) { $value = 0 }
 
@@ -1967,12 +1988,26 @@ function Format-DRUsedPercent {
         [object]$UsedBytes
     )
 
-    $total = ConvertTo-DRSizeBytes -Value $TotalBytes
-    $used  = ConvertTo-DRSizeBytes -Value $UsedBytes
+    $total = ConvertTo-DRBytes -Value $TotalBytes
+    $used  = ConvertTo-DRBytes -Value $UsedBytes
 
     if ($null -eq $total -or $null -eq $used -or $total -le 0) { return '' }
     $pct = ($used / $total) * 100
     return ('{0:N2}%' -f $pct)
+}
+
+function Get-DRNonNegativeDifference {
+    [CmdletBinding()]
+    param(
+        [object]$TotalBytes,
+        [object]$UsedBytes
+    )
+
+    $total = ConvertTo-DRBytes -Value $TotalBytes
+    $used  = ConvertTo-DRBytes -Value $UsedBytes
+
+    if ($null -eq $total -or $null -eq $used) { return $null }
+    return [Math]::Max([double]0, ([double]$total - [double]$used))
 }
 
 function Get-DRRepositoryName {
@@ -1996,7 +2031,32 @@ function Get-DRRepositoryKey {
         $v = Get-DRPropertyPathValue -Object $Repository -Path $path
         if (-not [string]::IsNullOrWhiteSpace([string]$v)) { return [string]$v }
     }
+    $location = Get-DRRepositoryLocation -Repository $Repository
+    if (-not [string]::IsNullOrWhiteSpace($location)) { return $location }
     return [string]$Repository.GetHashCode()
+}
+
+function Get-DRRepositoryLocation {
+    [CmdletBinding()]
+    param([object]$Repository)
+
+    if ($null -eq $Repository) { return '' }
+
+    foreach ($path in @(
+        'Path',
+        'Repository.Path',
+        'Info.Path',
+        'Container.Path',
+        'BucketName',
+        'Folder',
+        'SharePath',
+        'Host.Name'
+    )) {
+        $value = Get-DRPropertyPathValue -Object $Repository -Path $path
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) { return [string]$value }
+    }
+
+    return ''
 }
 
 function Get-DRRepositoryStatus {
@@ -2049,7 +2109,7 @@ function Get-DRRepositorySpaceInfo {
         }
     }
 
-    $total = Get-DRFirstSizeBytes -Values @(
+    $total = Get-DRFirstSizeValue -Values @(
         (Get-DRPropertyPathValue -Object $Repository -Path 'CachedTotalSpace'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'TotalSpace'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'Container.TotalSpace'),
@@ -2059,7 +2119,7 @@ function Get-DRRepositorySpaceInfo {
         (Get-DRPropertyPathValue -Object $Repository -Path 'Quota'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'Info.TotalSpace')
     )
-    $used = Get-DRFirstSizeBytes -Values @(
+    $used = Get-DRFirstSizeValue -Values @(
         (Get-DRPropertyPathValue -Object $Repository -Path 'CachedUsedSpace'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'UsedSpace'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'Container.UsedSpace'),
@@ -2068,7 +2128,7 @@ function Get-DRRepositorySpaceInfo {
         (Get-DRPropertyPathValue -Object $Repository -Path 'UsedSize'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'Info.UsedSpace')
     )
-    $free = Get-DRFirstSizeBytes -Values @(
+    $free = Get-DRFirstSizeValue -Values @(
         (Get-DRPropertyPathValue -Object $Repository -Path 'CachedFreeSpace'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'FreeSpace'),
         (Get-DRPropertyPathValue -Object $Repository -Path 'Container.FreeSpace'),
@@ -2091,7 +2151,7 @@ function Get-DRRepositorySpaceInfo {
         }
 
         if ($sizeLimitEnabled) {
-            $sizeLimit = Get-DRFirstSizeBytes -Values @(
+            $sizeLimit = Get-DRFirstSizeValue -Values @(
                 (Get-DRPropertyPathValue -Object $Repository -Path 'ObjectStorageSettings.SizeLimit'),
                 (Get-DRPropertyPathValue -Object $Repository -Path 'CapacityTierSettings.SizeLimit'),
                 (Get-DRPropertyPathValue -Object $Repository -Path 'SizeLimit'),
@@ -2102,10 +2162,10 @@ function Get-DRRepositorySpaceInfo {
     }
 
     if ($null -eq $used -and $null -ne $total -and $null -ne $free) {
-        $used = [Math]::Max(0, ($total - $free))
+        $used = [Math]::Max([double]0, ([double]$total - [double]$free))
     }
     if ($null -eq $free -and $null -ne $total -and $null -ne $used) {
-        $free = [Math]::Max(0, ($total - $used))
+        $free = [Math]::Max([double]0, ([double]$total - [double]$used))
     }
 
     return @{
@@ -2113,6 +2173,20 @@ function Get-DRRepositorySpaceInfo {
         UsedBytes  = $used
         FreeBytes  = $free
     }
+}
+
+function Get-DRPhysicalRepositorySpace {
+    [CmdletBinding()]
+    param([object]$Repository)
+
+    return (Get-DRRepositorySpaceInfo -Repository $Repository)
+}
+
+function Get-DRObjectRepositorySpace {
+    [CmdletBinding()]
+    param([object]$Repository)
+
+    return (Get-DRRepositorySpaceInfo -Repository $Repository -ObjectStorage)
 }
 
 function New-DRRepositoryRow {
@@ -2141,6 +2215,31 @@ function New-DRRepositoryRow {
         SortGroup  = $SortGroup
         SortOrder  = $SortOrder
     }
+}
+
+function Format-DRFixedWidth {
+    [CmdletBinding()]
+    param(
+        [AllowNull()] [string]$Value,
+        [Parameter(Mandatory)] [int]$Width
+    )
+
+    $text = if ($null -ne $Value) { [string]$Value } else { '' }
+    if ($text.Length -gt $Width) { return $text.Substring(0, $Width) }
+    return $text.PadRight($Width)
+}
+
+function New-DefinedRepositoryPlaceholderSection {
+    [CmdletBinding()]
+    param(
+        [string]$Message = '(repository utilisation unavailable)'
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    [void]$lines.Add('############### Defined Repository BEGIN ###################')
+    [void]$lines.Add($Message)
+    [void]$lines.Add('############### Defined Repository END ###################')
+    return ($lines -join [Environment]::NewLine)
 }
 
 function Get-DefinedRepositoryReport {
@@ -2189,7 +2288,7 @@ function Get-DefinedRepositoryReport {
             $extentKey = Get-DRRepositoryKey -Repository $extentRepo
             if (-not [string]::IsNullOrWhiteSpace($extentKey)) { [void]$attachedRepoKeys.Add($extentKey) }
 
-            $space = Get-DRRepositorySpaceInfo -Repository $extentRepo
+            $space = Get-DRPhysicalRepositorySpace -Repository $extentRepo
             [void]$rows.Add((New-DRRepositoryRow -Repository $extentName -Tier 'Performance' -Parent $sobrName -Status $extentStatus `
                 -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 2 -SortOrder ($sobrSort * 1000 + $perfOrder)))
 
@@ -2217,18 +2316,18 @@ function Get-DefinedRepositoryReport {
             $capKey = Get-DRRepositoryKey -Repository $capRepo
             if (-not [string]::IsNullOrWhiteSpace($capKey)) { [void]$attachedRepoKeys.Add($capKey) }
 
-            $capSpace = Get-DRRepositorySpaceInfo -Repository $capRepo -ObjectStorage
+            $capSpace = Get-DRObjectRepositorySpace -Repository $capRepo
             [void]$rows.Add((New-DRRepositoryRow -Repository $capName -Tier 'Capacity' -Parent $sobrName -Status $capStatus `
                 -TotalBytes $capSpace.TotalBytes -UsedBytes $capSpace.UsedBytes -FreeBytes $capSpace.FreeBytes -SortGroup 3 -SortOrder ($sobrSort * 1000 + $capOrder)))
         }
 
         if ($null -eq $perfTotal -or $null -eq $perfUsed) {
-            $sobrSpace = Get-DRRepositorySpaceInfo -Repository $sobr
+            $sobrSpace = Get-DRPhysicalRepositorySpace -Repository $sobr
             if ($null -eq $perfTotal) { $perfTotal = $sobrSpace.TotalBytes }
             if ($null -eq $perfUsed)  { $perfUsed  = $sobrSpace.UsedBytes  }
             $perfFree = $sobrSpace.FreeBytes
         } else {
-            $perfFree = [Math]::Max(0, ($perfTotal - $perfUsed))
+            $perfFree = Get-DRNonNegativeDifference -TotalBytes $perfTotal -UsedBytes $perfUsed
         }
 
         [void]$rows.Add((New-DRRepositoryRow -Repository $sobrName -Tier 'Scale-Out' -Parent '' -Status $sobrStatus `
@@ -2254,7 +2353,7 @@ function Get-DefinedRepositoryReport {
             $standardOrder++
             $name = Get-DRRepositoryName -Repository $repo
             $status = Get-DRRepositoryStatus -Repository $repo
-            $space = Get-DRRepositorySpaceInfo -Repository $repo
+            $space = Get-DRPhysicalRepositorySpace -Repository $repo
             [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Standard' -Parent '' -Status $status `
                 -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 4 -SortOrder $standardOrder))
         }
@@ -2276,7 +2375,7 @@ function Get-DefinedRepositoryReport {
             $objectOrder++
             $name = Get-DRRepositoryName -Repository $objRepo
             $status = Get-DRRepositoryStatus -Repository $objRepo
-            $space = Get-DRRepositorySpaceInfo -Repository $objRepo -ObjectStorage
+            $space = Get-DRObjectRepositorySpace -Repository $objRepo
             [void]$rows.Add((New-DRRepositoryRow -Repository $name -Tier 'Object' -Parent '' -Status $status `
                 -TotalBytes $space.TotalBytes -UsedBytes $space.UsedBytes -FreeBytes $space.FreeBytes -SortGroup 5 -SortOrder $objectOrder))
         }
@@ -2305,14 +2404,37 @@ function New-DefinedRepositorySectionText {
         if ($rows.Count -eq 0) {
             [void]$lines.Add('(no repositories found)')
         } else {
-            $displayRows = @($rows | Select-Object -Property Repository, Tier, Parent, Status, Total, Used, Free, 'Used %')
-            $tableText = (($displayRows | Format-Table -AutoSize | Out-String -Width 4096).TrimEnd())
-            if (-not [string]::IsNullOrWhiteSpace($tableText)) {
-                foreach ($line in ($tableText -split "(`r`n|`n|`r)")) {
-                    [void]$lines.Add($line)
-                }
-            } else {
-                [void]$lines.Add('(no repositories found)')
+            $wRepository = 30
+            $wTier       = 16
+            $wParent     = 20
+            $wStatus     = 12
+            $wTotal      = 11
+            $wUsed       = 11
+            $wFree       = 11
+            $wUsedPct    = 7
+            $separatorWidth = $wRepository + $wTier + $wParent + $wStatus + $wTotal + $wUsed + $wFree + $wUsedPct + 7
+
+            [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6} {7}' -f `
+                (Format-DRFixedWidth -Value 'Repository' -Width $wRepository),
+                (Format-DRFixedWidth -Value 'Tier'       -Width $wTier),
+                (Format-DRFixedWidth -Value 'Parent'     -Width $wParent),
+                (Format-DRFixedWidth -Value 'Status'     -Width $wStatus),
+                (Format-DRFixedWidth -Value 'Total'      -Width $wTotal),
+                (Format-DRFixedWidth -Value 'Used'       -Width $wUsed),
+                (Format-DRFixedWidth -Value 'Free'       -Width $wFree),
+                (Format-DRFixedWidth -Value 'Used %'     -Width $wUsedPct)))
+            [void]$lines.Add(('-' * $separatorWidth))
+
+            foreach ($row in $rows) {
+                [void]$lines.Add(('{0} {1} {2} {3} {4} {5} {6} {7}' -f `
+                    (Format-DRFixedWidth -Value ([string]$row.Repository) -Width $wRepository),
+                    (Format-DRFixedWidth -Value ([string]$row.Tier)       -Width $wTier),
+                    (Format-DRFixedWidth -Value ([string]$row.Parent)     -Width $wParent),
+                    (Format-DRFixedWidth -Value ([string]$row.Status)     -Width $wStatus),
+                    (Format-DRFixedWidth -Value ([string]$row.Total)      -Width $wTotal),
+                    (Format-DRFixedWidth -Value ([string]$row.Used)       -Width $wUsed),
+                    (Format-DRFixedWidth -Value ([string]$row.Free)       -Width $wFree),
+                    (Format-DRFixedWidth -Value ([string]$row.'Used %')   -Width $wUsedPct)))
             }
         }
 
@@ -2321,7 +2443,7 @@ function New-DefinedRepositorySectionText {
     } catch {
         Write-Warning ('Defined Repository baseline failed to build: {0}' -f $_.Exception.Message)
         Write-DebugMessage ('[New-DefinedRepositorySectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        return ''
+        return (New-DefinedRepositoryPlaceholderSection -Message '(repository utilisation unavailable)')
     }
 }
 
@@ -2503,7 +2625,9 @@ function New-CollectorReportBody {
         [Parameter(Mandatory)] [int]$SuccessCount,
         [Parameter(Mandatory)] [int]$WithError,
         # Optional Defined Jobs baseline block (text mode only; empty in JSON mode).
-        [string]$DefinedJobsSection = ''
+        [string]$DefinedJobsSection = '',
+        # Optional Defined Repository baseline block (text mode only; empty in JSON mode).
+        [string]$DefinedRepositorySection = ''
     )
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -2517,9 +2641,17 @@ function New-CollectorReportBody {
     [void]$lines.Add('============================================================')
     [void]$lines.Add('')
 
-    # Defined Jobs baseline (text mode only — never populated in JSON mode)
+    # Defined baseline sections (text mode only — never populated in JSON mode)
+    $hasBaselineSection = $false
     if (-not [string]::IsNullOrWhiteSpace($DefinedJobsSection)) {
         [void]$lines.Add($DefinedJobsSection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DefinedRepositorySection)) {
+        [void]$lines.Add($DefinedRepositorySection)
+        $hasBaselineSection = $true
+    }
+    if ($hasBaselineSection) {
         [void]$lines.Add('')
     }
 
@@ -2763,18 +2895,9 @@ if (-not $Json) {
     } catch {
         Write-Warning ('Defined Repository baseline failed: {0}' -f $_.Exception.Message)
         Write-DebugMessage ('[Main] Defined Repository baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $definedRepositorySection = ''
+        $definedRepositorySection = New-DefinedRepositoryPlaceholderSection -Message '(repository utilisation unavailable)'
     }
 }
-
-$definedBaselineSections = New-Object 'System.Collections.Generic.List[string]'
-if (-not [string]::IsNullOrWhiteSpace($definedJobsSection)) {
-    [void]$definedBaselineSections.Add($definedJobsSection)
-}
-if (-not [string]::IsNullOrWhiteSpace($definedRepositorySection)) {
-    [void]$definedBaselineSections.Add($definedRepositorySection)
-}
-$definedBaselineText = $definedBaselineSections -join [Environment]::NewLine
 
 $allReports = New-Object 'System.Collections.Generic.List[object]'
 
@@ -3245,7 +3368,7 @@ Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3
 $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
-    -DefinedJobsSection $definedBaselineText
+    -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
@@ -3253,7 +3376,7 @@ Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $r
 # ---------------------------------------------------------------------------
 Write-DebugMessage '[Main] Producing output.'
 if ($Json) {
-    $sorted | ConvertTo-Json -Depth 6
+    ConvertTo-Json -InputObject @($sorted) -Depth 6
     Write-Warning ('Summary: jobs={0} failed={1} warning={2} success={3} with_error={4}' `
         -f $totalJobs, $failedCount, $warnCount, $successCount, $withError)
 } else {
