@@ -2627,7 +2627,8 @@ function New-VBRLicensingSectionText {
                 $Used     = Get-DRPropertyPathValue -Object $Summary -Path 'UsedInstancesNumber'
 
                 $Remaining = if ($null -ne $Licensed -and $null -ne $Used) {
-                    [math]::Max([int64]0, [int64]$Licensed - [int64]$Used)
+                    try { [math]::Max([int64]0, [int64]$Licensed - [int64]$Used) }
+                    catch { $null }
                 }
                 else {
                     $null
