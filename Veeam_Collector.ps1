@@ -2502,6 +2502,213 @@ function New-DefinedRepositorySectionText {
     }
 }
 
+# ===========================================================================
+# VBR Licensing baseline — helper functions
+#   These functions are licensing-specific and DL-prefixed to avoid collisions
+#   with existing helpers from other collector phases.
+# ===========================================================================
+
+function Format-DLVBRLicenseDate {
+    [CmdletBinding()]
+    param([object]$Date)
+
+    if ($null -eq $Date) { return 'N/A' }
+    try { return ([datetime]$Date).ToString('yyyy-MM-dd') } catch { return [string]$Date }
+}
+
+function Get-DLDaysRemaining {
+    [CmdletBinding()]
+    param([object]$Date)
+
+    if ($null -eq $Date) { return 'N/A' }
+    try {
+        $d = [datetime]$Date
+        return [int]($d - (Get-Date)).TotalDays
+    } catch { return 'N/A' }
+}
+
+function ConvertTo-DLDisplayText {
+    [CmdletBinding()]
+    param([object]$Value)
+
+    if ($null -eq $Value) { return '' }
+    return [string]$Value
+}
+
+# ---------------------------------------------------------------------------
+# New-VBRLicensingSectionText
+#   Builds and returns the VBR Licensing baseline block as a single string.
+#   The block is delimited with the required markers and contains subsections
+#   for installed license, instance usage, socket usage and workloads.
+#   Returns an error line inside the delimiters on failure; never throws.
+#   Always returns empty string in JSON mode.
+# ---------------------------------------------------------------------------
+function New-VBRLicensingSectionText {
+    [CmdletBinding()]
+    param()
+
+    if ($Json) { return '' }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    [void]$lines.Add('############### VBR Licensing BEGIN ###################')
+
+    try {
+        Write-ProgressMessage 'Phase 8 — Collecting VBR licensing information...'
+        Write-DebugMessage '[New-VBRLicensingSectionText] Starting VBR licensing collection.'
+
+        if (-not (Get-Command -Name 'Get-VBRInstalledLicense' -ErrorAction SilentlyContinue)) {
+            [void]$lines.Add('(Get-VBRInstalledLicense cmdlet not available)')
+            [void]$lines.Add('############### VBR Licensing END ###################')
+            return ($lines -join [Environment]::NewLine)
+        }
+
+        $license = Get-VBRInstalledLicense -ErrorAction Stop
+
+        if ($null -eq $license) {
+            [void]$lines.Add('(no VBR license found)')
+            [void]$lines.Add('############### VBR Licensing END ###################')
+            return ($lines -join [Environment]::NewLine)
+        }
+
+        # ─── INSTALLED VBR LICENCE ───────────────────────────────────────
+        [void]$lines.Add('')
+        [void]$lines.Add('INSTALLED VBR LICENCE')
+        [void]$lines.Add('')
+
+        $licenseSummary = [PSCustomObject]@{
+            Status         = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'Status')
+            Edition        = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'Edition')
+            Type           = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'Type')
+            LicensedTo     = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'LicensedTo')
+            Expires        = Format-DLVBRLicenseDate (Get-DRPropertyPathValue -Object $license -Path 'ExpirationDate')
+            DaysRemaining  = Get-DLDaysRemaining     (Get-DRPropertyPathValue -Object $license -Path 'ExpirationDate')
+            SupportExpires = Format-DLVBRLicenseDate (Get-DRPropertyPathValue -Object $license -Path 'SupportExpirationDate')
+            AutoUpdate     = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'AutoUpdate')
+        }
+
+        $tableText = $licenseSummary | Format-Table -AutoSize | Out-String
+        foreach ($tl in ($tableText -split '\r?\n')) {
+            [void]$lines.Add($tl)
+        }
+
+        $licenseExtra = [PSCustomObject]@{
+            SupportID    = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'SupportId')
+            FreeAgentUse = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'FreeAgentUse')
+            CloudConnect = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $license -Path 'CloudConnect')
+        }
+
+        $extraText = $licenseExtra | Format-Table -AutoSize | Out-String
+        foreach ($el in ($extraText -split '\r?\n')) {
+            [void]$lines.Add($el)
+        }
+
+        # ─── INSTANCE LICENCE USAGE ─────────────────────────────────────
+        $instanceSummary = $null
+        if (Get-Command -Name 'Get-VBRInstanceLicenseSummary' -ErrorAction SilentlyContinue) {
+            try {
+                $instanceSummary = Get-VBRInstanceLicenseSummary -License $license -ErrorAction Stop
+            } catch {
+                Write-DebugMessage ('[New-VBRLicensingSectionText] Get-VBRInstanceLicenseSummary failed: {0}' -f $_.Exception.Message)
+            }
+        }
+        if ($null -eq $instanceSummary) {
+            $instanceSummary = Get-DRPropertyPathValue -Object $license -Path 'InstanceLicenseSummary'
+        }
+
+        if ($null -ne $instanceSummary) {
+            [void]$lines.Add('')
+            [void]$lines.Add('INSTANCE LICENCE USAGE')
+            [void]$lines.Add('')
+
+            $instanceRow = [PSCustomObject]@{
+                Licensed  = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'LicensedInstancesNumber')
+                Used      = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'UsedInstancesNumber')
+                Remaining = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'RemainingInstancesNumber')
+                New       = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'NewInstancesNumber')
+                Rental    = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'RentalInstancesNumber')
+                Workloads = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'ProtectedInstancesNumber')
+            }
+
+            $instanceText = $instanceRow | Format-Table -AutoSize | Out-String
+            foreach ($il in ($instanceText -split '\r?\n')) {
+                [void]$lines.Add($il)
+            }
+        }
+
+        # ─── SOCKET LICENCE USAGE ───────────────────────────────────────
+        $socketSummary = $null
+        if (Get-Command -Name 'Get-VBRSocketLicenseSummary' -ErrorAction SilentlyContinue) {
+            try {
+                $socketSummary = Get-VBRSocketLicenseSummary -License $license -ErrorAction Stop
+            } catch {
+                Write-DebugMessage ('[New-VBRLicensingSectionText] Get-VBRSocketLicenseSummary failed: {0}' -f $_.Exception.Message)
+            }
+        }
+        if ($null -eq $socketSummary) {
+            $socketSummary = Get-DRPropertyPathValue -Object $license -Path 'SocketLicenseSummary'
+        }
+
+        if ($null -ne $socketSummary) {
+            [void]$lines.Add('')
+            [void]$lines.Add('SOCKET LICENCE USAGE')
+            [void]$lines.Add('')
+
+            $socketItems = @($socketSummary)
+            $socketRows = foreach ($s in $socketItems) {
+                [PSCustomObject]@{
+                    Platform  = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $s -Path 'Platform')
+                    Licensed  = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $s -Path 'LicensedSocketsNumber')
+                    Used      = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $s -Path 'UsedSocketsNumber')
+                    Remaining = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $s -Path 'RemainingSocketsNumber')
+                }
+            }
+
+            $socketText = $socketRows | Format-Table -AutoSize | Out-String
+            foreach ($sl in ($socketText -split '\r?\n')) {
+                [void]$lines.Add($sl)
+            }
+        }
+
+        # ─── LICENSED INSTANCE WORKLOADS ────────────────────────────────
+        if (Get-Command -Name 'Get-VBRLicensedInstanceWorkload' -ErrorAction SilentlyContinue) {
+            try {
+                $workloads = @(Get-VBRLicensedInstanceWorkload -License $license -ErrorAction Stop)
+                if ($workloads.Count -gt 0) {
+                    [void]$lines.Add('')
+                    [void]$lines.Add('LICENSED INSTANCE WORKLOADS')
+                    [void]$lines.Add('')
+
+                    $workloadRows = foreach ($w in $workloads) {
+                        $wObj = New-Object PSObject
+                        foreach ($prop in @('Name','Workload','Type','Platform','HostName','ObjectName','LicenseType','InstancesNumber','InstanceCount','LastProcessingTime')) {
+                            $val = Get-DRPropertyPathValue -Object $w -Path $prop
+                            Add-Member -InputObject $wObj -MemberType NoteProperty -Name $prop -Value (ConvertTo-DLDisplayText $val) -Force
+                        }
+                        $wObj
+                    }
+
+                    $workloadText = $workloadRows | Format-Table -AutoSize | Out-String
+                    foreach ($wl in ($workloadText -split '\r?\n')) {
+                        [void]$lines.Add($wl)
+                    }
+                }
+            } catch {
+                Write-DebugMessage ('[New-VBRLicensingSectionText] Get-VBRLicensedInstanceWorkload failed: {0}' -f $_.Exception.Message)
+            }
+        }
+
+        Write-DebugMessage '[New-VBRLicensingSectionText] VBR licensing collection complete.'
+
+    } catch {
+        Write-Warning ('VBR Licensing collection failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[New-VBRLicensingSectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        [void]$lines.Add(('(VBR licensing information unavailable: {0})' -f $_.Exception.Message))
+    }
+
+    [void]$lines.Add('############### VBR Licensing END ###################')
+    return ($lines -join [Environment]::NewLine)
+}
+
 # ---------------------------------------------------------------------------
 # Build-JobReport
 #   Given a session and metadata, builds one report [pscustomobject].
@@ -2682,7 +2889,9 @@ function New-CollectorReportBody {
         # Optional Defined Jobs baseline block (text mode only; empty in JSON mode).
         [string]$DefinedJobsSection = '',
         # Optional Defined Repository baseline block (text mode only; empty in JSON mode).
-        [string]$DefinedRepositorySection = ''
+        [string]$DefinedRepositorySection = '',
+        # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
+        [string]$LicensingSection = ''
     )
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -2704,6 +2913,10 @@ function New-CollectorReportBody {
     }
     if (-not [string]::IsNullOrWhiteSpace($DefinedRepositorySection)) {
         [void]$lines.Add($DefinedRepositorySection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LicensingSection)) {
+        [void]$lines.Add($LicensingSection)
         $hasBaselineSection = $true
     }
     if ($hasBaselineSection) {
@@ -2932,6 +3145,7 @@ Write-EnvironmentDiagnostics
 # ---------------------------------------------------------------------------
 $definedJobsSection = ''
 $definedRepositorySection = ''
+$licensingSection = ''
 if (-not $Json) {
     Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
     try {
@@ -3363,6 +3577,25 @@ if (-not $Json) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Phase 8 — VBR Licensing (text mode only)
+#   Collects license information and stores it in $licensingSection so it can
+#   be included in the human-readable report body after the repository section.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 8 — VBR Licensing (license information).'
+Write-DebugMessage '[Main] Phase 8 — VBR Licensing.'
+if (-not $Json) {
+    try {
+        $licensingSection = New-VBRLicensingSectionText
+        Write-DebugMessage ('[Main] Licensing section ready, {0} char(s).' -f $licensingSection.Length)
+    } catch {
+        Write-Warning ('VBR Licensing phase failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] VBR Licensing phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $licensingSection = ''
+    }
+}
+
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
 
@@ -3432,7 +3665,8 @@ Write-DebugMessage ('[Main] Summary: total={0} failed={1} warning={2} success={3
 $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
-    -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection
+    -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection `
+    -LicensingSection $licensingSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
