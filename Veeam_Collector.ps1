@@ -2604,14 +2604,16 @@ function New-VBRLicensingSectionText {
 
         # ─── INSTANCE LICENCE USAGE ─────────────────────────────────────
         $instanceSummary = $null
-        if (Get-Command -Name 'Get-VBRInstanceLicenseSummary' -ErrorAction SilentlyContinue) {
-            try {
+        try {
+            if (Get-Command -Name 'Get-VBRInstanceLicenseSummary' -ErrorAction SilentlyContinue) {
                 $instanceSummary = Get-VBRInstanceLicenseSummary -License $license -ErrorAction Stop
-            } catch {
-                Write-DebugMessage ('[New-VBRLicensingSectionText] Get-VBRInstanceLicenseSummary failed: {0}' -f $_.Exception.Message)
+            }
+            else {
+                $instanceSummary = Get-DRPropertyPathValue -Object $license -Path 'InstanceLicenseSummary'
             }
         }
-        if ($null -eq $instanceSummary) {
+        catch {
+            Write-DebugMessage ('[New-VBRLicensingSectionText] Get-VBRInstanceLicenseSummary failed: {0}' -f $_.Exception.Message)
             $instanceSummary = Get-DRPropertyPathValue -Object $license -Path 'InstanceLicenseSummary'
         }
 
@@ -2620,16 +2622,32 @@ function New-VBRLicensingSectionText {
             [void]$lines.Add('INSTANCE LICENCE USAGE')
             [void]$lines.Add('')
 
-            $instanceRow = [PSCustomObject]@{
-                Licensed  = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'LicensedInstancesNumber')
-                Used      = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'UsedInstancesNumber')
-                Remaining = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'RemainingInstancesNumber')
-                New       = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'NewInstancesNumber')
-                Rental    = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'RentalInstancesNumber')
-                Workloads = ConvertTo-DLDisplayText (Get-DRPropertyPathValue -Object $instanceSummary -Path 'ProtectedInstancesNumber')
+            $instanceReport = foreach ($Summary in @($instanceSummary)) {
+                $Licensed = Get-DRPropertyPathValue -Object $Summary -Path 'LicensedInstancesNumber'
+                $Used     = Get-DRPropertyPathValue -Object $Summary -Path 'UsedInstancesNumber'
+
+                $Remaining = if ($null -ne $Licensed -and $null -ne $Used) {
+                    [math]::Max([int64]0, [int64]$Licensed - [int64]$Used)
+                }
+                else {
+                    $null
+                }
+
+                $WorkloadProp = Get-DRPropertyPathValue -Object $Summary -Path 'Workload'
+
+                [PSCustomObject]@{
+                    Licensed  = $Licensed
+                    Used      = $Used
+                    Remaining = $Remaining
+                    New       = Get-DRPropertyPathValue -Object $Summary -Path 'NewInstancesNumber'
+                    Rental    = Get-DRPropertyPathValue -Object $Summary -Path 'RentalInstancesNumber'
+                    Workloads = if ($WorkloadProp) { @($WorkloadProp).Count } else { 0 }
+                }
             }
 
-            $instanceText = $instanceRow | Format-Table -AutoSize | Out-String
+            $instanceText = $instanceReport |
+                Format-Table Licensed, Used, Remaining, New, Rental, Workloads -AutoSize |
+                Out-String
             foreach ($il in ($instanceText -split '\r?\n')) {
                 [void]$lines.Add($il)
             }
