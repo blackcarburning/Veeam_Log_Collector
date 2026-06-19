@@ -2728,6 +2728,374 @@ function New-VBRLicensingSectionText {
     return ($lines -join [Environment]::NewLine)
 }
 
+# ===========================================================================
+# Backup Versions baseline — helper functions
+#   BV-prefixed to avoid collisions with other collector phase helpers.
+# ===========================================================================
+
+function ConvertTo-BVIdKey {
+    [CmdletBinding()]
+    param([object]$Id)
+    if ($null -eq $Id) { return '' }
+    return [string]$Id
+}
+
+function Get-BVObjectProperty {
+    [CmdletBinding()]
+    param([object]$Obj, [string]$Name)
+    if ($null -eq $Obj) { return $null }
+    try {
+        $prop = $Obj.PSObject.Properties[$Name]
+        if ($null -ne $prop) { return $prop.Value }
+    } catch {}
+    try { return $Obj.$Name } catch { return $null }
+}
+
+function Get-BVRepositoryId {
+    [CmdletBinding()]
+    param([object]$Obj)
+    $id = Get-BVObjectProperty -Obj $Obj -Name 'RepositoryId'
+    if ($null -ne $id) { return ConvertTo-BVIdKey $id }
+    $id = Get-BVObjectProperty -Obj $Obj -Name 'TargetRepositoryId'
+    if ($null -ne $id) { return ConvertTo-BVIdKey $id }
+    return ''
+}
+
+function Get-BVGroupKey {
+    [CmdletBinding()]
+    param([string]$Machine, [string]$RepoName, [string]$Tier)
+    return ('{0}|||{1}|||{2}' -f $Machine, $RepoName, $Tier)
+}
+
+function Get-BVOrCreateCountGroup {
+    [CmdletBinding()]
+    param(
+        [hashtable]$Map,
+        [string]$Key,
+        [string]$Machine,
+        [string]$Repository,
+        [string]$Tier,
+        [string]$ParentSOBR,
+        [int]$SortOrder
+    )
+    if (-not $Map.ContainsKey($Key)) {
+        $Map[$Key] = [PSCustomObject]@{
+            Machine    = $Machine
+            Repository = $Repository
+            Tier       = $Tier
+            ParentSOBR = $ParentSOBR
+            SortOrder  = $SortOrder
+            Versions   = 0
+        }
+    }
+    return $Map[$Key]
+}
+
+function Get-BVOrCreateRestorePointSet {
+    [CmdletBinding()]
+    param([hashtable]$Map, [string]$Key)
+    if (-not $Map.ContainsKey($Key)) {
+        $Map[$Key] = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+    }
+    return $Map[$Key]
+}
+
+# ---------------------------------------------------------------------------
+# New-BackupVersionsSectionText
+#   Builds and returns the Backup Versions baseline block as a single string.
+#   Reports the number of backup versions per machine in each repository.
+#   Returns an error line inside the delimiters on failure; never throws.
+#   Always returns empty string in JSON mode.
+# ---------------------------------------------------------------------------
+function New-BackupVersionsSectionText {
+    [CmdletBinding()]
+    param()
+
+    if ($Json) { return '' }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    [void]$lines.Add('############### Backup Versions BEGIN ###################')
+
+    try {
+        Write-ProgressMessage 'Phase 9 — Collecting backup version counts...'
+        Write-DebugMessage '[New-BackupVersionsSectionText] Starting backup version collection.'
+
+        # ─── BUILD REPOSITORY NAME MAP ──────────────────────────────────────
+        $RepositoryNameById = @{}
+
+        $stdRepos = @(Get-VBRBackupRepository -ErrorAction SilentlyContinue)
+        foreach ($r in $stdRepos) {
+            $id = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $r -Name 'Id')
+            $nm = Get-BVObjectProperty -Obj $r -Name 'Name'
+            if ($id -and $nm) { $RepositoryNameById[$id] = [string]$nm }
+        }
+
+        if (Get-Command -Name 'Get-VBRObjectStorageRepository' -ErrorAction SilentlyContinue) {
+            $objRepos = @(Get-VBRObjectStorageRepository -ErrorAction SilentlyContinue)
+            foreach ($r in $objRepos) {
+                $id = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $r -Name 'Id')
+                $nm = Get-BVObjectProperty -Obj $r -Name 'Name'
+                if ($id -and $nm) { $RepositoryNameById[$id] = [string]$nm }
+            }
+        }
+
+        $sobrRepos = @(Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue)
+
+        # ─── BUILD SOBR MAPS ────────────────────────────────────────────────
+        $SobrByRepositoryId = @{}   # extent repo ID -> sobr info
+        $SobrByName         = @{}   # sobr name      -> sobr object
+
+        foreach ($sobr in $sobrRepos) {
+            $sobrName = Get-BVObjectProperty -Obj $sobr -Name 'Name'
+            if (-not $sobrName) { continue }
+            $SobrByName[$sobrName] = $sobr
+
+            # Map logical/summary repository ID
+            $sobrId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $sobr -Name 'Id')
+            if ($sobrId) {
+                $RepositoryNameById[$sobrId] = [string]$sobrName
+                $SobrByRepositoryId[$sobrId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'SOBR combined'; SortOrder = 2 }
+            }
+
+            # Map performance extent IDs
+            $perfExtents = @(Get-BVObjectProperty -Obj $sobr -Name 'PerformanceExtentCollection')
+            if ($null -eq $perfExtents -or $perfExtents.Count -eq 0) {
+                $perfExtents = @(Get-BVObjectProperty -Obj $sobr -Name 'Extent')
+            }
+            foreach ($ext in $perfExtents) {
+                if ($null -eq $ext) { continue }
+                $extRepo = Get-BVObjectProperty -Obj $ext -Name 'Repository'
+                if ($null -ne $extRepo) {
+                    $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $extRepo -Name 'Id')
+                    if ($extId) {
+                        $SobrByRepositoryId[$extId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'Performance'; SortOrder = 0 }
+                        $nm = Get-BVObjectProperty -Obj $extRepo -Name 'Name'
+                        if ($nm) { $RepositoryNameById[$extId] = [string]$nm }
+                    }
+                } else {
+                    $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $ext -Name 'RepositoryId')
+                    if (-not $extId) { $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $ext -Name 'Id') }
+                    if ($extId) {
+                        $SobrByRepositoryId[$extId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'Performance'; SortOrder = 0 }
+                    }
+                }
+            }
+
+            # Map capacity extent IDs
+            $capExtents = @(Get-BVObjectProperty -Obj $sobr -Name 'CapacityExtentCollection')
+            foreach ($ext in $capExtents) {
+                if ($null -eq $ext) { continue }
+                $extRepo = Get-BVObjectProperty -Obj $ext -Name 'Repository'
+                if ($null -ne $extRepo) {
+                    $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $extRepo -Name 'Id')
+                    if ($extId) {
+                        $SobrByRepositoryId[$extId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'Capacity'; SortOrder = 1 }
+                        $nm = Get-BVObjectProperty -Obj $extRepo -Name 'Name'
+                        if ($nm) { $RepositoryNameById[$extId] = [string]$nm }
+                    }
+                }
+            }
+        }
+
+        # ─── COUNT GROUPS MAP ────────────────────────────────────────────────
+        $CountGroups = @{}
+
+        # ─── MACHINE LOOKUP MAPS (for capacity tier) ─────────────────────────
+        $MachineByObjectAndSobr = @{}  # "objectId|||sobrName" -> machineName
+        $MachineByObjectId      = @{}  # objectId -> machineName
+
+        # ─── PERFORMANCE/STANDALONE RESTORE POINTS ───────────────────────────
+        $allBackups = @(Get-VBRBackup -ErrorAction SilentlyContinue)
+
+        foreach ($Backup in $allBackups) {
+            $backupObjList = @()
+            try {
+                $backupObjList = @(Get-VBRBackupObject -Backup $Backup -ErrorAction Stop)
+            } catch {
+                Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRBackupObject failed for backup: {0}' -f $_.Exception.Message)
+                continue
+            }
+
+            foreach ($obj in $backupObjList) {
+                $machineName = Get-BVObjectProperty -Obj $obj -Name 'Name'
+                if (-not $machineName) { $machineName = '(unknown)' }
+
+                $rpCount = Get-BVObjectProperty -Obj $obj -Name 'RestorePointsCount'
+                if ($null -eq $rpCount) { $rpCount = 0 }
+                try { $rpCount = [int]$rpCount } catch { $rpCount = 0 }
+
+                # Determine repository ID (object first, then backup)
+                $repoId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $obj -Name 'RepositoryId')
+                if (-not $repoId) {
+                    $repoId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $Backup -Name 'RepositoryId')
+                }
+                if (-not $repoId) {
+                    $repoId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $Backup -Name 'TargetRepositoryId')
+                }
+
+                $repoName = if ($repoId -and $RepositoryNameById.ContainsKey($repoId)) { $RepositoryNameById[$repoId] } else { $repoId }
+                if (-not $repoName) { $repoName = '(unknown)' }
+
+                # Check if this repository belongs to a SOBR
+                $sobrInfo = $null
+                if ($repoId -and $SobrByRepositoryId.ContainsKey($repoId)) {
+                    $sobrInfo = $SobrByRepositoryId[$repoId]
+                }
+
+                # Store machine lookup for capacity tier resolution
+                $objId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $obj -Name 'Id')
+                if ($objId) {
+                    $MachineByObjectId[$objId] = $machineName
+                    if ($sobrInfo -and $sobrInfo.SobrName) {
+                        $lookupKey = ('{0}|||{1}' -f $objId, $sobrInfo.SobrName)
+                        $MachineByObjectAndSobr[$lookupKey] = $machineName
+                    }
+                }
+
+                $tierLabel  = if ($sobrInfo) { $sobrInfo.Tier } else { 'Performance' }
+                $parentSobr = if ($sobrInfo) { $sobrInfo.SobrName } else { '-' }
+                $sortOrder  = if ($sobrInfo) { $sobrInfo.SortOrder } else { 0 }
+
+                $groupKey = Get-BVGroupKey -Machine $machineName -RepoName $repoName -Tier $tierLabel
+                $group = Get-BVOrCreateCountGroup -Map $CountGroups -Key $groupKey `
+                    -Machine $machineName -Repository $repoName -Tier $tierLabel `
+                    -ParentSOBR $parentSobr -SortOrder $sortOrder
+                $group.Versions += $rpCount
+            }
+        }
+
+        # ─── CAPACITY RESTORE POINTS ─────────────────────────────────────────
+        $hasCapacityCmdlets = (Get-Command -Name 'Get-VBRSOBRObjectStorageBackup'        -ErrorAction SilentlyContinue) -and
+                              (Get-Command -Name 'Get-VBRSOBRObjectStorageRestorePoint'   -ErrorAction SilentlyContinue)
+
+        if ($hasCapacityCmdlets) {
+            foreach ($sobr in $sobrRepos) {
+                $sobrName = Get-BVObjectProperty -Obj $sobr -Name 'Name'
+                if (-not $sobrName) { continue }
+
+                try {
+                    $capBackups = @(Get-VBRSOBRObjectStorageBackup -CapacityTier -ErrorAction Stop)
+                } catch {
+                    Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRSOBRObjectStorageBackup failed: {0}' -f $_.Exception.Message)
+                    continue
+                }
+
+                foreach ($CapacityBackup in $capBackups) {
+                    $capBackupSobrName = Get-BVObjectProperty -Obj $CapacityBackup -Name 'ScaleOutRepositoryName'
+                    if (-not $capBackupSobrName) {
+                        $capBackupSobrObj  = Get-BVObjectProperty -Obj $CapacityBackup -Name 'ScaleOutRepository'
+                        $capBackupSobrName = Get-BVObjectProperty -Obj $capBackupSobrObj -Name 'Name'
+                    }
+                    if ($capBackupSobrName -ne $sobrName) { continue }
+
+                    try {
+                        $capRestorePoints = @(Get-VBRSOBRObjectStorageRestorePoint -Backup $CapacityBackup -ErrorAction Stop |
+                            Where-Object { $_.IsCapacity -ne $false })
+                    } catch {
+                        Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRSOBRObjectStorageRestorePoint failed: {0}' -f $_.Exception.Message)
+                        continue
+                    }
+
+                    $repoName = Get-BVObjectProperty -Obj $CapacityBackup -Name 'RepositoryName'
+                    if (-not $repoName) {
+                        $repoObj  = Get-BVObjectProperty -Obj $CapacityBackup -Name 'Repository'
+                        $repoName = Get-BVObjectProperty -Obj $repoObj -Name 'Name'
+                    }
+                    if (-not $repoName) { $repoName = '(unknown)' }
+
+                    $seenIds = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+
+                    foreach ($rp in $capRestorePoints) {
+                        $rpId = Get-BVObjectProperty -Obj $rp -Name 'BackupId'
+                        if (-not $rpId) { $rpId = Get-BVObjectProperty -Obj $rp -Name 'Id' }
+                        if (-not $rpId) { $rpId = [System.Guid]::NewGuid().ToString() }
+                        $rpIdStr = [string]$rpId
+
+                        if ($seenIds.Contains($rpIdStr)) { continue }
+                        [void]$seenIds.Add($rpIdStr)
+
+                        # Resolve machine name
+                        $objId       = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $rp -Name 'ObjectId')
+                        $machineName = $null
+                        if ($objId) {
+                            $lookupKey = ('{0}|||{1}' -f $objId, $sobrName)
+                            if ($MachineByObjectAndSobr.ContainsKey($lookupKey)) {
+                                $machineName = $MachineByObjectAndSobr[$lookupKey]
+                            } elseif ($MachineByObjectId.ContainsKey($objId)) {
+                                $machineName = $MachineByObjectId[$objId]
+                            }
+                        }
+                        if (-not $machineName) { $machineName = Get-BVObjectProperty -Obj $rp -Name 'Name' }
+                        if (-not $machineName) { $machineName = '(unknown)' }
+
+                        $groupKey = Get-BVGroupKey -Machine $machineName -RepoName $repoName -Tier 'Capacity'
+                        $group = Get-BVOrCreateCountGroup -Map $CountGroups -Key $groupKey `
+                            -Machine $machineName -Repository $repoName -Tier 'Capacity' `
+                            -ParentSOBR $sobrName -SortOrder 1
+                        $group.Versions++
+                    }
+                }
+            }
+        }
+
+        # ─── BUILD COMBINED SOBR ROWS ─────────────────────────────────────────
+        # For each machine+SOBR combination, add a combined row totalling all tiers.
+        $SobrCombinedGroups = @{}
+        foreach ($g in $CountGroups.Values) {
+            if ($g.ParentSOBR -and $g.ParentSOBR -ne '-') {
+                $combKey = ('{0}|||{1}' -f $g.Machine, $g.ParentSOBR)
+                if (-not $SobrCombinedGroups.ContainsKey($combKey)) {
+                    $SobrCombinedGroups[$combKey] = [PSCustomObject]@{
+                        Machine    = $g.Machine
+                        Repository = $g.ParentSOBR
+                        Tier       = 'SOBR combined'
+                        ParentSOBR = $g.ParentSOBR
+                        SortOrder  = 2
+                        Versions   = 0
+                    }
+                }
+                $SobrCombinedGroups[$combKey].Versions += $g.Versions
+            }
+        }
+
+        # ─── SORT AND FORMAT OUTPUT ───────────────────────────────────────────
+        $AllRows = New-Object 'System.Collections.Generic.List[object]'
+        foreach ($g in $CountGroups.Values) { [void]$AllRows.Add($g) }
+        foreach ($g in $SobrCombinedGroups.Values) { [void]$AllRows.Add($g) }
+
+        $SortedReport = $AllRows | Sort-Object -Property `
+            @{Expression = {$_.Machine};    Ascending = $true},
+            @{Expression = {$_.ParentSOBR}; Ascending = $true},
+            @{Expression = {$_.SortOrder};  Ascending = $true},
+            @{Expression = {$_.Repository}; Ascending = $true}
+
+        [void]$lines.Add('')
+
+        $tableText = $SortedReport |
+            Format-Table `
+                @{Label='Machine';    Expression={$_.Machine};    Width=48},
+                @{Label='Repository'; Expression={$_.Repository}; Width=28},
+                @{Label='Tier';       Expression={$_.Tier};       Width=14},
+                @{Label='Versions';   Expression={$_.Versions};   Width=8} `
+                -AutoSize |
+            Out-String
+
+        foreach ($tl in ($tableText -split '\r?\n')) {
+            [void]$lines.Add($tl)
+        }
+
+        Write-DebugMessage '[New-BackupVersionsSectionText] Backup version collection complete.'
+
+    } catch {
+        Write-Warning ('Backup Versions collection failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[New-BackupVersionsSectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        [void]$lines.Add(('(backup version information unavailable: {0})' -f $_.Exception.Message))
+    }
+
+    [void]$lines.Add('############### Backup Versions END ###################')
+    return ($lines -join [Environment]::NewLine)
+}
+
 # ---------------------------------------------------------------------------
 # Build-JobReport
 #   Given a session and metadata, builds one report [pscustomobject].
@@ -2910,7 +3278,9 @@ function New-CollectorReportBody {
         # Optional Defined Repository baseline block (text mode only; empty in JSON mode).
         [string]$DefinedRepositorySection = '',
         # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
-        [string]$LicensingSection = ''
+        [string]$LicensingSection = '',
+        # Optional Backup Versions baseline block (text mode only; empty in JSON mode).
+        [string]$BackupVersionsSection = ''
     )
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -2936,6 +3306,10 @@ function New-CollectorReportBody {
     }
     if (-not [string]::IsNullOrWhiteSpace($LicensingSection)) {
         [void]$lines.Add($LicensingSection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BackupVersionsSection)) {
+        [void]$lines.Add($BackupVersionsSection)
         $hasBaselineSection = $true
     }
     if ($hasBaselineSection) {
@@ -3165,6 +3539,7 @@ Write-EnvironmentDiagnostics
 $definedJobsSection = ''
 $definedRepositorySection = ''
 $licensingSection = ''
+$backupVersionsSection = ''
 if (-not $Json) {
     Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
     try {
@@ -3615,6 +3990,26 @@ if (-not $Json) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Phase 9 — Backup Versions (text mode only)
+#   Counts the number of backup versions per machine in each repository and
+#   stores the result in $backupVersionsSection so it can be included in the
+#   human-readable report body after the licensing section.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 9 — Backup Versions (versions per machine per repository).'
+Write-DebugMessage '[Main] Phase 9 — Backup Versions.'
+if (-not $Json) {
+    try {
+        $backupVersionsSection = New-BackupVersionsSectionText
+        Write-DebugMessage ('[Main] Backup Versions section ready, {0} char(s).' -f $backupVersionsSection.Length)
+    } catch {
+        Write-Warning ('Backup Versions phase failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Backup Versions phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $backupVersionsSection = ''
+    }
+}
+
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
 
@@ -3685,7 +4080,7 @@ $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
     -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection `
-    -LicensingSection $licensingSection
+    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
