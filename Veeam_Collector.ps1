@@ -2850,11 +2850,15 @@ function New-BackupVersionsSectionText {
             if (-not $sobrName) { continue }
             $SobrByName[$sobrName] = $sobr
 
-            # Map logical/summary repository ID
+            # Map logical/summary repository ID to name only.
+            # Do NOT add to $SobrByRepositoryId — only performance and capacity
+            # extent IDs belong there.  Adding the SOBR logical ID would cause
+            # performance processing to create a spurious 'SOBR combined' entry
+            # in $CountGroups, which in turn would be double-counted when the
+            # combined rows are aggregated later.
             $sobrId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $sobr -Name 'Id')
             if ($sobrId) {
                 $RepositoryNameById[$sobrId] = [string]$sobrName
-                $SobrByRepositoryId[$sobrId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'SOBR combined'; SortOrder = 2 }
             }
 
             # Map performance extent IDs
@@ -2965,6 +2969,11 @@ function New-BackupVersionsSectionText {
         }
 
         # ─── CAPACITY RESTORE POINTS ─────────────────────────────────────────
+        # Use a dedicated $CapacityGroups map with per-group RestoreIds hash sets
+        # so that restore points are correctly deduplicated across multiple capacity
+        # backups (a per-backup $seenIds would miss cross-backup duplicates).
+        $CapacityGroups = @{}
+
         $hasCapacityCmdlets = (Get-Command -Name 'Get-VBRSOBRObjectStorageBackup'        -ErrorAction SilentlyContinue) -and
                               (Get-Command -Name 'Get-VBRSOBRObjectStorageRestorePoint'   -ErrorAction SilentlyContinue)
 
@@ -2989,8 +2998,14 @@ function New-BackupVersionsSectionText {
                     if ($capBackupSobrName -ne $sobrName) { continue }
 
                     try {
-                        $capRestorePoints = @(Get-VBRSOBRObjectStorageRestorePoint -Backup $CapacityBackup -ErrorAction Stop |
-                            Where-Object { $_.IsCapacity -ne $false })
+                        $capRestorePoints = @(
+                            Get-VBRSOBRObjectStorageRestorePoint `
+                                -Backup $CapacityBackup `
+                                -ErrorAction Stop |
+                                Where-Object {
+                                    $_.IsCapacity -ne $false
+                                }
+                        )
                     } catch {
                         Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRSOBRObjectStorageRestorePoint failed: {0}' -f $_.Exception.Message)
                         continue
@@ -3003,16 +3018,11 @@ function New-BackupVersionsSectionText {
                     }
                     if (-not $repoName) { $repoName = '(unknown)' }
 
-                    $seenIds = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
-
                     foreach ($rp in $capRestorePoints) {
                         $rpId = Get-BVObjectProperty -Obj $rp -Name 'BackupId'
                         if (-not $rpId) { $rpId = Get-BVObjectProperty -Obj $rp -Name 'Id' }
                         if (-not $rpId) { $rpId = [System.Guid]::NewGuid().ToString() }
                         $rpIdStr = [string]$rpId
-
-                        if ($seenIds.Contains($rpIdStr)) { continue }
-                        [void]$seenIds.Add($rpIdStr)
 
                         # Resolve machine name
                         $objId       = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $rp -Name 'ObjectId')
@@ -3028,46 +3038,90 @@ function New-BackupVersionsSectionText {
                         if (-not $machineName) { $machineName = Get-BVObjectProperty -Obj $rp -Name 'Name' }
                         if (-not $machineName) { $machineName = '(unknown)' }
 
-                        $groupKey = Get-BVGroupKey -Machine $machineName -RepoName $repoName -Tier 'Capacity'
-                        $group = Get-BVOrCreateCountGroup -Map $CountGroups -Key $groupKey `
-                            -Machine $machineName -Repository $repoName -Tier 'Capacity' `
-                            -ParentSOBR $sobrName -SortOrder 1
-                        $group.Versions++
+                        # Add to per-group RestoreIds hash set (deduplicates across backups).
+                        $capGroupKey = Get-BVGroupKey -Machine $machineName -RepoName $repoName -Tier 'Capacity'
+                        if (-not $CapacityGroups.ContainsKey($capGroupKey)) {
+                            $CapacityGroups[$capGroupKey] = [PSCustomObject]@{
+                                Machine    = $machineName
+                                Repository = $repoName
+                                Tier       = 'Capacity'
+                                ParentSOBR = $sobrName
+                                SortOrder  = 1
+                                RestoreIds = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+                            }
+                        }
+                        [void]$CapacityGroups[$capGroupKey].RestoreIds.Add($rpIdStr)
                     }
                 }
             }
+        }
+
+        # ─── BUILD REPORT ROWS ────────────────────────────────────────────────
+        # Collect performance/standalone rows and capacity rows into $Report first.
+        # Snapshot these base rows before adding combined rows to guarantee the
+        # combined aggregation cannot re-process combined entries (no double-count).
+        $Report = New-Object 'System.Collections.Generic.List[object]'
+
+        foreach ($g in $CountGroups.Values) {
+            [void]$Report.Add([PSCustomObject]@{
+                Machine    = $g.Machine
+                Repository = $g.Repository
+                Tier       = $g.Tier
+                ParentSOBR = $g.ParentSOBR
+                SortOrder  = $g.SortOrder
+                Versions   = $g.Versions
+            })
+        }
+
+        foreach ($g in $CapacityGroups.Values) {
+            [void]$Report.Add([PSCustomObject]@{
+                Machine    = $g.Machine
+                Repository = $g.Repository
+                Tier       = 'Capacity'
+                ParentSOBR = $g.ParentSOBR
+                SortOrder  = $g.SortOrder
+                Versions   = $g.RestoreIds.Count
+            })
         }
 
         # ─── BUILD COMBINED SOBR ROWS ─────────────────────────────────────────
-        # For each machine+SOBR combination, add a combined row totalling all tiers.
-        $SobrCombinedGroups = @{}
-        foreach ($g in $CountGroups.Values) {
-            if ($g.ParentSOBR -and $g.ParentSOBR -ne '-') {
-                $combKey = ('{0}|||{1}' -f $g.Machine, $g.ParentSOBR)
-                if (-not $SobrCombinedGroups.ContainsKey($combKey)) {
-                    $SobrCombinedGroups[$combKey] = [PSCustomObject]@{
-                        Machine    = $g.Machine
-                        Repository = $g.ParentSOBR
-                        Tier       = 'SOBR combined'
-                        ParentSOBR = $g.ParentSOBR
-                        SortOrder  = 2
-                        Versions   = 0
+        # Snapshot base rows now, before combined rows are appended, so the loop
+        # below cannot accidentally include combined rows in the sum.
+        $BaseRows = @($Report)
+
+        $SobrMachineGroups = @{}
+        foreach ($row in $BaseRows) {
+            if ($row.ParentSOBR -and $row.ParentSOBR -ne '-') {
+                $combKey = ('{0}|||{1}' -f $row.Machine, $row.ParentSOBR)
+                if (-not $SobrMachineGroups.ContainsKey($combKey)) {
+                    $SobrMachineGroups[$combKey] = [PSCustomObject]@{
+                        Machine  = $row.Machine
+                        SOBR     = $row.ParentSOBR
+                        Versions = 0
                     }
                 }
-                $SobrCombinedGroups[$combKey].Versions += $g.Versions
+                $SobrMachineGroups[$combKey].Versions += $row.Versions
             }
         }
 
-        # ─── SORT AND FORMAT OUTPUT ───────────────────────────────────────────
-        $AllRows = New-Object 'System.Collections.Generic.List[object]'
-        foreach ($g in $CountGroups.Values) { [void]$AllRows.Add($g) }
-        foreach ($g in $SobrCombinedGroups.Values) { [void]$AllRows.Add($g) }
+        foreach ($Combined in $SobrMachineGroups.Values) {
+            [void]$Report.Add([PSCustomObject]@{
+                Machine    = $Combined.Machine
+                Repository = $Combined.SOBR
+                Tier       = 'SOBR combined'
+                ParentSOBR = $Combined.SOBR
+                SortOrder  = 0
+                Versions   = $Combined.Versions
+            })
+        }
 
-        $SortedReport = $AllRows | Sort-Object -Property `
-            @{Expression = {$_.Machine};    Ascending = $true},
-            @{Expression = {$_.ParentSOBR}; Ascending = $true},
-            @{Expression = {$_.SortOrder};  Ascending = $true},
-            @{Expression = {$_.Repository}; Ascending = $true}
+        # ─── SORT AND FORMAT OUTPUT ───────────────────────────────────────────
+        $SortedReport = $Report |
+            Sort-Object -Property `
+                @{Expression = {$_.Machine};    Ascending = $true},
+                @{Expression = {$_.ParentSOBR}; Ascending = $true},
+                @{Expression = {$_.SortOrder};  Ascending = $true},
+                @{Expression = {$_.Repository}; Ascending = $true}
 
         [void]$lines.Add('')
 
