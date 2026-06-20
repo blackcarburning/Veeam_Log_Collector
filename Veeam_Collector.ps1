@@ -3092,7 +3092,7 @@ function New-BackupVersionsSectionText {
         $SobrMachineGroups = @{}
         foreach ($row in $BaseRows) {
             if ($row.ParentSOBR -and $row.ParentSOBR -ne '-') {
-                $combKey = $row.Machine + [char]0 + $row.ParentSOBR
+                $combKey = ('{0}|||{1}' -f $row.Machine, $row.ParentSOBR)
                 if (-not $SobrMachineGroups.ContainsKey($combKey)) {
                     $SobrMachineGroups[$combKey] = [PSCustomObject]@{
                         Machine  = $row.Machine
@@ -3117,10 +3117,11 @@ function New-BackupVersionsSectionText {
 
         # ─── SORT AND FORMAT OUTPUT ───────────────────────────────────────────
         $SortedReport = $Report |
-            Sort-Object Machine,
-                        ParentSOBR,
-                        SortOrder,
-                        Repository
+            Sort-Object -Property `
+                @{Expression = {$_.Machine};    Ascending = $true},
+                @{Expression = {$_.ParentSOBR}; Ascending = $true},
+                @{Expression = {$_.SortOrder};  Ascending = $true},
+                @{Expression = {$_.Repository}; Ascending = $true}
 
         [void]$lines.Add('')
 
