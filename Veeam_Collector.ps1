@@ -2735,69 +2735,165 @@ function New-VBRLicensingSectionText {
 
 function ConvertTo-BVIdKey {
     [CmdletBinding()]
-    param([object]$Id)
-    if ($null -eq $Id) { return '' }
-    return [string]$Id
+    param(
+        [AllowNull()]
+        [object]$Id
+    )
+
+    if ($null -eq $Id) {
+        return $null
+    }
+
+    $Text = ([string]$Id).Trim().Trim('{}')
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    return $Text.ToLowerInvariant()
 }
 
 function Get-BVObjectProperty {
     [CmdletBinding()]
-    param([object]$Obj, [string]$Name)
-    if ($null -eq $Obj) { return $null }
-    try {
-        $prop = $Obj.PSObject.Properties[$Name]
-        if ($null -ne $prop) { return $prop.Value }
-    } catch {}
-    try { return $Obj.$Name } catch { return $null }
+    param(
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$Names
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($Name in $Names) {
+        $Property = $InputObject.PSObject.Properties[$Name]
+
+        if (
+            $null -ne $Property -and
+            $null -ne $Property.Value
+        ) {
+            return $Property.Value
+        }
+    }
+
+    return $null
 }
 
 function Get-BVRepositoryId {
     [CmdletBinding()]
-    param([object]$Obj)
-    $id = Get-BVObjectProperty -Obj $Obj -Name 'RepositoryId'
-    if ($null -ne $id) { return ConvertTo-BVIdKey $id }
-    $id = Get-BVObjectProperty -Obj $Obj -Name 'TargetRepositoryId'
-    if ($null -ne $id) { return ConvertTo-BVIdKey $id }
-    return ''
+    param(
+        [AllowNull()]
+        [object]$Repository
+    )
+
+    return ConvertTo-BVIdKey (
+        Get-BVObjectProperty `
+            -InputObject $Repository `
+            -Names @(
+                'Id'
+                'RepositoryId'
+            )
+    )
 }
 
 function Get-BVGroupKey {
     [CmdletBinding()]
-    param([string]$Machine, [string]$RepoName, [string]$Tier)
-    return ('{0}|||{1}|||{2}' -f $Machine, $RepoName, $Tier)
+    param(
+        [Parameter(Mandatory)]
+        [string]$Machine,
+
+        [Parameter(Mandatory)]
+        [string]$Parent,
+
+        [Parameter(Mandatory)]
+        [string]$Repository
+    )
+
+    return (
+        $Machine.ToLowerInvariant() +
+        [char]0 +
+        $Parent.ToLowerInvariant() +
+        [char]0 +
+        $Repository.ToLowerInvariant()
+    )
 }
 
 function Get-BVOrCreateCountGroup {
     [CmdletBinding()]
     param(
-        [hashtable]$Map,
-        [string]$Key,
+        [Parameter(Mandatory)]
+        [hashtable]$Table,
+
+        [Parameter(Mandatory)]
         [string]$Machine,
+
+        [Parameter(Mandatory)]
+        [string]$Parent,
+
+        [Parameter(Mandatory)]
         [string]$Repository,
-        [string]$Tier,
-        [string]$ParentSOBR,
-        [int]$SortOrder
+
+        [Parameter(Mandatory)]
+        [string]$Tier
     )
-    if (-not $Map.ContainsKey($Key)) {
-        $Map[$Key] = [PSCustomObject]@{
+
+    $Key = Get-BVGroupKey `
+        -Machine $Machine `
+        -Parent $Parent `
+        -Repository $Repository
+
+    if (-not $Table.ContainsKey($Key)) {
+        $Table[$Key] = [PSCustomObject]@{
             Machine    = $Machine
+            Parent     = $Parent
             Repository = $Repository
             Tier       = $Tier
-            ParentSOBR = $ParentSOBR
-            SortOrder  = $SortOrder
-            Versions   = 0
+            Versions   = [int64]0
         }
     }
-    return $Map[$Key]
+
+    return $Table[$Key]
 }
 
 function Get-BVOrCreateRestorePointSet {
     [CmdletBinding()]
-    param([hashtable]$Map, [string]$Key)
-    if (-not $Map.ContainsKey($Key)) {
-        $Map[$Key] = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Table,
+
+        [Parameter(Mandatory)]
+        [string]$Machine,
+
+        [Parameter(Mandatory)]
+        [string]$Parent,
+
+        [Parameter(Mandatory)]
+        [string]$Repository,
+
+        [Parameter(Mandatory)]
+        [string]$Tier
+    )
+
+    $Key = Get-BVGroupKey `
+        -Machine $Machine `
+        -Parent $Parent `
+        -Repository $Repository
+
+    if (-not $Table.ContainsKey($Key)) {
+        $Table[$Key] = [PSCustomObject]@{
+            Machine     = $Machine
+            Parent      = $Parent
+            Repository  = $Repository
+            Tier        = $Tier
+            RestoreIds  = [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        }
     }
-    return $Map[$Key]
+
+    return $Table[$Key]
 }
 
 # ---------------------------------------------------------------------------
@@ -2820,308 +2916,547 @@ function New-BackupVersionsSectionText {
         Write-ProgressMessage 'Phase 9 — Collecting backup version counts...'
         Write-DebugMessage '[New-BackupVersionsSectionText] Starting backup version collection.'
 
-        # ─── BUILD REPOSITORY NAME MAP ──────────────────────────────────────
         $RepositoryNameById = @{}
 
-        $stdRepos = @(Get-VBRBackupRepository -ErrorAction SilentlyContinue)
-        foreach ($r in $stdRepos) {
-            $id = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $r -Name 'Id')
-            $nm = Get-BVObjectProperty -Obj $r -Name 'Name'
-            if ($id -and $nm) { $RepositoryNameById[$id] = [string]$nm }
-        }
+        $SobrByRepositoryId = @{}
 
-        if (Get-Command -Name 'Get-VBRObjectStorageRepository' -ErrorAction SilentlyContinue) {
-            $objRepos = @(Get-VBRObjectStorageRepository -ErrorAction SilentlyContinue)
-            foreach ($r in $objRepos) {
-                $id = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $r -Name 'Id')
-                $nm = Get-BVObjectProperty -Obj $r -Name 'Name'
-                if ($id -and $nm) { $RepositoryNameById[$id] = [string]$nm }
+        $SobrByName = @{}
+
+
+        $StandardRepositories = @(
+            Get-VBRBackupRepository `
+                -ErrorAction SilentlyContinue
+        )
+
+        foreach ($Repository in $StandardRepositories) {
+            $RepositoryId = Get-BVRepositoryId -Repository $Repository
+
+            if ($RepositoryId) {
+                $RepositoryNameById[$RepositoryId] = [string]$Repository.Name
             }
         }
 
-        $sobrRepos = @(Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue)
 
-        # ─── BUILD SOBR MAPS ────────────────────────────────────────────────
-        $SobrByRepositoryId = @{}   # extent repo ID -> sobr info
-        $SobrByName         = @{}   # sobr name      -> sobr object
+        $ObjectRepositories = @()
 
-        foreach ($sobr in $sobrRepos) {
-            $sobrName = Get-BVObjectProperty -Obj $sobr -Name 'Name'
-            if (-not $sobrName) { continue }
-            $SobrByName[$sobrName] = $sobr
+        if (
+            Get-Command Get-VBRObjectStorageRepository `
+                -ErrorAction SilentlyContinue
+        ) {
+            $ObjectRepositories = @(
+                Get-VBRObjectStorageRepository `
+                    -ErrorAction SilentlyContinue
+            )
 
-            # Map logical/summary repository ID to name only.
-            # Do NOT add to $SobrByRepositoryId — only performance and capacity
-            # extent IDs belong there.  Adding the SOBR logical ID would cause
-            # performance processing to create a spurious 'SOBR combined' entry
-            # in $CountGroups, which in turn would be double-counted when the
-            # combined rows are aggregated later.
-            $sobrId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $sobr -Name 'Id')
-            if ($sobrId) {
-                $RepositoryNameById[$sobrId] = [string]$sobrName
-            }
+            foreach ($Repository in $ObjectRepositories) {
+                $RepositoryId = Get-BVRepositoryId -Repository $Repository
 
-            # Map performance extent IDs
-            $perfExtents = @(Get-BVObjectProperty -Obj $sobr -Name 'PerformanceExtentCollection')
-            if ($null -eq $perfExtents -or $perfExtents.Count -eq 0) {
-                $perfExtents = @(Get-BVObjectProperty -Obj $sobr -Name 'Extent')
-            }
-            foreach ($ext in $perfExtents) {
-                if ($null -eq $ext) { continue }
-                $extRepo = Get-BVObjectProperty -Obj $ext -Name 'Repository'
-                if ($null -ne $extRepo) {
-                    $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $extRepo -Name 'Id')
-                    if ($extId) {
-                        $SobrByRepositoryId[$extId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'Performance'; SortOrder = 0 }
-                        $nm = Get-BVObjectProperty -Obj $extRepo -Name 'Name'
-                        if ($nm) { $RepositoryNameById[$extId] = [string]$nm }
-                    }
-                } else {
-                    $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $ext -Name 'RepositoryId')
-                    if (-not $extId) { $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $ext -Name 'Id') }
-                    if ($extId) {
-                        $SobrByRepositoryId[$extId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'Performance'; SortOrder = 0 }
-                    }
-                }
-            }
-
-            # Map capacity extent IDs
-            $capExtents = @(Get-BVObjectProperty -Obj $sobr -Name 'CapacityExtentCollection')
-            foreach ($ext in $capExtents) {
-                if ($null -eq $ext) { continue }
-                $extRepo = Get-BVObjectProperty -Obj $ext -Name 'Repository'
-                if ($null -ne $extRepo) {
-                    $extId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $extRepo -Name 'Id')
-                    if ($extId) {
-                        $SobrByRepositoryId[$extId] = [PSCustomObject]@{ SobrName = $sobrName; Tier = 'Capacity'; SortOrder = 1 }
-                        $nm = Get-BVObjectProperty -Obj $extRepo -Name 'Name'
-                        if ($nm) { $RepositoryNameById[$extId] = [string]$nm }
-                    }
+                if ($RepositoryId) {
+                    $RepositoryNameById[$RepositoryId] = [string]$Repository.Name
                 }
             }
         }
 
-        # ─── COUNT GROUPS MAP ────────────────────────────────────────────────
-        $CountGroups = @{}
 
-        # ─── MACHINE LOOKUP MAPS (for capacity tier) ─────────────────────────
-        $MachineByObjectAndSobr = @{}  # "objectId|||sobrName" -> machineName
-        $MachineByObjectId      = @{}  # objectId -> machineName
+        $ScaleOutRepositories = @(
+            Get-VBRBackupRepository `
+                -ScaleOut `
+                -ErrorAction SilentlyContinue
+        )
 
-        # ─── PERFORMANCE/STANDALONE RESTORE POINTS ───────────────────────────
-        $allBackups = @(Get-VBRBackup -ErrorAction SilentlyContinue)
+        foreach ($SOBR in $ScaleOutRepositories) {
+            $SobrId = Get-BVRepositoryId -Repository $SOBR
 
-        foreach ($Backup in $allBackups) {
-            $backupObjList = @()
+            $PerformanceExtents = @()
+
             try {
-                $backupObjList = @(Get-VBRBackupObject -Backup $Backup -ErrorAction Stop)
-            } catch {
-                Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRBackupObject failed for backup: {0}' -f $_.Exception.Message)
+                $PerformanceExtents = @(
+                    Get-VBRRepositoryExtent `
+                        -Repository $SOBR `
+                        -ErrorAction Stop
+                )
+            }
+            catch {
+                $PerformanceExtents = @()
+            }
+
+            $CapacityExtents = @()
+
+            try {
+                $CapacityExtents = @(
+                    Get-VBRCapacityExtent `
+                        -Repository $SOBR `
+                        -ErrorAction Stop
+                )
+            }
+            catch {
+                $CapacityExtents = @()
+            }
+
+            $PerformanceNames = @(
+                $PerformanceExtents |
+                    ForEach-Object {
+                        [string]$_.Repository.Name
+                    } |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    }
+            )
+
+            $CapacityNames = @(
+                $CapacityExtents |
+                    ForEach-Object {
+                        [string]$_.Repository.Name
+                    } |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    }
+            )
+
+            $SobrInformation = [PSCustomObject]@{
+                Name               = [string]$SOBR.Name
+                Id                 = $SobrId
+                PerformanceExtents = $PerformanceExtents
+                CapacityExtents    = $CapacityExtents
+                PerformanceNames   = $PerformanceNames
+                CapacityNames      = $CapacityNames
+            }
+
+            $SobrByName[$SOBR.Name.ToLowerInvariant()] = $SobrInformation
+
+            if ($SobrId) {
+                $SobrByRepositoryId[$SobrId] = $SobrInformation
+                $RepositoryNameById[$SobrId] = [string]$SOBR.Name
+            }
+
+            foreach ($Extent in $PerformanceExtents) {
+                $ExtentRepository = $Extent.Repository
+                $ExtentId = Get-BVRepositoryId -Repository $ExtentRepository
+
+                if ($ExtentId) {
+                    $SobrByRepositoryId[$ExtentId] = $SobrInformation
+                    $RepositoryNameById[$ExtentId] =
+                        [string]$ExtentRepository.Name
+                }
+            }
+
+            foreach ($Extent in $CapacityExtents) {
+                $ExtentRepository = $Extent.Repository
+                $ExtentId = Get-BVRepositoryId -Repository $ExtentRepository
+
+                if ($ExtentId) {
+                    $SobrByRepositoryId[$ExtentId] = $SobrInformation
+                    $RepositoryNameById[$ExtentId] =
+                        [string]$ExtentRepository.Name
+                }
+            }
+        }
+
+
+        $PerformanceGroups = @{}
+
+        $MachineByObjectAndSobr = @{}
+        $MachineByObjectId      = @{}
+
+
+        $Backups = @(
+            Get-VBRBackup `
+                -ErrorAction SilentlyContinue
+        )
+
+        foreach ($Backup in $Backups) {
+            $BackupObjects = @()
+
+            try {
+                $BackupObjects = @(
+                    Get-VBRBackupObject `
+                        -Backup $Backup `
+                        -ErrorAction Stop
+                )
+            }
+            catch {
+                Write-Warning (
+                    "Unable to read objects from backup '$($Backup.Name)': " +
+                    $_.Exception.Message
+                )
+
                 continue
             }
 
-            foreach ($obj in $backupObjList) {
-                $machineName = Get-BVObjectProperty -Obj $obj -Name 'Name'
-                if (-not $machineName) { $machineName = '(unknown)' }
+            foreach ($BackupObject in $BackupObjects) {
+                $Machine = [string]$BackupObject.Name
 
-                $rpCount = Get-BVObjectProperty -Obj $obj -Name 'RestorePointsCount'
-                if ($null -eq $rpCount) { $rpCount = 0 }
-                try { $rpCount = [int]$rpCount } catch { $rpCount = 0 }
-
-                # Determine repository ID (object first, then backup)
-                $repoId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $obj -Name 'RepositoryId')
-                if (-not $repoId) {
-                    $repoId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $Backup -Name 'RepositoryId')
-                }
-                if (-not $repoId) {
-                    $repoId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $Backup -Name 'TargetRepositoryId')
-                }
-
-                $repoName = if ($repoId -and $RepositoryNameById.ContainsKey($repoId)) { $RepositoryNameById[$repoId] } else { $repoId }
-                if (-not $repoName) { $repoName = '(unknown)' }
-
-                # Check if this repository belongs to a SOBR
-                $sobrInfo = $null
-                if ($repoId -and $SobrByRepositoryId.ContainsKey($repoId)) {
-                    $sobrInfo = $SobrByRepositoryId[$repoId]
-                }
-
-                # Store machine lookup for capacity tier resolution
-                $objId = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $obj -Name 'Id')
-                if ($objId) {
-                    $MachineByObjectId[$objId] = $machineName
-                    if ($sobrInfo -and $sobrInfo.SobrName) {
-                        $lookupKey = ('{0}|||{1}' -f $objId, $sobrInfo.SobrName)
-                        $MachineByObjectAndSobr[$lookupKey] = $machineName
-                    }
-                }
-
-                $tierLabel  = if ($sobrInfo) { $sobrInfo.Tier } else { 'Performance' }
-                $parentSobr = if ($sobrInfo) { $sobrInfo.SobrName } else { '-' }
-                $sortOrder  = if ($sobrInfo) { $sobrInfo.SortOrder } else { 0 }
-
-                $groupKey = Get-BVGroupKey -Machine $machineName -RepoName $repoName -Tier $tierLabel
-                $group = Get-BVOrCreateCountGroup -Map $CountGroups -Key $groupKey `
-                    -Machine $machineName -Repository $repoName -Tier $tierLabel `
-                    -ParentSOBR $parentSobr -SortOrder $sortOrder
-                $group.Versions += $rpCount
-            }
-        }
-
-        # ─── CAPACITY RESTORE POINTS ─────────────────────────────────────────
-        # Use a dedicated $CapacityGroups map with per-group RestoreIds hash sets
-        # so that restore points are correctly deduplicated across multiple capacity
-        # backups (a per-backup $seenIds would miss cross-backup duplicates).
-        $CapacityGroups = @{}
-
-        $hasCapacityCmdlets = (Get-Command -Name 'Get-VBRSOBRObjectStorageBackup'        -ErrorAction SilentlyContinue) -and
-                              (Get-Command -Name 'Get-VBRSOBRObjectStorageRestorePoint'   -ErrorAction SilentlyContinue)
-
-        if ($hasCapacityCmdlets) {
-            foreach ($sobr in $sobrRepos) {
-                $sobrName = Get-BVObjectProperty -Obj $sobr -Name 'Name'
-                if (-not $sobrName) { continue }
-
-                try {
-                    $capBackups = @(Get-VBRSOBRObjectStorageBackup -CapacityTier -ErrorAction Stop)
-                } catch {
-                    Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRSOBRObjectStorageBackup failed: {0}' -f $_.Exception.Message)
+                if ([string]::IsNullOrWhiteSpace($Machine)) {
                     continue
                 }
 
-                foreach ($CapacityBackup in $capBackups) {
-                    $capBackupSobrName = Get-BVObjectProperty -Obj $CapacityBackup -Name 'ScaleOutRepositoryName'
-                    if (-not $capBackupSobrName) {
-                        $capBackupSobrObj  = Get-BVObjectProperty -Obj $CapacityBackup -Name 'ScaleOutRepository'
-                        $capBackupSobrName = Get-BVObjectProperty -Obj $capBackupSobrObj -Name 'Name'
-                    }
-                    if ($capBackupSobrName -ne $sobrName) { continue }
+                [int64]$VersionCount = 0
 
-                    try {
-                        $capRestorePoints = @(
-                            Get-VBRSOBRObjectStorageRestorePoint `
-                                -Backup $CapacityBackup `
-                                -ErrorAction Stop |
-                                Where-Object {
-                                    $_.IsCapacity -ne $false
-                                }
+                if ($null -ne $BackupObject.RestorePointsCount) {
+                    $VersionCount = [int64]$BackupObject.RestorePointsCount
+                }
+
+                $RepositoryId = ConvertTo-BVIdKey $BackupObject.RepositoryId
+
+                if (-not $RepositoryId) {
+                    $RepositoryId = ConvertTo-BVIdKey (
+                        Get-BVObjectProperty `
+                            -InputObject $Backup `
+                            -Names @(
+                                'RepositoryId'
+                                'TargetRepositoryId'
+                            )
+                    )
+                }
+
+                $SobrInformation = $null
+
+                if (
+                    $RepositoryId -and
+                    $SobrByRepositoryId.ContainsKey($RepositoryId)
+                ) {
+                    $SobrInformation = $SobrByRepositoryId[$RepositoryId]
+                }
+
+                if ($SobrInformation) {
+                    $SobrName = $SobrInformation.Name
+
+                    if (
+                        $RepositoryId -and
+                        $RepositoryNameById.ContainsKey($RepositoryId) -and
+                        $RepositoryId -ne $SobrInformation.Id
+                    ) {
+                        $PerformanceRepository =
+                            $RepositoryNameById[$RepositoryId]
+                    }
+                    elseif ($SobrInformation.PerformanceNames.Count -eq 1) {
+                        $PerformanceRepository =
+                            $SobrInformation.PerformanceNames[0]
+                    }
+                    elseif ($SobrInformation.PerformanceNames.Count -gt 1) {
+                        $PerformanceRepository =
+                            "$SobrName performance tier"
+                    }
+                    else {
+                        $PerformanceRepository =
+                            "$SobrName performance tier"
+                    }
+
+                    $Group = Get-BVOrCreateCountGroup `
+                        -Table $PerformanceGroups `
+                        -Machine $Machine `
+                        -Parent $SobrName `
+                        -Repository $PerformanceRepository `
+                        -Tier 'Performance'
+
+                    $Group.Versions += $VersionCount
+
+                    foreach ($ObjectIdentifier in @(
+                        $BackupObject.ObjectId
+                        $BackupObject.Id
+                    )) {
+                        $ObjectKey = ConvertTo-BVIdKey $ObjectIdentifier
+
+                        if (-not $ObjectKey) {
+                            continue
+                        }
+
+                        $CombinedObjectKey = (
+                            $ObjectKey +
+                            [char]0 +
+                            $SobrName.ToLowerInvariant()
                         )
-                    } catch {
-                        Write-DebugMessage ('[New-BackupVersionsSectionText] Get-VBRSOBRObjectStorageRestorePoint failed: {0}' -f $_.Exception.Message)
-                        continue
+
+                        $MachineByObjectAndSobr[$CombinedObjectKey] = $Machine
+                        $MachineByObjectId[$ObjectKey] = $Machine
+                    }
+                }
+                else {
+                    $RepositoryName = $null
+
+                    if (
+                        $RepositoryId -and
+                        $RepositoryNameById.ContainsKey($RepositoryId)
+                    ) {
+                        $RepositoryName =
+                            $RepositoryNameById[$RepositoryId]
                     }
 
-                    $repoName = Get-BVObjectProperty -Obj $CapacityBackup -Name 'RepositoryName'
-                    if (-not $repoName) {
-                        $repoObj  = Get-BVObjectProperty -Obj $CapacityBackup -Name 'Repository'
-                        $repoName = Get-BVObjectProperty -Obj $repoObj -Name 'Name'
-                    }
-                    if (-not $repoName) { $repoName = '(unknown)' }
-
-                    foreach ($rp in $capRestorePoints) {
-                        $rpId = Get-BVObjectProperty -Obj $rp -Name 'BackupId'
-                        if (-not $rpId) { $rpId = Get-BVObjectProperty -Obj $rp -Name 'Id' }
-                        if (-not $rpId) { $rpId = [System.Guid]::NewGuid().ToString() }
-                        $rpIdStr = [string]$rpId
-
-                        # Resolve machine name
-                        $objId       = ConvertTo-BVIdKey (Get-BVObjectProperty -Obj $rp -Name 'ObjectId')
-                        $machineName = $null
-                        if ($objId) {
-                            $lookupKey = ('{0}|||{1}' -f $objId, $sobrName)
-                            if ($MachineByObjectAndSobr.ContainsKey($lookupKey)) {
-                                $machineName = $MachineByObjectAndSobr[$lookupKey]
-                            } elseif ($MachineByObjectId.ContainsKey($objId)) {
-                                $machineName = $MachineByObjectId[$objId]
+                    if ([string]::IsNullOrWhiteSpace($RepositoryName)) {
+                        try {
+                            if (
+                                $Backup.PSObject.Methods.Name -contains
+                                'GetRepository'
+                            ) {
+                                $BackupRepository = $Backup.GetRepository()
+                                $RepositoryName = [string]$BackupRepository.Name
                             }
                         }
-                        if (-not $machineName) { $machineName = Get-BVObjectProperty -Obj $rp -Name 'Name' }
-                        if (-not $machineName) { $machineName = '(unknown)' }
-
-                        # Add to per-group RestoreIds hash set (deduplicates across backups).
-                        $capGroupKey = Get-BVGroupKey -Machine $machineName -RepoName $repoName -Tier 'Capacity'
-                        if (-not $CapacityGroups.ContainsKey($capGroupKey)) {
-                            $CapacityGroups[$capGroupKey] = [PSCustomObject]@{
-                                Machine    = $machineName
-                                Repository = $repoName
-                                Tier       = 'Capacity'
-                                ParentSOBR = $sobrName
-                                SortOrder  = 1
-                                RestoreIds = New-Object 'System.Collections.Generic.HashSet[string]'([System.StringComparer]::OrdinalIgnoreCase)
-                            }
+                        catch {
                         }
-                        [void]$CapacityGroups[$capGroupKey].RestoreIds.Add($rpIdStr)
                     }
+
+                    if ([string]::IsNullOrWhiteSpace($RepositoryName)) {
+                        $RepositoryName = 'Unknown repository'
+                    }
+
+                    $Group = Get-BVOrCreateCountGroup `
+                        -Table $PerformanceGroups `
+                        -Machine $Machine `
+                        -Parent 'Standalone' `
+                        -Repository $RepositoryName `
+                        -Tier 'Performance'
+
+                    $Group.Versions += $VersionCount
                 }
             }
         }
 
-        # ─── BUILD REPORT ROWS ────────────────────────────────────────────────
-        # Collect performance/standalone rows and capacity rows into $Report first.
-        # Snapshot these base rows before adding combined rows to guarantee the
-        # combined aggregation cannot re-process combined entries (no double-count).
-        $Report = New-Object 'System.Collections.Generic.List[object]'
 
-        foreach ($g in $CountGroups.Values) {
-            [void]$Report.Add([PSCustomObject]@{
-                Machine    = $g.Machine
-                Repository = $g.Repository
-                Tier       = $g.Tier
-                ParentSOBR = $g.ParentSOBR
-                SortOrder  = $g.SortOrder
-                Versions   = $g.Versions
-            })
+        $CapacityGroups = @{}
+
+        if (
+            (Get-Command Get-VBRSOBRObjectStorageBackup `
+                -ErrorAction SilentlyContinue) -and
+            (Get-Command Get-VBRSOBRObjectStorageRestorePoint `
+                -ErrorAction SilentlyContinue)
+        ) {
+            $CapacityBackups = @()
+
+            try {
+                $CapacityBackups = @(
+                    Get-VBRSOBRObjectStorageBackup `
+                        -CapacityTier `
+                        -ErrorAction Stop
+                )
+            }
+            catch {
+                Write-Warning (
+                    'Unable to retrieve capacity-tier backups: ' +
+                    $_.Exception.Message
+                )
+
+                $CapacityBackups = @()
+            }
+
+            foreach ($CapacityBackup in $CapacityBackups) {
+                $RepositoryId = ConvertTo-BVIdKey `
+                    $CapacityBackup.RepositoryId
+
+                $SobrInformation = $null
+
+                if (
+                    $RepositoryId -and
+                    $SobrByRepositoryId.ContainsKey($RepositoryId)
+                ) {
+                    $SobrInformation =
+                        $SobrByRepositoryId[$RepositoryId]
+                }
+
+                if (-not $SobrInformation) {
+                    Write-Warning (
+                        "Unable to identify the parent SOBR for capacity backup " +
+                        "'$($CapacityBackup.Name)' with repository ID " +
+                        "'$RepositoryId'."
+                    )
+
+                    continue
+                }
+
+                $SobrName = $SobrInformation.Name
+
+                if (
+                    $RepositoryId -and
+                    $RepositoryNameById.ContainsKey($RepositoryId) -and
+                    $RepositoryId -ne $SobrInformation.Id
+                ) {
+                    $CapacityRepository =
+                        $RepositoryNameById[$RepositoryId]
+                }
+                elseif ($SobrInformation.CapacityNames.Count -eq 1) {
+                    $CapacityRepository =
+                        $SobrInformation.CapacityNames[0]
+                }
+                elseif ($SobrInformation.CapacityNames.Count -gt 1) {
+                    $CapacityRepository =
+                        "$SobrName capacity tier"
+                }
+                else {
+                    $CapacityRepository =
+                        "$SobrName capacity tier"
+                }
+
+                $CapacityRestorePoints = @()
+
+                try {
+                    $CapacityRestorePoints = @(
+                        Get-VBRSOBRObjectStorageRestorePoint `
+                            -Backup $CapacityBackup `
+                            -ErrorAction Stop |
+                            Where-Object {
+                                $_.IsCapacity -ne $false
+                            }
+                    )
+                }
+                catch {
+                    Write-Warning (
+                        "Unable to read capacity-tier restore points from " +
+                        "'$($CapacityBackup.Name)': " +
+                        $_.Exception.Message
+                    )
+
+                    continue
+                }
+
+                $FallbackCounter = 0
+
+                foreach ($RestorePoint in $CapacityRestorePoints) {
+                    $ObjectId = ConvertTo-BVIdKey $RestorePoint.ObjectId
+
+                    $Machine = $null
+
+                    if ($ObjectId) {
+                        $CombinedObjectKey = (
+                            $ObjectId +
+                            [char]0 +
+                            $SobrName.ToLowerInvariant()
+                        )
+
+                        if (
+                            $MachineByObjectAndSobr.ContainsKey(
+                                $CombinedObjectKey
+                            )
+                        ) {
+                            $Machine =
+                                $MachineByObjectAndSobr[$CombinedObjectKey]
+                        }
+                        elseif ($MachineByObjectId.ContainsKey($ObjectId)) {
+                            $Machine = $MachineByObjectId[$ObjectId]
+                        }
+                    }
+
+                    if ([string]::IsNullOrWhiteSpace($Machine)) {
+                        $Machine = if ($ObjectId) {
+                            "Unknown machine [$ObjectId]"
+                        }
+                        else {
+                            'Unknown machine'
+                        }
+                    }
+
+                    $Group = Get-BVOrCreateRestorePointSet `
+                        -Table $CapacityGroups `
+                        -Machine $Machine `
+                        -Parent $SobrName `
+                        -Repository $CapacityRepository `
+                        -Tier 'Capacity'
+
+                    $RestorePointId = ConvertTo-BVIdKey `
+                        $RestorePoint.BackupId
+
+                    if (-not $RestorePointId) {
+                        $FallbackCounter++
+                        $RestorePointId = (
+                            "$ObjectId-$FallbackCounter-" +
+                            "$($CapacityBackup.CreationTime.Ticks)"
+                        )
+                    }
+
+                    $null = $Group.RestoreIds.Add($RestorePointId)
+                }
+            }
         }
 
-        foreach ($g in $CapacityGroups.Values) {
-            [void]$Report.Add([PSCustomObject]@{
-                Machine    = $g.Machine
-                Repository = $g.Repository
-                Tier       = 'Capacity'
-                ParentSOBR = $g.ParentSOBR
-                SortOrder  = $g.SortOrder
-                Versions   = $g.RestoreIds.Count
-            })
+
+        $Report = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($Group in $PerformanceGroups.Values) {
+            $SortOrder = if ($Group.Parent -eq 'Standalone') {
+                1
+            }
+            else {
+                1
+            }
+
+            $Report.Add(
+                [PSCustomObject]@{
+                    Machine    = $Group.Machine
+                    Repository = $Group.Repository
+                    Tier       = $Group.Tier
+                    ParentSOBR = if ($Group.Parent -eq 'Standalone') {
+                        '-'
+                    }
+                    else {
+                        $Group.Parent
+                    }
+                    Versions   = [int64]$Group.Versions
+                    SortOrder  = $SortOrder
+                }
+            )
         }
 
-        # ─── BUILD COMBINED SOBR ROWS ─────────────────────────────────────────
-        # Snapshot base rows now, before combined rows are appended, so the loop
-        # below cannot accidentally include combined rows in the sum.
-        $BaseRows = @($Report)
+
+        foreach ($Group in $CapacityGroups.Values) {
+            $Report.Add(
+                [PSCustomObject]@{
+                    Machine    = $Group.Machine
+                    Repository = $Group.Repository
+                    Tier       = 'Capacity'
+                    ParentSOBR = $Group.Parent
+                    Versions   = [int64]$Group.RestoreIds.Count
+                    SortOrder  = 2
+                }
+            )
+        }
+
 
         $SobrMachineGroups = @{}
-        foreach ($row in $BaseRows) {
-            if ($row.ParentSOBR -and $row.ParentSOBR -ne '-') {
-                $combKey = ('{0}|||{1}' -f $row.Machine, $row.ParentSOBR)
-                if (-not $SobrMachineGroups.ContainsKey($combKey)) {
-                    $SobrMachineGroups[$combKey] = [PSCustomObject]@{
-                        Machine  = $row.Machine
-                        SOBR     = $row.ParentSOBR
-                        Versions = 0
-                    }
-                }
-                $SobrMachineGroups[$combKey].Versions += $row.Versions
+
+        foreach ($Row in @($Report)) {
+            if ($Row.ParentSOBR -eq '-') {
+                continue
             }
+
+            $Key = (
+                $Row.Machine.ToLowerInvariant() +
+                [char]0 +
+                $Row.ParentSOBR.ToLowerInvariant()
+            )
+
+            if (-not $SobrMachineGroups.ContainsKey($Key)) {
+                $SobrMachineGroups[$Key] = [PSCustomObject]@{
+                    Machine  = $Row.Machine
+                    SOBR     = $Row.ParentSOBR
+                    Versions = [int64]0
+                }
+            }
+
+            $SobrMachineGroups[$Key].Versions +=
+                [int64]$Row.Versions
         }
+
 
         foreach ($Combined in $SobrMachineGroups.Values) {
-            [void]$Report.Add([PSCustomObject]@{
-                Machine    = $Combined.Machine
-                Repository = $Combined.SOBR
-                Tier       = 'SOBR combined'
-                ParentSOBR = $Combined.SOBR
-                SortOrder  = 0
-                Versions   = $Combined.Versions
-            })
+            $Report.Add(
+                [PSCustomObject]@{
+                    Machine    = $Combined.Machine
+                    Repository = $Combined.SOBR
+                    Tier       = 'SOBR combined'
+                    ParentSOBR = $Combined.SOBR
+                    Versions   = [int64]$Combined.Versions
+                    SortOrder  = 0
+                }
+            )
         }
 
-        # ─── SORT AND FORMAT OUTPUT ───────────────────────────────────────────
-        $SortedReport = $Report |
-            Sort-Object -Property `
-                @{Expression = {$_.Machine};    Ascending = $true},
-                @{Expression = {$_.ParentSOBR}; Ascending = $true},
-                @{Expression = {$_.SortOrder};  Ascending = $true},
-                @{Expression = {$_.Repository}; Ascending = $true}
+
+        $SortedReport = @(
+            $Report |
+                Sort-Object Machine,
+                            ParentSOBR,
+                            SortOrder,
+                            Repository
+        )
 
         [void]$lines.Add('')
 
