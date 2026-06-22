@@ -25,6 +25,8 @@ The Defined Jobs and Defined Repository blocks are **omitted in `-Json` mode** s
 
 Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available. If dedicated housekeeping session cmdlets are unavailable, the script also uses a `Get-VBRSession` fallback pass to discover relevant offload/repository/configuration sessions.
 
+For in-progress offload sessions, the report includes how long the session has been running (`running_for`) and how much data has been processed so far (`data_processed`) when Veeam exposes it. Running sessions are always retained even when `-OnlyFailures` is used.
+
 ## Requirements
 
 - PowerShell 7 (recommended) or Windows PowerShell 5.1 with VeeamPSSnapIn
@@ -52,7 +54,7 @@ Housekeeping-style processes (configuration backup and repository offload/extent
 |-----------|------|---------|-------------|
 | `-Hours` | int | 24 | Time window in hours (1–8760). Sessions outside this window are ignored. |
 | `-Json` | switch | — | Emit a JSON array on stdout. Progress messages go to the Warning stream. |
-| `-OnlyFailures` | switch | — | Only include jobs with a Failed, Warning, Error, or Stopped last session. |
+| `-OnlyFailures` | switch | — | Only include jobs with a Failed, Warning, Error, or Stopped last session; currently running sessions are always included. |
 
 ## Output
 
@@ -61,6 +63,8 @@ Housekeeping-style processes (configuration backup and repository offload/extent
 **JSON mode** (`-Json`): a single JSON array, one object per job, with fields:
 - `job_name`, `job_type`, `result`
 - `start_time`, `end_time` (ISO 8601)
+- `running_for` (elapsed runtime for in-progress sessions; empty string otherwise)
+- `data_processed` (formatted processed bytes for in-progress sessions when available; empty string otherwise)
 - `last_error` (empty string when there is no error)
 - `warning_details` (deeper per-task/session warning text when available)
 - `source` (which cmdlet enumerated the job)
