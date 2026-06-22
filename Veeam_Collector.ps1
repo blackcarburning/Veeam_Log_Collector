@@ -474,6 +474,7 @@ $script:StartTime    = $script:EndTime.AddHours(-[Math]::Abs($Hours))
 $script:Cutoff       = $script:StartTime
 $script:SeenSessions = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:DJDateFormat = 'dd/MM/yyyy HH:mm'
+$script:RunningStatePattern = 'Working|InProgress|Running|Pending|Starting|Resuming|Stopping'
 
 # ---------------------------------------------------------------------------
 # Write-ProgressMessage
@@ -764,7 +765,7 @@ function Test-SessionIsRunning {
         }
 
         $state = Get-SessionState -Session $Session
-        if (-not [string]::IsNullOrWhiteSpace($state) -and $state -imatch 'Working|InProgress|Running|Pending|Starting|Resuming|Stopping') {
+        if (-not [string]::IsNullOrWhiteSpace($state) -and $state -imatch $script:RunningStatePattern) {
             Write-DebugMessage ('[Test-SessionIsRunning] Session "{0}" matched running state: {1}' -f (Get-SessionName -Session $Session), $state)
             return $true
         }
