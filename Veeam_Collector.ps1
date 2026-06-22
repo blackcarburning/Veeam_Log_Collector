@@ -19,8 +19,9 @@
       4. Task methods (GetLastError()/GetDetails()) for per-object warnings.
 
     The result is a compact, LLM-friendly report showing each job's status and
-    last error text.  No log bundles are created; no Export-VBRLogs calls are
-    made.
+    last error text.  Running offload sessions also include elapsed runtime and
+    processed data-so-far when available.  No log bundles are created; no
+    Export-VBRLogs calls are made.
 
     In normal text mode the report begins with a **Defined Jobs** baseline
     section delimited by:
@@ -58,6 +59,7 @@
 .PARAMETER OnlyFailures
     When set, only include jobs whose most recent session result is Failed,
     Warning, Error, or Stopped.  Successful/skipped jobs are omitted.
+    Running sessions are always retained.
 
 .PARAMETER CollectorDebug
     Enable detailed diagnostic/debug logging.  Debug messages are routed to the
@@ -150,6 +152,9 @@
         to the Warning stream and optionally to -DebugLogPath, never to stdout.
       - The script also attempts to extract deeper per-task warning details from
         task sessions and logger records (without creating log bundles).
+      - Running offload sessions include elapsed runtime (`running_for`) and
+        processed data (`data_processed`) when exposed by Veeam.
+      - Running sessions are never hidden by -OnlyFailures.
       - After the report is built, the same human-readable body is written to
         E:\VEEAM_LOGS\COLLECTOR by default, emailed by default, and old
         collector-created files in that directory are removed after 7 days.
@@ -469,6 +474,7 @@ $script:StartTime    = $script:EndTime.AddHours(-[Math]::Abs($Hours))
 $script:Cutoff       = $script:StartTime
 $script:SeenSessions = New-Object 'System.Collections.Generic.HashSet[string]'
 $script:DJDateFormat = 'dd/MM/yyyy HH:mm'
+$script:RunningStatePattern = 'Working|InProgress|Running|Pending|Starting|Resuming|Stopping'
 
 # ---------------------------------------------------------------------------
 # Write-ProgressMessage
@@ -734,6 +740,139 @@ function Test-SessionInWindow {
     if ($null -ne $start -and $null -eq $end)                    { return $true }
 
     return ($null -eq $start -and $null -eq $end)
+}
+
+# ---------------------------------------------------------------------------
+# Test-SessionIsRunning
+#   Returns $true when a session is currently in progress.
+# ---------------------------------------------------------------------------
+function Test-SessionIsRunning {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Session)
+
+    try {
+        $start = Get-SessionStartTime -Session $Session
+        $end   = Get-SessionEndTime   -Session $Session
+
+        if ($null -ne $end) {
+            Write-DebugMessage ('[Test-SessionIsRunning] Session "{0}" has end time; not running.' -f (Get-SessionName -Session $Session))
+            return $false
+        }
+
+        if ($null -ne $start) {
+            Write-DebugMessage ('[Test-SessionIsRunning] Session "{0}" has start without end; running.' -f (Get-SessionName -Session $Session))
+            return $true
+        }
+
+        $state = Get-SessionState -Session $Session
+        if (-not [string]::IsNullOrWhiteSpace($state) -and $state -imatch $script:RunningStatePattern) {
+            Write-DebugMessage ('[Test-SessionIsRunning] Session "{0}" matched running state: {1}' -f (Get-SessionName -Session $Session), $state)
+            return $true
+        }
+
+        return $false
+    } catch {
+        Write-DebugMessage ('[Test-SessionIsRunning] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Format-RunningDuration
+#   Formats elapsed time from start time to $script:EndTime.
+# ---------------------------------------------------------------------------
+function Format-RunningDuration {
+    [CmdletBinding()]
+    param([AllowNull()] [datetime]$StartTime)
+
+    if ($null -eq $StartTime) { return '' }
+
+    try {
+        $elapsed = $script:EndTime - $StartTime
+        if ($elapsed.Ticks -lt 0) {
+            $elapsed = [timespan]::Zero
+        }
+
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        $days = [int]$elapsed.TotalDays
+        $hours = [int][Math]::Floor($elapsed.TotalHours)
+        $minutes = [int]$elapsed.Minutes
+
+        if ($days -gt 0) {
+            $hoursWithinDay = [int]$elapsed.Hours
+            $formatted = [string]::Format($culture, '{0}d {1:00}h {2:00}m', $days, $hoursWithinDay, $minutes)
+        } else {
+            $formatted = [string]::Format($culture, '{0}h {1:00}m', $hours, $minutes)
+        }
+
+        Write-DebugMessage ('[Format-RunningDuration] start={0:o} end={1:o} duration={2}' -f $StartTime, $script:EndTime, $formatted)
+        return $formatted
+    } catch {
+        Write-DebugMessage ('[Format-RunningDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-SessionRunningDuration
+#   Returns formatted running duration for in-progress sessions.
+# ---------------------------------------------------------------------------
+function Get-SessionRunningDuration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Session)
+
+    try {
+        if (-not (Test-SessionIsRunning -Session $Session)) { return '' }
+
+        $start = Get-SessionStartTime -Session $Session
+        if ($null -eq $start) { return '' }
+
+        return (Format-RunningDuration -StartTime $start)
+    } catch {
+        Write-DebugMessage ('[Get-SessionRunningDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-SessionProcessedBytes
+#   Returns best-effort processed bytes for a session, or $null.
+# ---------------------------------------------------------------------------
+function Get-SessionProcessedBytes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Session)
+
+    try {
+        $progressPropertyNames = @('ProcessedSize', 'TransferedSize', 'TransferredSize', 'ProcessedUsedSize', 'ReadSize')
+        $topLevelPropertyNames = @('ProcessedSize', 'TransferedSize', 'TransferredSize')
+
+        $progress = Get-PropertyValue -InputObject $Session -Names @('Progress')
+        if ($null -ne $progress) {
+            foreach ($name in $progressPropertyNames) {
+                $value = Get-PropertyValue -InputObject $progress -Names @($name)
+                if ($null -ne $value) {
+                    $bytes = ConvertTo-DRBytes -Value $value
+                    Write-DebugMessage ('[Get-SessionProcessedBytes] Session "{0}" matched Progress.{1} raw="{2}" bytes="{3}"' -f (Get-SessionName -Session $Session), $name, $value, $bytes)
+                    if ($null -ne $bytes) { return $bytes }
+                }
+            }
+        }
+
+        foreach ($name in $topLevelPropertyNames) {
+            $value = Get-PropertyValue -InputObject $Session -Names @($name)
+            if ($null -ne $value) {
+                $bytes = ConvertTo-DRBytes -Value $value
+                Write-DebugMessage ('[Get-SessionProcessedBytes] Session "{0}" matched session.{1} raw="{2}" bytes="{3}"' -f (Get-SessionName -Session $Session), $name, $value, $bytes)
+                if ($null -ne $bytes) { return $bytes }
+            }
+        }
+
+        Write-DebugMessage ('[Get-SessionProcessedBytes] Session "{0}" has no usable processed-byte property.' -f (Get-SessionName -Session $Session))
+        return $null
+    } catch {
+        Write-DebugMessage ('[Get-SessionProcessedBytes] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return $null
+    }
 }
 
 function Get-LastErrorText {
@@ -3503,6 +3642,10 @@ function Build-JobReport {
     $result  = Get-SessionState    -Session $Session
     $start   = Get-SessionStartTime -Session $Session
     $end     = Get-SessionEndTime   -Session $Session
+    $isRunning = Test-SessionIsRunning -Session $Session
+    $runningFor = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
+    $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
+    $dataProcessed = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
     $lastErr = Get-LastErrorText    -Session $Session
     $warningDetails = Get-VeeamWarningDetails -Session $Session
 
@@ -3512,6 +3655,8 @@ function Build-JobReport {
         result          = $result
         start_time      = if ($null -ne $start) { $start.ToString('o') } else { $null }
         end_time        = if ($null -ne $end)   { $end.ToString('o')   } else { $null }
+        running_for     = $runningFor
+        data_processed  = $dataProcessed
         last_error      = $lastErr
         warning_details = $warningDetails
         source          = $Source
@@ -3717,6 +3862,17 @@ function New-CollectorReportBody {
             [void]$lines.Add(('Type     : {0}' -f $r.job_type))
             [void]$lines.Add(('Result   : {0}' -f $r.result))
             [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
+
+            $runningFor = Get-PropertyValue -InputObject $r -Names @('running_for')
+            if (-not [string]::IsNullOrWhiteSpace([string]$runningFor)) {
+                [void]$lines.Add(('Running  : {0}' -f $runningFor))
+            }
+
+            $dataProcessed = Get-PropertyValue -InputObject $r -Names @('data_processed')
+            if (-not [string]::IsNullOrWhiteSpace([string]$dataProcessed)) {
+                [void]$lines.Add(('Processed: {0}' -f $dataProcessed))
+            }
+
             if (-not [string]::IsNullOrWhiteSpace([string]$r.last_error)) {
                 [void]$lines.Add(('Error    : {0}' -f $r.last_error))
             }
@@ -4312,6 +4468,10 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
 
                 $sStart         = Get-SessionStartTime   -Session $Session
                 $sEnd           = Get-SessionEndTime     -Session $Session
+                $isRunning      = Test-SessionIsRunning  -Session $Session
+                $runningFor     = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
+                $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
+                $dataProcessed  = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
                 $warningDetails = Get-VeeamWarningDetails -Session $Session
 
                 $report = [pscustomobject][ordered]@{
@@ -4320,6 +4480,8 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
                     result          = $sResult
                     start_time      = if ($null -ne $sStart) { $sStart.ToString('o') } else { $null }
                     end_time        = if ($null -ne $sEnd)   { $sEnd.ToString('o')   } else { $null }
+                    running_for     = $runningFor
+                    data_processed  = $dataProcessed
                     last_error      = $lastError
                     warning_details = $warningDetails
                     source          = 'Get-VBRSession-ArchiveBackup'
@@ -4410,7 +4572,13 @@ Write-DebugMessage ('[Main] Applying OnlyFailures filter. OnlyFailures={0}; inpu
 if ($OnlyFailures) {
     $filtered = foreach ($report in $allReports) {
         $resultText = if ($null -ne $report.result) { [string]$report.result } else { '' }
+        $runningFor = Get-PropertyValue -InputObject $report -Names @('running_for')
         if ($resultText -imatch 'Failed|Warning|Warn|Error|Stopped') {
+            $report
+            continue
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$runningFor)) {
+            Write-DebugMessage ('[Main] Retaining running session under -OnlyFailures: {0}' -f $report.job_name)
             $report
         }
     }
