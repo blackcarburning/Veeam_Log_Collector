@@ -200,13 +200,17 @@
       - Get-VBRRepositoryExtentSyncSession is used when available.  Absence of
         this cmdlet is handled gracefully.
 
-    SOBR archive backup / offload sessions:
-      - Phase 6 uses Get-VBRSession -Type ArchiveBackup to collect SOBR
-        archive-tier backup and offload sessions.  Messages are extracted from
-        both the session-level logger and per-task loggers (via
-        Get-VBRTaskSession) so that individual object errors surface in the
-        report.  The cmdlet and its -Type parameter are checked defensively;
-        the phase is skipped gracefully when either is unavailable.
+    SOBR offload sessions (text mode only):
+      - A single delimited SOBR Offloads section uses Get-VBRSession -Type
+        ArchiveBackup to report all archive/capacity-tier offload sessions in
+        the window (running sessions are always included).  The section is
+        wrapped with:
+            ############### SOBR Offloads BEGIN ###################
+            ############### SOBR Offloads END ###################
+        and contains state, start time, elapsed runtime, progress %,
+        data moved, and task count for each session.  No Logger property is
+        accessed; the phase degrades gracefully when the cmdlet or -Type
+        parameter is unavailable.  The section is omitted from -Json mode.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -3624,960 +3628,11 @@ function New-BackupVersionsSectionText {
     return ($lines -join [Environment]::NewLine)
 }
 
-# ---------------------------------------------------------------------------
-# Build-JobReport
-#   Given a session and metadata, builds one report [pscustomobject].
-# ---------------------------------------------------------------------------
-function Build-JobReport {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [object]$Session,
-        [string]$JobName   = '',
-        [string]$JobType   = '',
-        [string]$Source    = ''
-    )
-
-    $name    = if ($JobName) { $JobName } else { Get-SessionName -Session $Session }
-    $type    = if ($JobType) { $JobType } else { Get-SessionType -Session $Session }
-    $result  = Get-SessionState    -Session $Session
-    $start   = Get-SessionStartTime -Session $Session
-    $end     = Get-SessionEndTime   -Session $Session
-    $isRunning = Test-SessionIsRunning -Session $Session
-    $runningFor = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
-    $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
-    $dataProcessed = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
-    $lastErr = Get-LastErrorText    -Session $Session
-    $warningDetails = Get-VeeamWarningDetails -Session $Session
-
-    return [pscustomobject][ordered]@{
-        job_name        = $name
-        job_type        = $type
-        result          = $result
-        start_time      = if ($null -ne $start) { $start.ToString('o') } else { $null }
-        end_time        = if ($null -ne $end)   { $end.ToString('o')   } else { $null }
-        running_for     = $runningFor
-        data_processed  = $dataProcessed
-        last_error      = $lastErr
-        warning_details = $warningDetails
-        source          = $Source
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Add-JobReportFromJob
-#   Finds the most recent in-window session for a job and appends a report
-#   entry to $Results (passed by [ref]).  De-duplicates via $SeenSessions.
-# ---------------------------------------------------------------------------
-function Add-JobReportFromJob {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [object]$Job,
-        [Parameter(Mandatory)] [string]$Source,
-        [Parameter(Mandatory)] [ref]$Results
-    )
-
-    $jobName = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
-    $jobType = Get-SessionType -Session $Job
-
-    Write-DebugMessage ('[Add-JobReportFromJob] Job="{0}" Type="{1}" Source={2}' -f $jobName, $jobType, $Source)
-    if ($script:CollectorDebugEnabled) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Job object summary:' + [Environment]::NewLine + (Format-VeeamObjectSummary -InputObject $Job))
-    }
-
-    # Collect candidate sessions from the job object.
-    $candidates = New-Object 'System.Collections.Generic.List[object]'
-
-    if ($Job.PSObject.Methods['FindLastSession']) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.FindLastSession() for "{0}"' -f $jobName)
-        try {
-            $s = $Job.FindLastSession()
-            if ($null -ne $s) {
-                Write-DebugMessage ('[Add-JobReportFromJob] FindLastSession() returned: {0}' -f (Get-SessionName -Session $s))
-                [void]$candidates.Add($s)
-            } else {
-                Write-DebugMessage '[Add-JobReportFromJob] FindLastSession() returned null.'
-            }
-        } catch {
-            Write-DebugMessage ('[Add-JobReportFromJob] $Job.FindLastSession() threw:' +
-                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-    }
-
-    if ($Job.PSObject.Methods['FindLastSessions']) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.FindLastSessions() for "{0}"' -f $jobName)
-        try {
-            $found = @($Job.FindLastSessions())
-            Write-DebugMessage ('[Add-JobReportFromJob] FindLastSessions() returned {0} session(s).' -f $found.Count)
-            foreach ($s in $found) {
-                if ($null -ne $s) { [void]$candidates.Add($s) }
-            }
-        } catch {
-            Write-DebugMessage ('[Add-JobReportFromJob] $Job.FindLastSessions() threw:' +
-                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-    }
-
-    if ($Job.PSObject.Methods['GetSessions']) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.GetSessions() for "{0}"' -f $jobName)
-        try {
-            $found = @($Job.GetSessions())
-            Write-DebugMessage ('[Add-JobReportFromJob] GetSessions() returned {0} session(s).' -f $found.Count)
-            foreach ($s in $found) {
-                if ($null -ne $s) { [void]$candidates.Add($s) }
-            }
-        } catch {
-            Write-DebugMessage ('[Add-JobReportFromJob] $Job.GetSessions() threw:' +
-                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-    }
-
-    # Also try Get-VBRBackupSession filtered by job when available.
-    if (Get-Command -Name 'Get-VBRBackupSession' -ErrorAction SilentlyContinue) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Calling Get-VBRBackupSession -Job "{0}"' -f $jobName)
-        try {
-            $bsSessions = @(Get-VBRBackupSession -Job $Job -ErrorAction Stop)
-            Write-DebugMessage ('[Add-JobReportFromJob] Get-VBRBackupSession returned {0} session(s).' -f $bsSessions.Count)
-            foreach ($s in $bsSessions) {
-                if ($null -ne $s) { [void]$candidates.Add($s) }
-            }
-        } catch {
-            Write-DebugMessage ('[Add-JobReportFromJob] Get-VBRBackupSession -Job "{0}" threw:' -f $jobName +
-                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-    }
-
-    # Filter to window and pick the most recent.
-    $inWindow = @($candidates | Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) })
-    Write-DebugMessage ('[Add-JobReportFromJob] "{0}": {1} candidate(s), {2} in window.' -f $jobName, $candidates.Count, $inWindow.Count)
-    if ($inWindow.Count -eq 0) { return }
-
-    # Sort by end time descending, then start time descending; pick first.
-    $sorted = @($inWindow | Sort-Object -Property {
-        $e = Get-SessionEndTime   -Session $_
-        $s = Get-SessionStartTime -Session $_
-        if ($null -ne $e) { Get-SortableTicks -Value $e }
-        elseif ($null -ne $s) { Get-SortableTicks -Value $s }
-        else { [long]0 }
-    } -Descending)
-
-    $session = $sorted[0]
-
-    Write-DebugMessage ('[Add-JobReportFromJob] Selected session for "{0}": {1}' -f $jobName, (Get-SessionName -Session $session))
-    if ($script:CollectorDebugEnabled) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Session object summary:' + [Environment]::NewLine + (Format-VeeamObjectSummary -InputObject $session))
-    }
-
-    $sessionId = Get-ObjectIdentity -InputObject $session
-    if (-not $script:SeenSessions.Add($sessionId)) {
-        Write-DebugMessage ('[Add-JobReportFromJob] Session "{0}" already seen; skipping duplicate.' -f $sessionId)
-        return
-    }
-
-    $report = Build-JobReport -Session $session -JobName $jobName -JobType $jobType -Source $Source
-    Write-DebugMessage ('[Add-JobReportFromJob] Built report for "{0}": result={1}  lastError={2}' `
-        -f $jobName, $report.result, $(if ([string]::IsNullOrWhiteSpace($report.last_error)) { '<none>' } else { $report.last_error }))
-    [void]$Results.Value.Add($report)
-}
-
-# ---------------------------------------------------------------------------
-# Get-CollectorHostName
-# ---------------------------------------------------------------------------
-function Get-CollectorHostName {
-    [CmdletBinding()]
-    param()
-
-    if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
-        return $env:COMPUTERNAME
-    }
-
-    return [System.Environment]::MachineName
-}
-
-# ---------------------------------------------------------------------------
-# New-CollectorReportBody
-#   Returns the single canonical human-readable report string used for console,
-#   disk, and email output. Never includes progress/debug lines.
-# ---------------------------------------------------------------------------
-function New-CollectorReportBody {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Reports,
-        [Parameter(Mandatory)] [int]$TotalJobs,
-        [Parameter(Mandatory)] [int]$FailedCount,
-        [Parameter(Mandatory)] [int]$WarnCount,
-        [Parameter(Mandatory)] [int]$SuccessCount,
-        [Parameter(Mandatory)] [int]$WithError,
-        # Optional Defined Jobs baseline block (text mode only; empty in JSON mode).
-        [string]$DefinedJobsSection = '',
-        # Optional Defined Repository baseline block (text mode only; empty in JSON mode).
-        [string]$DefinedRepositorySection = '',
-        # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
-        [string]$LicensingSection = '',
-        # Optional Backup Versions baseline block (text mode only; empty in JSON mode).
-        [string]$BackupVersionsSection = ''
-    )
-
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
-
-    [void]$lines.Add('============================================================')
-    [void]$lines.Add('Veeam Last-Error Report')
-    [void]$lines.Add(('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
-    [void]$lines.Add(('Host       : {0}' -f (Get-CollectorHostName)))
-    [void]$lines.Add(('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion))
-    [void]$lines.Add('============================================================')
-    [void]$lines.Add('')
-
-    # Defined baseline sections (text mode only — never populated in JSON mode)
-    $hasBaselineSection = $false
-    if (-not [string]::IsNullOrWhiteSpace($DefinedJobsSection)) {
-        [void]$lines.Add($DefinedJobsSection)
-        $hasBaselineSection = $true
-    }
-    if (-not [string]::IsNullOrWhiteSpace($DefinedRepositorySection)) {
-        [void]$lines.Add($DefinedRepositorySection)
-        $hasBaselineSection = $true
-    }
-    if (-not [string]::IsNullOrWhiteSpace($LicensingSection)) {
-        [void]$lines.Add($LicensingSection)
-        $hasBaselineSection = $true
-    }
-    if (-not [string]::IsNullOrWhiteSpace($BackupVersionsSection)) {
-        [void]$lines.Add($BackupVersionsSection)
-        $hasBaselineSection = $true
-    }
-    if ($hasBaselineSection) {
-        [void]$lines.Add('')
-    }
-
-    if ($Reports.Count -eq 0) {
-        if ($OnlyFailures) {
-            [void]$lines.Add('No Failed or Warning sessions found in the specified window.')
-        } else {
-            [void]$lines.Add('No sessions found in the specified window.')
-        }
-    } else {
-        foreach ($r in $Reports) {
-            [void]$lines.Add(('Job      : {0}' -f $r.job_name))
-            [void]$lines.Add(('Type     : {0}' -f $r.job_type))
-            [void]$lines.Add(('Result   : {0}' -f $r.result))
-            [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
-
-            $runningFor = Get-PropertyValue -InputObject $r -Names @('running_for')
-            if (-not [string]::IsNullOrWhiteSpace([string]$runningFor)) {
-                [void]$lines.Add(('Running  : {0}' -f $runningFor))
-            }
-
-            $dataProcessed = Get-PropertyValue -InputObject $r -Names @('data_processed')
-            if (-not [string]::IsNullOrWhiteSpace([string]$dataProcessed)) {
-                [void]$lines.Add(('Processed: {0}' -f $dataProcessed))
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace([string]$r.last_error)) {
-                [void]$lines.Add(('Error    : {0}' -f $r.last_error))
-            }
-
-            $warningDetails = Get-PropertyValue -InputObject $r -Names @('warning_details')
-            if (-not [string]::IsNullOrWhiteSpace([string]$warningDetails)) {
-                [void]$lines.Add(('Warning  : {0}' -f $warningDetails))
-            }
-
-            [void]$lines.Add('')
-        }
-    }
-
-    [void]$lines.Add('------------------------------------------------------------')
-    [void]$lines.Add(('Window   : last {0} hour(s)  ({1:o}  to  {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
-    [void]$lines.Add(('Jobs     : {0}  (Failed: {1}  Warning: {2}  Success: {3}  WithError: {4})' `
-        -f $TotalJobs, $FailedCount, $WarnCount, $SuccessCount, $WithError))
-    [void]$lines.Add('------------------------------------------------------------')
-
-    return ($lines -join [Environment]::NewLine)
-}
-
-# ---------------------------------------------------------------------------
-# Get-CollectorReportFilePath
-# ---------------------------------------------------------------------------
-function Get-CollectorReportFilePath {
-    [CmdletBinding()]
-    param()
-
-    $timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
-    return [IO.Path]::Combine($ReportOutputDirectory, ('Veeam_Collector_Report_{0}.txt' -f $timestamp))
-}
-
-# ---------------------------------------------------------------------------
-# Write-CollectorReportBodyToDisk
-# ---------------------------------------------------------------------------
-function Write-CollectorReportBodyToDisk {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [string]$Body)
-
-    try {
-        if (-not (Test-Path -LiteralPath $ReportOutputDirectory)) {
-            $null = New-Item -ItemType Directory -Path $ReportOutputDirectory -Force
-        }
-
-        $path = Get-CollectorReportFilePath
-        [System.IO.File]::WriteAllText($path, $Body, [System.Text.Encoding]::UTF8)
-        Write-ProgressMessage ('Report body written to: {0}' -f $path)
-        return $path
-    } catch {
-        Write-Warning ('Unable to write report body to "{0}": {1}' -f $ReportOutputDirectory, $_.Exception.Message)
-        Write-DebugMessage ('[Write-CollectorReportBodyToDisk] Failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        return ''
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Get-CollectorMailSubject
-# ---------------------------------------------------------------------------
-function Get-CollectorMailSubject {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [int]$FailedCount,
-        [Parameter(Mandatory)] [int]$WarnCount
-    )
-
-    return ('Veeam Last-Error Report - {0} - Failed: {1} Warning: {2}' -f (Get-CollectorHostName), $FailedCount, $WarnCount)
-}
-
-# ---------------------------------------------------------------------------
-# Send-CollectorReportEmail
-# ---------------------------------------------------------------------------
-function Send-CollectorReportEmail {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [string]$Body,
-        [Parameter(Mandatory)] [string]$Subject
-    )
-
-    if ($DisableEmail) {
-        Write-ProgressMessage 'Email delivery disabled by -DisableEmail.'
-        return $false
-    }
-
-    $recipients = @(
-        foreach ($recipient in $MailTo) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$recipient)) {
-                [string]$recipient
-            }
-        }
-    )
-
-    if ($recipients.Count -eq 0) {
-        Write-Warning 'Email delivery skipped because no recipients were configured.'
-        return $false
-    }
-
-    try {
-        $mailMessage = New-Object 'System.Net.Mail.MailMessage'
-        try {
-            $mailMessage.From = $MailFrom
-            foreach ($recipient in $recipients) {
-                [void]$mailMessage.To.Add($recipient)
-            }
-            $mailMessage.Subject = $Subject
-            $mailMessage.Body = $Body
-            $mailMessage.IsBodyHtml = $false
-
-            $smtpClient = New-Object 'System.Net.Mail.SmtpClient'($SmtpServer)
-            try {
-                $smtpClient.Send($mailMessage)
-            } finally {
-                $smtpClient.Dispose()
-            }
-        } finally {
-            $mailMessage.Dispose()
-        }
-
-        Write-ProgressMessage ('Report email sent to: {0}' -f ($recipients -join ', '))
-        return $true
-    } catch {
-        Write-Warning ('Unable to send report email via "{0}": {1}' -f $SmtpServer, $_.Exception.Message)
-        Write-DebugMessage ('[Send-CollectorReportEmail] Failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        return $false
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Remove-OldCollectorFiles
-# ---------------------------------------------------------------------------
-function Remove-OldCollectorFiles {
-    [CmdletBinding()]
-    param()
-
-    if (-not (Test-Path -LiteralPath $ReportOutputDirectory)) {
-        Write-DebugMessage ('[Remove-OldCollectorFiles] Directory not found, skipping cleanup: {0}' -f $ReportOutputDirectory)
-        return
-    }
-
-    $cutoff = (Get-Date).AddDays(-1 * $RetentionDays)
-    $patterns = @(
-        'Veeam_Collector_Report_*.txt',
-        'Veeam_Collector_*.log',
-        'veeam-collector-debug-*.log'
-    )
-
-    try {
-        $staleFiles = @(Get-ChildItem -LiteralPath $ReportOutputDirectory -File -ErrorAction Stop | Where-Object {
-            $file = $_
-            if ($file.LastWriteTime -ge $cutoff) { return $false }
-
-            foreach ($pattern in $patterns) {
-                if ($file.Name -like $pattern) {
-                    return $true
-                }
-            }
-
-            return $false
-        })
-
-        foreach ($file in $staleFiles) {
-            try {
-                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
-                Write-ProgressMessage ('Removed old collector file: {0}' -f $file.FullName)
-            } catch {
-                Write-Warning ('Unable to remove old collector file "{0}": {1}' -f $file.FullName, $_.Exception.Message)
-                Write-DebugMessage ('[Remove-OldCollectorFiles] Remove failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-            }
-        }
-
-        if ($staleFiles.Count -eq 0) {
-            Write-ProgressMessage ('No collector report/log files older than {0} day(s) found in {1}.' -f $RetentionDays, $ReportOutputDirectory)
-        }
-    } catch {
-        Write-Warning ('Unable to clean up old collector files in "{0}": {1}' -f $ReportOutputDirectory, $_.Exception.Message)
-        Write-DebugMessage ('[Remove-OldCollectorFiles] Enumeration failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    }
-}
-
 # ===========================================================================
-# Main
+# SOBR Offload section — helper functions
+#   P10-prefixed to avoid collisions with existing collector functions.
+#   These helpers are used by New-SobrOffloadSectionText.
 # ===========================================================================
-
-# Top-level fatal error trap — catches any terminating error that escapes the
-# structured try/catch blocks below, emits a FATAL diagnostic record, and
-# exits with a non-zero code so callers detect the failure.
-trap {
-    $fatalMsg = '[FATAL] Veeam_Collector.ps1 terminated with an unhandled error.'
-    Write-Warning $fatalMsg
-    # Use Write-DebugMessage for the detail record; it handles both Warning stream
-    # and file append in one place.  The plain Write-Warning above always fires so
-    # callers see the FATAL line even when -CollectorDebug is not set.
-    Write-DebugMessage ('FATAL error detail:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    $host.SetShouldExit(1)
-    break
-}
-
-Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
-    -f $Hours, $script:StartTime, $script:EndTime)
-
-Import-VeeamPowerShell
-Write-EnvironmentDiagnostics
-
-# ---------------------------------------------------------------------------
-# Defined Jobs baseline — collected once immediately after Veeam PowerShell
-# loads so it reflects the current job inventory.  Skipped in JSON mode to
-# keep stdout a pure JSON array.
-# ---------------------------------------------------------------------------
-$definedJobsSection = ''
-$definedRepositorySection = ''
-$licensingSection = ''
-$backupVersionsSection = ''
-if (-not $Json) {
-    Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
-    try {
-        $definedJobsSection = New-DefinedJobsSectionText
-        Write-DebugMessage ('[Main] Defined Jobs section ready, {0} char(s).' -f $definedJobsSection.Length)
-    } catch {
-        Write-Warning ('Defined Jobs baseline failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Defined Jobs baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $definedJobsSection = ''
-    }
-
-}
-
-$allReports = New-Object 'System.Collections.Generic.List[object]'
-
-# Job objects collected from Phase 1/2 (retained for potential future use).
-$sessionFallbackJobs = New-Object 'System.Collections.Generic.List[object]'
-
-# ---------------------------------------------------------------------------
-# Phase 1 — Regular VBR jobs via Get-VBRJob
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 1 — Enumerating regular jobs (Get-VBRJob).'
-Write-DebugMessage '[Main] Phase 1 — Get-VBRJob'
-if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
-    try {
-        Write-DebugMessage '[Main] Calling Get-VBRJob ...'
-        $vbrJobs = @(Get-VBRJob -ErrorAction Stop -WarningAction SilentlyContinue)
-        Write-ProgressMessage ('  Found {0} job(s) via Get-VBRJob.' -f $vbrJobs.Count)
-        Write-DebugMessage ('[Main] Get-VBRJob returned {0} job(s).' -f $vbrJobs.Count)
-        $idx = 0
-        foreach ($job in $vbrJobs) {
-            $idx++
-            $jn = if ($null -ne $job.PSObject.Properties['Name']) { $job.Name } else { '<unnamed>' }
-            Write-ProgressMessage ('  Job {0}/{1}: {2}' -f $idx, $vbrJobs.Count, $jn)
-            try {
-                Add-JobReportFromJob -Job $job -Source 'Get-VBRJob' -Results ([ref]$allReports)
-            } catch {
-                Write-Warning ('  Unable to process job "{0}": {1}' -f $jn, $_.Exception.Message)
-                Write-DebugMessage ('[Main] Add-JobReportFromJob failed for "{0}":' -f $jn +
-                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-            }
-            [void]$sessionFallbackJobs.Add($job)
-            Write-DebugMessage ('[Main] Added Phase 1 job "{0}" to sessionFallbackJobs (count={1}).' -f $jn, $sessionFallbackJobs.Count)
-        }
-    } catch {
-        Write-Warning ('Unable to enumerate jobs via Get-VBRJob: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Get-VBRJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    }
-} else {
-    Write-ProgressMessage '  Get-VBRJob not available. Skipping.'
-    Write-DebugMessage '[Main] Get-VBRJob cmdlet not found.'
-}
-
-# ---------------------------------------------------------------------------
-# Phase 2 — Computer/agent backup jobs via Get-VBRComputerBackupJob
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 2 — Computer/agent backup jobs (Get-VBRComputerBackupJob).'
-Write-DebugMessage '[Main] Phase 2 — Get-VBRComputerBackupJob'
-if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) {
-    try {
-        Write-DebugMessage '[Main] Calling Get-VBRComputerBackupJob ...'
-        $computerJobs = @(Get-VBRComputerBackupJob -ErrorAction Stop -WarningAction SilentlyContinue)
-        Write-ProgressMessage ('  Found {0} computer backup job(s).' -f $computerJobs.Count)
-        Write-DebugMessage ('[Main] Get-VBRComputerBackupJob returned {0} job(s).' -f $computerJobs.Count)
-        $idx = 0
-        foreach ($job in $computerJobs) {
-            $idx++
-            $jn = if ($null -ne $job.PSObject.Properties['Name']) { $job.Name } else { '<unnamed>' }
-            Write-ProgressMessage ('  Computer job {0}/{1}: {2}' -f $idx, $computerJobs.Count, $jn)
-            try {
-                Add-JobReportFromJob -Job $job -Source 'Get-VBRComputerBackupJob' -Results ([ref]$allReports)
-            } catch {
-                Write-Warning ('  Unable to process computer backup job "{0}": {1}' -f $jn, $_.Exception.Message)
-                Write-DebugMessage ('[Main] Add-JobReportFromJob failed for computer job "{0}":' -f $jn +
-                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-            }
-            [void]$sessionFallbackJobs.Add($job)
-            Write-DebugMessage ('[Main] Added Phase 2 job "{0}" to sessionFallbackJobs (count={1}).' -f $jn, $sessionFallbackJobs.Count)
-        }
-    } catch {
-        Write-Warning ('Unable to enumerate computer backup jobs: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Get-VBRComputerBackupJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    }
-} else {
-    Write-ProgressMessage '  Get-VBRComputerBackupJob not available. Skipping.'
-    Write-DebugMessage '[Main] Get-VBRComputerBackupJob cmdlet not found.'
-}
-
-# ---------------------------------------------------------------------------
-# Phase 3 — SOBR capacity-tier offload sessions
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 3 — SOBR capacity-tier offload (Get-VBRCapacityTierSyncSession).'
-Write-DebugMessage '[Main] Phase 3 — Get-VBRCapacityTierSyncSession'
-if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyContinue) {
-    try {
-        Write-DebugMessage '[Main] Calling Get-VBRCapacityTierSyncSession ...'
-        $sobrSessions = @(Get-VBRCapacityTierSyncSession -ErrorAction Stop)
-        Write-ProgressMessage ('  Found {0} capacity-tier session(s).' -f $sobrSessions.Count)
-        Write-DebugMessage ('[Main] Get-VBRCapacityTierSyncSession returned {0} session(s).' -f $sobrSessions.Count)
-        $inWindow = @($sobrSessions | Where-Object { Test-SessionInWindow -Session $_ })
-        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
-        Write-DebugMessage ('[Main] SOBR sessions in window: {0}' -f $inWindow.Count)
-
-        # For SOBR sessions there is no parent job object — report per session.
-        # Group by name to pick the most-recent per named offload job.
-        $grouped = @{}
-        foreach ($s in $inWindow) {
-            $sName = Get-SessionName -Session $s
-            $sEnd  = Get-SessionEndTime -Session $s
-            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
-                $st = Get-SessionStartTime -Session $s
-                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
-            }
-            if (-not $grouped.ContainsKey($sName)) {
-                $grouped[$sName] = @{ Session = $s; Time = $sTime }
-            } elseif ($sTime -gt $grouped[$sName].Time) {
-                $grouped[$sName] = @{ Session = $s; Time = $sTime }
-            }
-        }
-
-        foreach ($entry in $grouped.Values) {
-            $s = $entry.Session
-            $sessionId = Get-ObjectIdentity -InputObject $s
-            if (-not $script:SeenSessions.Add($sessionId)) { continue }
-            $report = Build-JobReport -Session $s -JobType 'CapacityTierSync' -Source 'Get-VBRCapacityTierSyncSession'
-            Write-DebugMessage ('[Main] SOBR report: name={0} result={1}' -f $report.job_name, $report.result)
-            [void]$allReports.Add($report)
-        }
-    } catch {
-        Write-Warning ('Unable to enumerate capacity-tier sessions: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Get-VBRCapacityTierSyncSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    }
-} else {
-    Write-ProgressMessage '  Get-VBRCapacityTierSyncSession not available. Skipping.'
-    Write-DebugMessage '[Main] Get-VBRCapacityTierSyncSession cmdlet not found.'
-}
-
-# ---------------------------------------------------------------------------
-# Phase 4 — Configuration backup sessions (housekeeping)
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 4 — Configuration backup (Get-VBRConfigurationBackupJobSession / Get-VBRConfigurationBackupJob).'
-Write-DebugMessage '[Main] Phase 4 — Configuration backup sessions'
-$configBackupHandled = $false
-
-if (Get-Command -Name 'Get-VBRConfigurationBackupJobSession' -ErrorAction SilentlyContinue) {
-    try {
-        Write-DebugMessage '[Main] Calling Get-VBRConfigurationBackupJobSession ...'
-        $configSessions = @(Get-VBRConfigurationBackupJobSession -ErrorAction Stop)
-        Write-ProgressMessage ('  Found {0} configuration backup session(s).' -f $configSessions.Count)
-        Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJobSession returned {0} session(s).' -f $configSessions.Count)
-        $inWindow = @($configSessions | Where-Object { Test-SessionInWindow -Session $_ })
-        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
-        Write-DebugMessage ('[Main] Configuration backup sessions in window: {0}' -f $inWindow.Count)
-
-        # There is normally one configuration backup job; group defensively to pick
-        # the most-recent session per logical job name.
-        $grouped = @{}
-        foreach ($s in $inWindow) {
-            $sName = Get-SessionName -Session $s
-            $sEnd  = Get-SessionEndTime -Session $s
-            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
-                $st = Get-SessionStartTime -Session $s
-                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
-            }
-            if (-not $grouped.ContainsKey($sName)) {
-                $grouped[$sName] = @{ Session = $s; Time = $sTime }
-            } elseif ($sTime -gt $grouped[$sName].Time) {
-                $grouped[$sName] = @{ Session = $s; Time = $sTime }
-            }
-        }
-
-        foreach ($entry in $grouped.Values) {
-            $s = $entry.Session
-            $sessionId = Get-ObjectIdentity -InputObject $s
-            if (-not $script:SeenSessions.Add($sessionId)) { continue }
-            $report = Build-JobReport -Session $s -JobType 'ConfigurationBackup' -Source 'Get-VBRConfigurationBackupJobSession'
-            Write-DebugMessage ('[Main] Config backup report: name={0} result={1}' -f $report.job_name, $report.result)
-            [void]$allReports.Add($report)
-        }
-        $configBackupHandled = $true
-    } catch {
-        Write-Warning ('Unable to enumerate configuration backup sessions: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJobSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    }
-} else {
-    Write-ProgressMessage '  Get-VBRConfigurationBackupJobSession not available.'
-    Write-DebugMessage '[Main] Get-VBRConfigurationBackupJobSession cmdlet not found.'
-}
-
-# Fallback: if the dedicated session cmdlet was unavailable or threw, try via the job object.
-if (-not $configBackupHandled) {
-    if (Get-Command -Name 'Get-VBRConfigurationBackupJob' -ErrorAction SilentlyContinue) {
-        try {
-            Write-DebugMessage '[Main] Calling Get-VBRConfigurationBackupJob (fallback) ...'
-            $configJob = Get-VBRConfigurationBackupJob -ErrorAction Stop
-            if ($null -ne $configJob) {
-                $jn = if ($null -ne $configJob.PSObject.Properties['Name']) { [string]$configJob.Name } else { 'ConfigurationBackup' }
-                Write-ProgressMessage ('  Configuration backup job found: {0}' -f $jn)
-                try {
-                    Add-JobReportFromJob -Job $configJob -Source 'Get-VBRConfigurationBackupJob' -Results ([ref]$allReports)
-                } catch {
-                    Write-Warning ('  Unable to process configuration backup job "{0}": {1}' -f $jn, $_.Exception.Message)
-                    Write-DebugMessage ('[Main] Add-JobReportFromJob failed for config backup job "{0}":' -f $jn +
-                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                }
-            } else {
-                Write-ProgressMessage '  Get-VBRConfigurationBackupJob returned no job.'
-                Write-DebugMessage '[Main] Get-VBRConfigurationBackupJob returned null.'
-            }
-        } catch {
-            Write-Warning ('Unable to get configuration backup job: {0}' -f $_.Exception.Message)
-            Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-    } else {
-        Write-ProgressMessage '  Get-VBRConfigurationBackupJob not available. Skipping.'
-        Write-DebugMessage '[Main] Get-VBRConfigurationBackupJob cmdlet not found.'
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Phase 5 — Repository offload / extent-sync sessions (housekeeping)
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 5 — Repository offload sessions (Get-VBRRepositoryExtentSyncSession).'
-Write-DebugMessage '[Main] Phase 5 — Repository offload / extent-sync sessions'
-if (Get-Command -Name 'Get-VBRRepositoryExtentSyncSession' -ErrorAction SilentlyContinue) {
-    try {
-        Write-DebugMessage '[Main] Calling Get-VBRRepositoryExtentSyncSession ...'
-        $repoOffloadSessions = @(Get-VBRRepositoryExtentSyncSession -ErrorAction Stop)
-        Write-ProgressMessage ('  Found {0} repository offload session(s).' -f $repoOffloadSessions.Count)
-        Write-DebugMessage ('[Main] Get-VBRRepositoryExtentSyncSession returned {0} session(s).' -f $repoOffloadSessions.Count)
-        $inWindow = @($repoOffloadSessions | Where-Object { Test-SessionInWindow -Session $_ })
-        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
-        Write-DebugMessage ('[Main] Repository offload sessions in window: {0}' -f $inWindow.Count)
-
-        # Group by name to pick the most-recent session per repository/offload job.
-        $grouped = @{}
-        foreach ($s in $inWindow) {
-            $sName = Get-SessionName -Session $s
-            $sEnd  = Get-SessionEndTime -Session $s
-            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
-                $st = Get-SessionStartTime -Session $s
-                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
-            }
-            if (-not $grouped.ContainsKey($sName)) {
-                $grouped[$sName] = @{ Session = $s; Time = $sTime }
-            } elseif ($sTime -gt $grouped[$sName].Time) {
-                $grouped[$sName] = @{ Session = $s; Time = $sTime }
-            }
-        }
-
-        foreach ($entry in $grouped.Values) {
-            $s = $entry.Session
-            $sessionId = Get-ObjectIdentity -InputObject $s
-            if (-not $script:SeenSessions.Add($sessionId)) { continue }
-            $report = Build-JobReport -Session $s -JobType 'RepositoryOffload' -Source 'Get-VBRRepositoryExtentSyncSession'
-            Write-DebugMessage ('[Main] Repo offload report: name={0} result={1}' -f $report.job_name, $report.result)
-            [void]$allReports.Add($report)
-        }
-    } catch {
-        Write-Warning ('Unable to enumerate repository offload sessions: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Get-VBRRepositoryExtentSyncSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-    }
-} else {
-    Write-ProgressMessage '  Get-VBRRepositoryExtentSyncSession not available. Skipping.'
-    Write-DebugMessage '[Main] Get-VBRRepositoryExtentSyncSession cmdlet not found.'
-}
-
-# ---------------------------------------------------------------------------
-# Phase 6 — SOBR archive backup / offload sessions (Get-VBRSession -Type ArchiveBackup)
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 6 — SOBR archive backup sessions (Get-VBRSession -Type ArchiveBackup).'
-Write-DebugMessage '[Main] Phase 6 — Get-VBRSession -Type ArchiveBackup'
-if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
-    if (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Type') {
-        try {
-            Write-DebugMessage '[Main] Calling Get-VBRSession -Type ArchiveBackup ...'
-            $archiveSessions = @(
-                Get-VBRSession -Type ArchiveBackup -ErrorAction Stop |
-                    Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) } |
-                    Sort-Object CreationTime -Descending
-            )
-            Write-ProgressMessage ('  Found {0} SOBR archive session(s) in window.' -f $archiveSessions.Count)
-            Write-DebugMessage ('[Main] Get-VBRSession -Type ArchiveBackup returned {0} session(s) in window.' -f $archiveSessions.Count)
-
-            foreach ($Session in $archiveSessions) {
-                $sessionId = Get-ObjectIdentity -InputObject $Session
-                if (-not $script:SeenSessions.Add($sessionId)) { continue }
-
-                $sName = Get-SessionName -Session $Session
-                Write-DebugMessage ('[Main] Processing SOBR archive session: {0}' -f $sName)
-
-                # Collect messages: session-level logger records
-                $messages = New-Object 'System.Collections.Generic.List[string]'
-
-                try {
-                    Write-DebugMessage ('[Main] Reading session logger for: {0}' -f $sName)
-                    $sessionLog = if ($null -ne $Session.Logger) { $Session.Logger.GetLog() } else { $null }
-                    if ($null -ne $sessionLog) {
-                        foreach ($Record in $sessionLog.UpdatedRecords) {
-                            if (
-                                [string]$Record.Status -match 'Fail|Error|Warning' -or
-                                $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
-                            ) {
-                                if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
-                                    [void]$messages.Add($Record.Title)
-                                }
-                            }
-                        }
-                    }
-                } catch {
-                    Write-DebugMessage ('[Main] Session logger read failed for "{0}":' -f $sName +
-                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                    [void]$messages.Add("Unable to read session log: $($_.Exception.Message)")
-                }
-
-                # Collect messages: task sessions via Get-VBRTaskSession
-                try {
-                    Write-DebugMessage ('[Main] Calling Get-VBRTaskSession for: {0}' -f $sName)
-                    $Tasks = @(Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue)
-                    Write-DebugMessage ('[Main] Get-VBRTaskSession returned {0} task(s) for: {1}' -f $Tasks.Count, $sName)
-
-                    foreach ($Task in $Tasks) {
-                        $taskName = if ($null -ne $Task -and $null -ne $Task.PSObject.Properties['Name']) { [string]$Task.Name } else { '<unnamed>' }
-
-                        # Task failure reason
-                        try {
-                            if (
-                                $null -ne $Task.Info -and
-                                -not [string]::IsNullOrWhiteSpace($Task.Info.Reason) -and
-                                $Task.Info.Reason -notmatch 'Success'
-                            ) {
-                                Write-DebugMessage ('[Main] Task "{0}" reason: {1}' -f $taskName, $Task.Info.Reason)
-                                [void]$messages.Add(('{0}: {1}' -f $taskName, $Task.Info.Reason))
-                            }
-                        } catch {
-                            Write-DebugMessage ('[Main] Task reason access failed for "{0}":' -f $taskName +
-                                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                        }
-
-                        # Task logger records
-                        try {
-                            Write-DebugMessage ('[Main] Reading task logger for: {0}' -f $taskName)
-                            $taskLog = if ($null -ne $Task.Logger) { $Task.Logger.GetLog() } else { $null }
-                            if ($null -ne $taskLog) {
-                                foreach ($Record in $taskLog.UpdatedRecords) {
-                                    if (
-                                        [string]$Record.Status -match 'Fail|Error|Warning' -or
-                                        $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
-                                    ) {
-                                        if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
-                                            [void]$messages.Add(('{0}: {1}' -f $taskName, $Record.Title))
-                                        }
-                                    }
-                                }
-                            }
-                        } catch {
-                            Write-DebugMessage ('[Main] Task logger read failed for "{0}":' -f $taskName +
-                                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                        }
-                    }
-                } catch {
-                    Write-DebugMessage ('[Main] Get-VBRTaskSession failed for "{0}":' -f $sName +
-                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                }
-
-                # De-duplicate messages and build last_error string
-                $uniqueMessages = @(
-                    $messages |
-                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-                        Select-Object -Unique
-                )
-
-                $sResult = Get-SessionState -Session $Session
-                $lastError = if ($uniqueMessages.Count -gt 0) {
-                    $uniqueMessages -join '; '
-                } elseif ($sResult -eq 'Success') {
-                    'None'
-                } else {
-                    ''
-                }
-
-                $sStart         = Get-SessionStartTime   -Session $Session
-                $sEnd           = Get-SessionEndTime     -Session $Session
-                $isRunning      = Test-SessionIsRunning  -Session $Session
-                $runningFor     = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
-                $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
-                $dataProcessed  = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
-                $warningDetails = Get-VeeamWarningDetails -Session $Session
-
-                $report = [pscustomobject][ordered]@{
-                    job_name        = $sName
-                    job_type        = 'SOBRArchiveBackup'
-                    result          = $sResult
-                    start_time      = if ($null -ne $sStart) { $sStart.ToString('o') } else { $null }
-                    end_time        = if ($null -ne $sEnd)   { $sEnd.ToString('o')   } else { $null }
-                    running_for     = $runningFor
-                    data_processed  = $dataProcessed
-                    last_error      = $lastError
-                    warning_details = $warningDetails
-                    source          = 'Get-VBRSession-ArchiveBackup'
-                }
-
-                Write-DebugMessage ('[Main] SOBR archive report: name={0} result={1} last_error={2}' -f $report.job_name, $report.result, $report.last_error)
-                [void]$allReports.Add($report)
-            }
-        } catch {
-            Write-Warning ('Unable to enumerate SOBR archive backup sessions: {0}' -f $_.Exception.Message)
-            Write-DebugMessage ('[Main] Get-VBRSession -Type ArchiveBackup threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        }
-    } else {
-        Write-ProgressMessage '  Get-VBRSession does not support -Type parameter. Skipping SOBR archive phase.'
-        Write-DebugMessage '[Main] Get-VBRSession has no -Type parameter; skipping Phase 6.'
-    }
-} else {
-    Write-ProgressMessage '  Get-VBRSession not available. Skipping SOBR archive phase.'
-    Write-DebugMessage '[Main] Get-VBRSession cmdlet not found; skipping Phase 6.'
-}
-
-# ---------------------------------------------------------------------------
-# Phase 7 — Defined Repository baseline (text mode only)
-#   Collects repository utilisation and stores it in $definedRepositorySection
-#   so it can be included in the human-readable report body.
-#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 7 — Defined Repository baseline (repository utilisation).'
-Write-DebugMessage '[Main] Phase 7 — Defined Repository baseline.'
-if (-not $Json) {
-    try {
-        $definedRepositorySection = New-DefinedRepositorySectionText
-        Write-DebugMessage ('[Main] Defined Repository section ready, {0} char(s).' -f $definedRepositorySection.Length)
-    } catch {
-        Write-Warning ('Defined Repository baseline failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Defined Repository baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $definedRepositorySection = New-DefinedRepositoryPlaceholderSection -Message '(repository utilisation unavailable)'
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Phase 8 — VBR Licensing (text mode only)
-#   Collects license information and stores it in $licensingSection so it can
-#   be included in the human-readable report body after the repository section.
-#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 8 — VBR Licensing (license information).'
-Write-DebugMessage '[Main] Phase 8 — VBR Licensing.'
-if (-not $Json) {
-    try {
-        $licensingSection = New-VBRLicensingSectionText
-        Write-DebugMessage ('[Main] Licensing section ready, {0} char(s).' -f $licensingSection.Length)
-    } catch {
-        Write-Warning ('VBR Licensing phase failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] VBR Licensing phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $licensingSection = ''
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Phase 9 — Backup Versions (text mode only)
-#   Counts the number of backup versions per machine in each repository and
-#   stores the result in $backupVersionsSection so it can be included in the
-#   human-readable report body after the licensing section.
-#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 9 — Backup Versions (versions per machine per repository).'
-Write-DebugMessage '[Main] Phase 9 — Backup Versions.'
-if (-not $Json) {
-    try {
-        $backupVersionsSection = New-BackupVersionsSectionText
-        Write-DebugMessage ('[Main] Backup Versions section ready, {0} char(s).' -f $backupVersionsSection.Length)
-    } catch {
-        Write-Warning ('Backup Versions phase failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Backup Versions phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $backupVersionsSection = ''
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Phase 10 — Working SOBR offloads (live ArchiveBackup sessions)
-#   Reports currently-running SOBR capacity/archive-tier offload sessions with
-#   state, start time, elapsed runtime, progress %, data moved, and task count.
-#   Optional per-task detail table is gated behind $P10ShowTaskDetails.
-#   This block is self-contained: it defines its own helpers (P10-prefixed) so
-#   it does not collide with the collector's existing functions.
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 10 — Working SOBR offloads (live ArchiveBackup sessions).'
-Write-DebugMessage '[Main] Phase 10 — Working SOBR offloads.'
-
-# Set to $true to show the individual tasks below the summary.
-$P10ShowTaskDetails = $false
-
-# ============================================================================
-# Phase 10 Helpers
-# ============================================================================
 
 function Get-P10PropertyPathValue {
     param (
@@ -4849,233 +3904,977 @@ function Get-P10TaskTransferInformation {
 }
 
 
-# ============================================================================
-# Find active SOBR offload sessions
-# ============================================================================
+# ---------------------------------------------------------------------------
+# New-SobrOffloadSectionText
+#   Builds and returns the SOBR Offloads baseline block as a single string.
+#   Reports all SOBR archive/capacity-tier offload sessions within the time
+#   window (running sessions are always included).
+#   Returns an error line inside the delimiters on failure; never throws.
+#   Always returns empty string in JSON mode.
+# ---------------------------------------------------------------------------
+function New-SobrOffloadSectionText {
+    [CmdletBinding()]
+    param()
 
-$P10ActiveStates = @(
-    'Starting'
-    'Working'
-    'Stopping'
-    'Pausing'
-    'Resuming'
-    'Idle'
-    'Postprocessing'
-    'WaitingRepository'
-    'Pending'
-)
+    if ($Json) { return '' }
 
-$P10Sessions = @(
-    Get-VBRSession `
-        -Type ArchiveBackup `
-        -ErrorAction SilentlyContinue |
-        Where-Object {
-            [string]$_.State -in $P10ActiveStates
-        }
-)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    [void]$lines.Add('############### SOBR Offloads BEGIN ###################')
 
-if ($P10Sessions.Count -eq 0) {
-    Write-Host 'No SOBR offloads are currently running.'
-}
-else {
+    try {
+        Write-ProgressMessage 'SOBR Offloads — collecting archive/offload sessions...'
+        Write-DebugMessage '[New-SobrOffloadSectionText] Starting SOBR offload collection.'
 
-    # ============================================================================
-    # Build report
-    # ============================================================================
-
-    $P10Report = [System.Collections.Generic.List[object]]::new()
-    $P10TaskReport = [System.Collections.Generic.List[object]]::new()
-
-    foreach ($OriginalSession in $P10Sessions) {
-        # Refresh the session so its state and progress are current.
-        try {
-            $Session = Get-VBRSession `
-                -Session $OriginalSession `
-                -ErrorAction Stop
-        }
-        catch {
-            $Session = $OriginalSession
+        if (-not (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)) {
+            [void]$lines.Add('(Get-VBRSession cmdlet not available; skipping SOBR offload section)')
+            [void]$lines.Add('############### SOBR Offloads END ###################')
+            return ($lines -join [Environment]::NewLine)
         }
 
-        if ([string]$Session.State -notin $P10ActiveStates) {
-            continue
+        if (-not (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Type')) {
+            [void]$lines.Add('(Get-VBRSession does not support -Type parameter; skipping SOBR offload section)')
+            [void]$lines.Add('############### SOBR Offloads END ###################')
+            return ($lines -join [Environment]::NewLine)
         }
 
-        $StartTime = Get-P10PropertyPathValue `
-            -InputObject $Session `
-            -Paths @(
-                'CreationTime'
-                'StartTime'
-                'CreationTimeLocal'
-                'Info.CreationTime'
-            )
-
-        try {
-            $StartTime = [datetime]$StartTime
-        }
-        catch {
-            $StartTime = $null
-        }
-
-        $RunTime = if ($StartTime) {
-            (Get-Date) - $StartTime
-        }
-        else {
-            [timespan]::Zero
-        }
-
-        $Tasks = @(
-            Get-VBRTaskSession `
-                -Session $Session `
-                -ErrorAction SilentlyContinue
+        $sobrSessions = @(
+            Get-VBRSession -Type ArchiveBackup -ErrorAction Stop |
+                Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) } |
+                Sort-Object -Property @(
+                    @{ Expression = { [string]$_.Name }; Descending = $false }
+                )
         )
 
-        $Transfer = Get-P10TaskTransferInformation -Tasks $Tasks
+        Write-ProgressMessage ('SOBR Offloads — {0} session(s) found in window.' -f $sobrSessions.Count)
+        Write-DebugMessage ('[New-SobrOffloadSectionText] {0} session(s) in window.' -f $sobrSessions.Count)
 
-        # Some builds expose transfer information at session level instead.
-        if ($null -eq $Transfer.Bytes) {
-            $SessionTransfer = Get-P10FirstNumericValue `
+        if ($sobrSessions.Count -eq 0) {
+            [void]$lines.Add('No SOBR offloads found.')
+            [void]$lines.Add('############### SOBR Offloads END ###################')
+            return ($lines -join [Environment]::NewLine)
+        }
+
+        $reportRows = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($OriginalSession in $sobrSessions) {
+            # Attempt to refresh session state; fall back to original on error.
+            $Session = $OriginalSession
+            try {
+                $Refreshed = Get-VBRSession -Session $OriginalSession -ErrorAction Stop
+                if ($null -ne $Refreshed) {
+                    $Session = $Refreshed
+                }
+            } catch {
+                Write-DebugMessage ('[New-SobrOffloadSectionText] Session refresh failed for "{0}": {1}' -f [string]$OriginalSession.Name, $_.Exception.Message)
+            }
+
+            $StartTime = Get-P10PropertyPathValue `
                 -InputObject $Session `
                 -Paths @(
-                    'Info.Progress.TransferedSize'
-                    'Info.Progress.TransferredSize'
-                    'Progress.TransferedSize'
-                    'Progress.TransferredSize'
+                    'CreationTime'
+                    'StartTime'
+                    'CreationTimeLocal'
+                    'Info.CreationTime'
                 )
 
-            if ($SessionTransfer.Found) {
-                $Transfer = [PSCustomObject]@{
-                    Bytes   = [double]$SessionTransfer.Value
-                    Measure = 'Session transferred'
-                }
+            try {
+                $StartTime = [datetime]$StartTime
+            } catch {
+                $StartTime = $null
             }
-        }
 
-        $Progress = Get-P10SessionProgressPercent -Session $Session
-
-        $P10Report.Add(
-            [PSCustomObject]@{
-                SOBROffload = [string]$Session.Name
-                State       = [string]$Session.State
-                Started     = if ($StartTime) {
-                    $StartTime.ToString('dd/MM/yyyy HH:mm')
-                }
-                else {
-                    'Unknown'
-                }
-                Running     = Format-P10RunTime -Duration $RunTime
-                Progress    = if ($null -ne $Progress) {
-                    "$Progress%"
-                }
-                else {
-                    'N/A'
-                }
-                DataMoved   = Format-P10ByteSize -Bytes $Transfer.Bytes
-                Measure     = $Transfer.Measure
-                Tasks       = $Tasks.Count
+            $RunTime = if ($null -ne $StartTime) {
+                (Get-Date) - $StartTime
+            } else {
+                [timespan]::Zero
             }
-        )
 
-        if ($P10ShowTaskDetails) {
-            foreach ($Task in $Tasks) {
-                $TaskTransfer = Get-P10FirstNumericValue `
-                    -InputObject $Task `
+            $Tasks = @(
+                Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue
+            )
+
+            $Transfer = Get-P10TaskTransferInformation -Tasks $Tasks
+
+            # Some builds expose transfer information at session level instead.
+            if ($null -eq $Transfer.Bytes) {
+                $SessionTransfer = Get-P10FirstNumericValue `
+                    -InputObject $Session `
                     -Paths @(
-                        'Progress.TransferedSize'
-                        'Progress.TransferredSize'
                         'Info.Progress.TransferedSize'
                         'Info.Progress.TransferredSize'
+                        'Progress.TransferedSize'
+                        'Progress.TransferredSize'
                     )
 
-                $TaskProcessed = Get-P10FirstNumericValue `
-                    -InputObject $Task `
-                    -Paths @(
-                        'Progress.ProcessedSize'
-                        'Info.Progress.ProcessedSize'
-                    )
-
-                $TaskStart = Get-P10PropertyPathValue `
-                    -InputObject $Task `
-                    -Paths @(
-                        'Progress.StartTime'
-                        'Info.Progress.StartTime'
-                        'CreationTime'
-                    )
-
-                try {
-                    $TaskStart = [datetime]$TaskStart
-                }
-                catch {
-                    $TaskStart = $null
-                }
-
-                $P10TaskReport.Add(
-                    [PSCustomObject]@{
-                        SOBROffload = [string]$Session.Name
-                        Task        = [string]$Task.Name
-                        Status      = [string]$Task.Status
-                        Started     = if ($TaskStart) {
-                            $TaskStart.ToString('dd/MM/yyyy HH:mm')
-                        }
-                        else {
-                            'Unknown'
-                        }
-                        Transferred = if ($TaskTransfer.Found) {
-                            Format-P10ByteSize $TaskTransfer.Value
-                        }
-                        else {
-                            'N/A'
-                        }
-                        Processed   = if ($TaskProcessed.Found) {
-                            Format-P10ByteSize $TaskProcessed.Value
-                        }
-                        else {
-                            'N/A'
-                        }
+                if ($SessionTransfer.Found) {
+                    $Transfer = [PSCustomObject]@{
+                        Bytes   = [double]$SessionTransfer.Value
+                        Measure = 'Session transferred'
                     }
-                )
+                }
+            }
+
+            $Progress = Get-P10SessionProgressPercent -Session $Session
+
+            $reportRows.Add(
+                [PSCustomObject]@{
+                    SOBROffload = [string]$Session.Name
+                    State       = [string]$Session.State
+                    Started     = if ($null -ne $StartTime) {
+                        $StartTime.ToString('dd/MM/yyyy HH:mm')
+                    } else {
+                        'Unknown'
+                    }
+                    Running     = Format-P10RunTime -Duration $RunTime
+                    Progress    = if ($null -ne $Progress) { "$Progress%" } else { 'N/A' }
+                    DataMoved   = Format-P10ByteSize -Bytes $Transfer.Bytes
+                    Measure     = $Transfer.Measure
+                    Tasks       = $Tasks.Count
+                }
+            )
+        }
+
+        if ($reportRows.Count -eq 0) {
+            [void]$lines.Add('No SOBR offloads found.')
+        } else {
+            $tableText = $reportRows |
+                Format-Table `
+                    @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=36},
+                    @{Label='State';        Expression={$_.State};       Width=17},
+                    @{Label='Started';      Expression={$_.Started};     Width=16},
+                    @{Label='Running';      Expression={$_.Running};     Width=13},
+                    @{Label='Progress';     Expression={$_.Progress};    Width=8},
+                    @{Label='Data moved';   Expression={$_.DataMoved};   Width=12},
+                    @{Label='Measure';      Expression={$_.Measure};     Width=18},
+                    @{Label='Tasks';        Expression={$_.Tasks};       Width=5} |
+                Out-String
+
+            foreach ($tl in ($tableText -split '\r?\n')) {
+                [void]$lines.Add($tl)
             }
         }
+
+        Write-DebugMessage '[New-SobrOffloadSectionText] SOBR offload section complete.'
+
+    } catch {
+        Write-Warning ('SOBR Offloads collection failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[New-SobrOffloadSectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        [void]$lines.Add(('Unable to collect SOBR offload sessions: {0}' -f $_.Exception.Message))
     }
 
+    [void]$lines.Add('############### SOBR Offloads END ###################')
+    return ($lines -join [Environment]::NewLine)
+}
 
-    # ============================================================================
-    # Display
-    # ============================================================================
+# ---------------------------------------------------------------------------
+# Build-JobReport
+#   Given a session and metadata, builds one report [pscustomobject].
+# ---------------------------------------------------------------------------
+function Build-JobReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$Session,
+        [string]$JobName   = '',
+        [string]$JobType   = '',
+        [string]$Source    = ''
+    )
 
-    if ($P10Report.Count -eq 0) {
-        Write-Host 'No SOBR offloads are currently running.'
+    $name    = if ($JobName) { $JobName } else { Get-SessionName -Session $Session }
+    $type    = if ($JobType) { $JobType } else { Get-SessionType -Session $Session }
+    $result  = Get-SessionState    -Session $Session
+    $start   = Get-SessionStartTime -Session $Session
+    $end     = Get-SessionEndTime   -Session $Session
+    $isRunning = Test-SessionIsRunning -Session $Session
+    $runningFor = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
+    $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
+    $dataProcessed = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
+    $lastErr = Get-LastErrorText    -Session $Session
+    $warningDetails = Get-VeeamWarningDetails -Session $Session
+
+    return [pscustomobject][ordered]@{
+        job_name        = $name
+        job_type        = $type
+        result          = $result
+        start_time      = if ($null -ne $start) { $start.ToString('o') } else { $null }
+        end_time        = if ($null -ne $end)   { $end.ToString('o')   } else { $null }
+        running_for     = $runningFor
+        data_processed  = $dataProcessed
+        last_error      = $lastErr
+        warning_details = $warningDetails
+        source          = $Source
     }
-    else {
+}
 
-        Write-Host "`nRUNNING SOBR OFFLOADS" -ForegroundColor Cyan
+# ---------------------------------------------------------------------------
+# Add-JobReportFromJob
+#   Finds the most recent in-window session for a job and appends a report
+#   entry to $Results (passed by [ref]).  De-duplicates via $SeenSessions.
+# ---------------------------------------------------------------------------
+function Add-JobReportFromJob {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [object]$Job,
+        [Parameter(Mandatory)] [string]$Source,
+        [Parameter(Mandatory)] [ref]$Results
+    )
 
-        $P10Report |
-            Sort-Object SOBROffload |
-            Format-Table `
-                @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=36},
-                @{Label='State';        Expression={$_.State};       Width=17},
-                @{Label='Started';      Expression={$_.Started};     Width=16},
-                @{Label='Running';      Expression={$_.Running};     Width=13},
-                @{Label='Progress';     Expression={$_.Progress};    Width=8},
-                @{Label='Data moved';   Expression={$_.DataMoved};   Width=12},
-                @{Label='Measure';      Expression={$_.Measure};     Width=18},
-                @{Label='Tasks';        Expression={$_.Tasks};       Width=5}
+    $jobName = if ($null -ne $Job.PSObject.Properties['Name']) { [string]$Job.Name } else { '<unnamed>' }
+    $jobType = Get-SessionType -Session $Job
 
+    Write-DebugMessage ('[Add-JobReportFromJob] Job="{0}" Type="{1}" Source={2}' -f $jobName, $jobType, $Source)
+    if ($script:CollectorDebugEnabled) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Job object summary:' + [Environment]::NewLine + (Format-VeeamObjectSummary -InputObject $Job))
+    }
 
-        if ($P10ShowTaskDetails -and $P10TaskReport.Count -gt 0) {
-            Write-Host "`nOFFLOAD TASK DETAILS" -ForegroundColor Cyan
+    # Collect candidate sessions from the job object.
+    $candidates = New-Object 'System.Collections.Generic.List[object]'
 
-            $P10TaskReport |
-                Sort-Object SOBROffload, Task |
-                Format-Table `
-                    @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=30},
-                    @{Label='Task';         Expression={$_.Task};        Width=38},
-                    @{Label='Status';       Expression={$_.Status};      Width=11},
-                    @{Label='Started';      Expression={$_.Started};     Width=16},
-                    @{Label='Transferred';  Expression={$_.Transferred}; Width=12},
-                    @{Label='Processed';    Expression={$_.Processed};   Width=12}
+    if ($Job.PSObject.Methods['FindLastSession']) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.FindLastSession() for "{0}"' -f $jobName)
+        try {
+            $s = $Job.FindLastSession()
+            if ($null -ne $s) {
+                Write-DebugMessage ('[Add-JobReportFromJob] FindLastSession() returned: {0}' -f (Get-SessionName -Session $s))
+                [void]$candidates.Add($s)
+            } else {
+                Write-DebugMessage '[Add-JobReportFromJob] FindLastSession() returned null.'
+            }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] $Job.FindLastSession() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         }
+    }
+
+    if ($Job.PSObject.Methods['FindLastSessions']) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.FindLastSessions() for "{0}"' -f $jobName)
+        try {
+            $found = @($Job.FindLastSessions())
+            Write-DebugMessage ('[Add-JobReportFromJob] FindLastSessions() returned {0} session(s).' -f $found.Count)
+            foreach ($s in $found) {
+                if ($null -ne $s) { [void]$candidates.Add($s) }
+            }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] $Job.FindLastSessions() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    }
+
+    if ($Job.PSObject.Methods['GetSessions']) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling $Job.GetSessions() for "{0}"' -f $jobName)
+        try {
+            $found = @($Job.GetSessions())
+            Write-DebugMessage ('[Add-JobReportFromJob] GetSessions() returned {0} session(s).' -f $found.Count)
+            foreach ($s in $found) {
+                if ($null -ne $s) { [void]$candidates.Add($s) }
+            }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] $Job.GetSessions() threw:' +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    }
+
+    # Also try Get-VBRBackupSession filtered by job when available.
+    if (Get-Command -Name 'Get-VBRBackupSession' -ErrorAction SilentlyContinue) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Calling Get-VBRBackupSession -Job "{0}"' -f $jobName)
+        try {
+            $bsSessions = @(Get-VBRBackupSession -Job $Job -ErrorAction Stop)
+            Write-DebugMessage ('[Add-JobReportFromJob] Get-VBRBackupSession returned {0} session(s).' -f $bsSessions.Count)
+            foreach ($s in $bsSessions) {
+                if ($null -ne $s) { [void]$candidates.Add($s) }
+            }
+        } catch {
+            Write-DebugMessage ('[Add-JobReportFromJob] Get-VBRBackupSession -Job "{0}" threw:' -f $jobName +
+                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    }
+
+    # Filter to window and pick the most recent.
+    $inWindow = @($candidates | Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) })
+    Write-DebugMessage ('[Add-JobReportFromJob] "{0}": {1} candidate(s), {2} in window.' -f $jobName, $candidates.Count, $inWindow.Count)
+    if ($inWindow.Count -eq 0) { return }
+
+    # Sort by end time descending, then start time descending; pick first.
+    $sorted = @($inWindow | Sort-Object -Property {
+        $e = Get-SessionEndTime   -Session $_
+        $s = Get-SessionStartTime -Session $_
+        if ($null -ne $e) { Get-SortableTicks -Value $e }
+        elseif ($null -ne $s) { Get-SortableTicks -Value $s }
+        else { [long]0 }
+    } -Descending)
+
+    $session = $sorted[0]
+
+    Write-DebugMessage ('[Add-JobReportFromJob] Selected session for "{0}": {1}' -f $jobName, (Get-SessionName -Session $session))
+    if ($script:CollectorDebugEnabled) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Session object summary:' + [Environment]::NewLine + (Format-VeeamObjectSummary -InputObject $session))
+    }
+
+    $sessionId = Get-ObjectIdentity -InputObject $session
+    if (-not $script:SeenSessions.Add($sessionId)) {
+        Write-DebugMessage ('[Add-JobReportFromJob] Session "{0}" already seen; skipping duplicate.' -f $sessionId)
+        return
+    }
+
+    $report = Build-JobReport -Session $session -JobName $jobName -JobType $jobType -Source $Source
+    Write-DebugMessage ('[Add-JobReportFromJob] Built report for "{0}": result={1}  lastError={2}' `
+        -f $jobName, $report.result, $(if ([string]::IsNullOrWhiteSpace($report.last_error)) { '<none>' } else { $report.last_error }))
+    [void]$Results.Value.Add($report)
+}
+
+# ---------------------------------------------------------------------------
+# Get-CollectorHostName
+# ---------------------------------------------------------------------------
+function Get-CollectorHostName {
+    [CmdletBinding()]
+    param()
+
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+        return $env:COMPUTERNAME
+    }
+
+    return [System.Environment]::MachineName
+}
+
+# ---------------------------------------------------------------------------
+# New-CollectorReportBody
+#   Returns the single canonical human-readable report string used for console,
+#   disk, and email output. Never includes progress/debug lines.
+# ---------------------------------------------------------------------------
+function New-CollectorReportBody {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Reports,
+        [Parameter(Mandatory)] [int]$TotalJobs,
+        [Parameter(Mandatory)] [int]$FailedCount,
+        [Parameter(Mandatory)] [int]$WarnCount,
+        [Parameter(Mandatory)] [int]$SuccessCount,
+        [Parameter(Mandatory)] [int]$WithError,
+        # Optional Defined Jobs baseline block (text mode only; empty in JSON mode).
+        [string]$DefinedJobsSection = '',
+        # Optional Defined Repository baseline block (text mode only; empty in JSON mode).
+        [string]$DefinedRepositorySection = '',
+        # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
+        [string]$LicensingSection = '',
+        # Optional Backup Versions baseline block (text mode only; empty in JSON mode).
+        [string]$BackupVersionsSection = '',
+        # Optional SOBR Offloads section (text mode only; empty in JSON mode).
+        [string]$SobrOffloadSection = ''
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
+
+    [void]$lines.Add('============================================================')
+    [void]$lines.Add('Veeam Last-Error Report')
+    [void]$lines.Add(('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
+    [void]$lines.Add(('Host       : {0}' -f (Get-CollectorHostName)))
+    [void]$lines.Add(('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion))
+    [void]$lines.Add('============================================================')
+    [void]$lines.Add('')
+
+    # Defined baseline sections (text mode only — never populated in JSON mode)
+    $hasBaselineSection = $false
+    if (-not [string]::IsNullOrWhiteSpace($DefinedJobsSection)) {
+        [void]$lines.Add($DefinedJobsSection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DefinedRepositorySection)) {
+        [void]$lines.Add($DefinedRepositorySection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LicensingSection)) {
+        [void]$lines.Add($LicensingSection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BackupVersionsSection)) {
+        [void]$lines.Add($BackupVersionsSection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SobrOffloadSection)) {
+        [void]$lines.Add($SobrOffloadSection)
+        $hasBaselineSection = $true
+    }
+    if ($hasBaselineSection) {
+        [void]$lines.Add('')
+    }
+
+    if ($Reports.Count -eq 0) {
+        if ($OnlyFailures) {
+            [void]$lines.Add('No Failed or Warning sessions found in the specified window.')
+        } else {
+            [void]$lines.Add('No sessions found in the specified window.')
+        }
+    } else {
+        foreach ($r in $Reports) {
+            [void]$lines.Add(('Job      : {0}' -f $r.job_name))
+            [void]$lines.Add(('Type     : {0}' -f $r.job_type))
+            [void]$lines.Add(('Result   : {0}' -f $r.result))
+            [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
+
+            $runningFor = Get-PropertyValue -InputObject $r -Names @('running_for')
+            if (-not [string]::IsNullOrWhiteSpace([string]$runningFor)) {
+                [void]$lines.Add(('Running  : {0}' -f $runningFor))
+            }
+
+            $dataProcessed = Get-PropertyValue -InputObject $r -Names @('data_processed')
+            if (-not [string]::IsNullOrWhiteSpace([string]$dataProcessed)) {
+                [void]$lines.Add(('Processed: {0}' -f $dataProcessed))
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$r.last_error)) {
+                [void]$lines.Add(('Error    : {0}' -f $r.last_error))
+            }
+
+            $warningDetails = Get-PropertyValue -InputObject $r -Names @('warning_details')
+            if (-not [string]::IsNullOrWhiteSpace([string]$warningDetails)) {
+                [void]$lines.Add(('Warning  : {0}' -f $warningDetails))
+            }
+
+            [void]$lines.Add('')
+        }
+    }
+
+    [void]$lines.Add('------------------------------------------------------------')
+    [void]$lines.Add(('Window   : last {0} hour(s)  ({1:o}  to  {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
+    [void]$lines.Add(('Jobs     : {0}  (Failed: {1}  Warning: {2}  Success: {3}  WithError: {4})' `
+        -f $TotalJobs, $FailedCount, $WarnCount, $SuccessCount, $WithError))
+    [void]$lines.Add('------------------------------------------------------------')
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+# ---------------------------------------------------------------------------
+# Get-CollectorReportFilePath
+# ---------------------------------------------------------------------------
+function Get-CollectorReportFilePath {
+    [CmdletBinding()]
+    param()
+
+    $timestamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+    return [IO.Path]::Combine($ReportOutputDirectory, ('Veeam_Collector_Report_{0}.txt' -f $timestamp))
+}
+
+# ---------------------------------------------------------------------------
+# Write-CollectorReportBodyToDisk
+# ---------------------------------------------------------------------------
+function Write-CollectorReportBodyToDisk {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string]$Body)
+
+    try {
+        if (-not (Test-Path -LiteralPath $ReportOutputDirectory)) {
+            $null = New-Item -ItemType Directory -Path $ReportOutputDirectory -Force
+        }
+
+        $path = Get-CollectorReportFilePath
+        [System.IO.File]::WriteAllText($path, $Body, [System.Text.Encoding]::UTF8)
+        Write-ProgressMessage ('Report body written to: {0}' -f $path)
+        return $path
+    } catch {
+        Write-Warning ('Unable to write report body to "{0}": {1}' -f $ReportOutputDirectory, $_.Exception.Message)
+        Write-DebugMessage ('[Write-CollectorReportBodyToDisk] Failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Get-CollectorMailSubject
+# ---------------------------------------------------------------------------
+function Get-CollectorMailSubject {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [int]$FailedCount,
+        [Parameter(Mandatory)] [int]$WarnCount
+    )
+
+    return ('Veeam Last-Error Report - {0} - Failed: {1} Warning: {2}' -f (Get-CollectorHostName), $FailedCount, $WarnCount)
+}
+
+# ---------------------------------------------------------------------------
+# Send-CollectorReportEmail
+# ---------------------------------------------------------------------------
+function Send-CollectorReportEmail {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$Body,
+        [Parameter(Mandatory)] [string]$Subject
+    )
+
+    if ($DisableEmail) {
+        Write-ProgressMessage 'Email delivery disabled by -DisableEmail.'
+        return $false
+    }
+
+    $recipients = @(
+        foreach ($recipient in $MailTo) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$recipient)) {
+                [string]$recipient
+            }
+        }
+    )
+
+    if ($recipients.Count -eq 0) {
+        Write-Warning 'Email delivery skipped because no recipients were configured.'
+        return $false
+    }
+
+    try {
+        $mailMessage = New-Object 'System.Net.Mail.MailMessage'
+        try {
+            $mailMessage.From = $MailFrom
+            foreach ($recipient in $recipients) {
+                [void]$mailMessage.To.Add($recipient)
+            }
+            $mailMessage.Subject = $Subject
+            $mailMessage.Body = $Body
+            $mailMessage.IsBodyHtml = $false
+
+            $smtpClient = New-Object 'System.Net.Mail.SmtpClient'($SmtpServer)
+            try {
+                $smtpClient.Send($mailMessage)
+            } finally {
+                $smtpClient.Dispose()
+            }
+        } finally {
+            $mailMessage.Dispose()
+        }
+
+        Write-ProgressMessage ('Report email sent to: {0}' -f ($recipients -join ', '))
+        return $true
+    } catch {
+        Write-Warning ('Unable to send report email via "{0}": {1}' -f $SmtpServer, $_.Exception.Message)
+        Write-DebugMessage ('[Send-CollectorReportEmail] Failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Remove-OldCollectorFiles
+# ---------------------------------------------------------------------------
+function Remove-OldCollectorFiles {
+    [CmdletBinding()]
+    param()
+
+    if (-not (Test-Path -LiteralPath $ReportOutputDirectory)) {
+        Write-DebugMessage ('[Remove-OldCollectorFiles] Directory not found, skipping cleanup: {0}' -f $ReportOutputDirectory)
+        return
+    }
+
+    $cutoff = (Get-Date).AddDays(-1 * $RetentionDays)
+    $patterns = @(
+        'Veeam_Collector_Report_*.txt',
+        'Veeam_Collector_*.log',
+        'veeam-collector-debug-*.log'
+    )
+
+    try {
+        $staleFiles = @(Get-ChildItem -LiteralPath $ReportOutputDirectory -File -ErrorAction Stop | Where-Object {
+            $file = $_
+            if ($file.LastWriteTime -ge $cutoff) { return $false }
+
+            foreach ($pattern in $patterns) {
+                if ($file.Name -like $pattern) {
+                    return $true
+                }
+            }
+
+            return $false
+        })
+
+        foreach ($file in $staleFiles) {
+            try {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                Write-ProgressMessage ('Removed old collector file: {0}' -f $file.FullName)
+            } catch {
+                Write-Warning ('Unable to remove old collector file "{0}": {1}' -f $file.FullName, $_.Exception.Message)
+                Write-DebugMessage ('[Remove-OldCollectorFiles] Remove failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+            }
+        }
+
+        if ($staleFiles.Count -eq 0) {
+            Write-ProgressMessage ('No collector report/log files older than {0} day(s) found in {1}.' -f $RetentionDays, $ReportOutputDirectory)
+        }
+    } catch {
+        Write-Warning ('Unable to clean up old collector files in "{0}": {1}' -f $ReportOutputDirectory, $_.Exception.Message)
+        Write-DebugMessage ('[Remove-OldCollectorFiles] Enumeration failure:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+# Top-level fatal error trap — catches any terminating error that escapes the
+# structured try/catch blocks below, emits a FATAL diagnostic record, and
+# exits with a non-zero code so callers detect the failure.
+trap {
+    $fatalMsg = '[FATAL] Veeam_Collector.ps1 terminated with an unhandled error.'
+    Write-Warning $fatalMsg
+    # Use Write-DebugMessage for the detail record; it handles both Warning stream
+    # and file append in one place.  The plain Write-Warning above always fires so
+    # callers see the FATAL line even when -CollectorDebug is not set.
+    Write-DebugMessage ('FATAL error detail:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    $host.SetShouldExit(1)
+    break
+}
+
+Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
+    -f $Hours, $script:StartTime, $script:EndTime)
+
+Import-VeeamPowerShell
+Write-EnvironmentDiagnostics
+
+# ---------------------------------------------------------------------------
+# Defined Jobs baseline — collected once immediately after Veeam PowerShell
+# loads so it reflects the current job inventory.  Skipped in JSON mode to
+# keep stdout a pure JSON array.
+# ---------------------------------------------------------------------------
+$definedJobsSection = ''
+$definedRepositorySection = ''
+$licensingSection = ''
+$backupVersionsSection = ''
+$sobrOffloadSection = ''
+if (-not $Json) {
+    Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
+    try {
+        $definedJobsSection = New-DefinedJobsSectionText
+        Write-DebugMessage ('[Main] Defined Jobs section ready, {0} char(s).' -f $definedJobsSection.Length)
+    } catch {
+        Write-Warning ('Defined Jobs baseline failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Defined Jobs baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $definedJobsSection = ''
+    }
+
+}
+
+$allReports = New-Object 'System.Collections.Generic.List[object]'
+
+# Job objects collected from Phase 1/2 (retained for potential future use).
+$sessionFallbackJobs = New-Object 'System.Collections.Generic.List[object]'
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Regular VBR jobs via Get-VBRJob
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 1 — Enumerating regular jobs (Get-VBRJob).'
+Write-DebugMessage '[Main] Phase 1 — Get-VBRJob'
+if (Get-Command -Name 'Get-VBRJob' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRJob ...'
+        $vbrJobs = @(Get-VBRJob -ErrorAction Stop -WarningAction SilentlyContinue)
+        Write-ProgressMessage ('  Found {0} job(s) via Get-VBRJob.' -f $vbrJobs.Count)
+        Write-DebugMessage ('[Main] Get-VBRJob returned {0} job(s).' -f $vbrJobs.Count)
+        $idx = 0
+        foreach ($job in $vbrJobs) {
+            $idx++
+            $jn = if ($null -ne $job.PSObject.Properties['Name']) { $job.Name } else { '<unnamed>' }
+            Write-ProgressMessage ('  Job {0}/{1}: {2}' -f $idx, $vbrJobs.Count, $jn)
+            try {
+                Add-JobReportFromJob -Job $job -Source 'Get-VBRJob' -Results ([ref]$allReports)
+            } catch {
+                Write-Warning ('  Unable to process job "{0}": {1}' -f $jn, $_.Exception.Message)
+                Write-DebugMessage ('[Main] Add-JobReportFromJob failed for "{0}":' -f $jn +
+                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+            }
+            [void]$sessionFallbackJobs.Add($job)
+            Write-DebugMessage ('[Main] Added Phase 1 job "{0}" to sessionFallbackJobs (count={1}).' -f $jn, $sessionFallbackJobs.Count)
+        }
+    } catch {
+        Write-Warning ('Unable to enumerate jobs via Get-VBRJob: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRJob not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRJob cmdlet not found.'
+}
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Computer/agent backup jobs via Get-VBRComputerBackupJob
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 2 — Computer/agent backup jobs (Get-VBRComputerBackupJob).'
+Write-DebugMessage '[Main] Phase 2 — Get-VBRComputerBackupJob'
+if (Get-Command -Name 'Get-VBRComputerBackupJob' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRComputerBackupJob ...'
+        $computerJobs = @(Get-VBRComputerBackupJob -ErrorAction Stop -WarningAction SilentlyContinue)
+        Write-ProgressMessage ('  Found {0} computer backup job(s).' -f $computerJobs.Count)
+        Write-DebugMessage ('[Main] Get-VBRComputerBackupJob returned {0} job(s).' -f $computerJobs.Count)
+        $idx = 0
+        foreach ($job in $computerJobs) {
+            $idx++
+            $jn = if ($null -ne $job.PSObject.Properties['Name']) { $job.Name } else { '<unnamed>' }
+            Write-ProgressMessage ('  Computer job {0}/{1}: {2}' -f $idx, $computerJobs.Count, $jn)
+            try {
+                Add-JobReportFromJob -Job $job -Source 'Get-VBRComputerBackupJob' -Results ([ref]$allReports)
+            } catch {
+                Write-Warning ('  Unable to process computer backup job "{0}": {1}' -f $jn, $_.Exception.Message)
+                Write-DebugMessage ('[Main] Add-JobReportFromJob failed for computer job "{0}":' -f $jn +
+                    [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+            }
+            [void]$sessionFallbackJobs.Add($job)
+            Write-DebugMessage ('[Main] Added Phase 2 job "{0}" to sessionFallbackJobs (count={1}).' -f $jn, $sessionFallbackJobs.Count)
+        }
+    } catch {
+        Write-Warning ('Unable to enumerate computer backup jobs: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRComputerBackupJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRComputerBackupJob not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRComputerBackupJob cmdlet not found.'
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3 — SOBR capacity-tier offload sessions
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 3 — SOBR capacity-tier offload (Get-VBRCapacityTierSyncSession).'
+Write-DebugMessage '[Main] Phase 3 — Get-VBRCapacityTierSyncSession'
+if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRCapacityTierSyncSession ...'
+        $sobrSessions = @(Get-VBRCapacityTierSyncSession -ErrorAction Stop)
+        Write-ProgressMessage ('  Found {0} capacity-tier session(s).' -f $sobrSessions.Count)
+        Write-DebugMessage ('[Main] Get-VBRCapacityTierSyncSession returned {0} session(s).' -f $sobrSessions.Count)
+        $inWindow = @($sobrSessions | Where-Object { Test-SessionInWindow -Session $_ })
+        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] SOBR sessions in window: {0}' -f $inWindow.Count)
+
+        # For SOBR sessions there is no parent job object — report per session.
+        # Group by name to pick the most-recent per named offload job.
+        $grouped = @{}
+        foreach ($s in $inWindow) {
+            $sName = Get-SessionName -Session $s
+            $sEnd  = Get-SessionEndTime -Session $s
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
+                $st = Get-SessionStartTime -Session $s
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
+            }
+            if (-not $grouped.ContainsKey($sName)) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            } elseif ($sTime -gt $grouped[$sName].Time) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            }
+        }
+
+        foreach ($entry in $grouped.Values) {
+            $s = $entry.Session
+            $sessionId = Get-ObjectIdentity -InputObject $s
+            if (-not $script:SeenSessions.Add($sessionId)) { continue }
+            $report = Build-JobReport -Session $s -JobType 'CapacityTierSync' -Source 'Get-VBRCapacityTierSyncSession'
+            Write-DebugMessage ('[Main] SOBR report: name={0} result={1}' -f $report.job_name, $report.result)
+            [void]$allReports.Add($report)
+        }
+    } catch {
+        Write-Warning ('Unable to enumerate capacity-tier sessions: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRCapacityTierSyncSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRCapacityTierSyncSession not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRCapacityTierSyncSession cmdlet not found.'
+}
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Configuration backup sessions (housekeeping)
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 4 — Configuration backup (Get-VBRConfigurationBackupJobSession / Get-VBRConfigurationBackupJob).'
+Write-DebugMessage '[Main] Phase 4 — Configuration backup sessions'
+$configBackupHandled = $false
+
+if (Get-Command -Name 'Get-VBRConfigurationBackupJobSession' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRConfigurationBackupJobSession ...'
+        $configSessions = @(Get-VBRConfigurationBackupJobSession -ErrorAction Stop)
+        Write-ProgressMessage ('  Found {0} configuration backup session(s).' -f $configSessions.Count)
+        Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJobSession returned {0} session(s).' -f $configSessions.Count)
+        $inWindow = @($configSessions | Where-Object { Test-SessionInWindow -Session $_ })
+        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] Configuration backup sessions in window: {0}' -f $inWindow.Count)
+
+        # There is normally one configuration backup job; group defensively to pick
+        # the most-recent session per logical job name.
+        $grouped = @{}
+        foreach ($s in $inWindow) {
+            $sName = Get-SessionName -Session $s
+            $sEnd  = Get-SessionEndTime -Session $s
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
+                $st = Get-SessionStartTime -Session $s
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
+            }
+            if (-not $grouped.ContainsKey($sName)) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            } elseif ($sTime -gt $grouped[$sName].Time) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            }
+        }
+
+        foreach ($entry in $grouped.Values) {
+            $s = $entry.Session
+            $sessionId = Get-ObjectIdentity -InputObject $s
+            if (-not $script:SeenSessions.Add($sessionId)) { continue }
+            $report = Build-JobReport -Session $s -JobType 'ConfigurationBackup' -Source 'Get-VBRConfigurationBackupJobSession'
+            Write-DebugMessage ('[Main] Config backup report: name={0} result={1}' -f $report.job_name, $report.result)
+            [void]$allReports.Add($report)
+        }
+        $configBackupHandled = $true
+    } catch {
+        Write-Warning ('Unable to enumerate configuration backup sessions: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJobSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRConfigurationBackupJobSession not available.'
+    Write-DebugMessage '[Main] Get-VBRConfigurationBackupJobSession cmdlet not found.'
+}
+
+# Fallback: if the dedicated session cmdlet was unavailable or threw, try via the job object.
+if (-not $configBackupHandled) {
+    if (Get-Command -Name 'Get-VBRConfigurationBackupJob' -ErrorAction SilentlyContinue) {
+        try {
+            Write-DebugMessage '[Main] Calling Get-VBRConfigurationBackupJob (fallback) ...'
+            $configJob = Get-VBRConfigurationBackupJob -ErrorAction Stop
+            if ($null -ne $configJob) {
+                $jn = if ($null -ne $configJob.PSObject.Properties['Name']) { [string]$configJob.Name } else { 'ConfigurationBackup' }
+                Write-ProgressMessage ('  Configuration backup job found: {0}' -f $jn)
+                try {
+                    Add-JobReportFromJob -Job $configJob -Source 'Get-VBRConfigurationBackupJob' -Results ([ref]$allReports)
+                } catch {
+                    Write-Warning ('  Unable to process configuration backup job "{0}": {1}' -f $jn, $_.Exception.Message)
+                    Write-DebugMessage ('[Main] Add-JobReportFromJob failed for config backup job "{0}":' -f $jn +
+                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                }
+            } else {
+                Write-ProgressMessage '  Get-VBRConfigurationBackupJob returned no job.'
+                Write-DebugMessage '[Main] Get-VBRConfigurationBackupJob returned null.'
+            }
+        } catch {
+            Write-Warning ('Unable to get configuration backup job: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Main] Get-VBRConfigurationBackupJob threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    } else {
+        Write-ProgressMessage '  Get-VBRConfigurationBackupJob not available. Skipping.'
+        Write-DebugMessage '[Main] Get-VBRConfigurationBackupJob cmdlet not found.'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Repository offload / extent-sync sessions (housekeeping)
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 5 — Repository offload sessions (Get-VBRRepositoryExtentSyncSession).'
+Write-DebugMessage '[Main] Phase 5 — Repository offload / extent-sync sessions'
+if (Get-Command -Name 'Get-VBRRepositoryExtentSyncSession' -ErrorAction SilentlyContinue) {
+    try {
+        Write-DebugMessage '[Main] Calling Get-VBRRepositoryExtentSyncSession ...'
+        $repoOffloadSessions = @(Get-VBRRepositoryExtentSyncSession -ErrorAction Stop)
+        Write-ProgressMessage ('  Found {0} repository offload session(s).' -f $repoOffloadSessions.Count)
+        Write-DebugMessage ('[Main] Get-VBRRepositoryExtentSyncSession returned {0} session(s).' -f $repoOffloadSessions.Count)
+        $inWindow = @($repoOffloadSessions | Where-Object { Test-SessionInWindow -Session $_ })
+        Write-ProgressMessage ('  {0} session(s) within window.' -f $inWindow.Count)
+        Write-DebugMessage ('[Main] Repository offload sessions in window: {0}' -f $inWindow.Count)
+
+        # Group by name to pick the most-recent session per repository/offload job.
+        $grouped = @{}
+        foreach ($s in $inWindow) {
+            $sName = Get-SessionName -Session $s
+            $sEnd  = Get-SessionEndTime -Session $s
+            $sTime = if ($null -ne $sEnd) { Get-SortableTicks -Value $sEnd } else {
+                $st = Get-SessionStartTime -Session $s
+                if ($null -ne $st) { Get-SortableTicks -Value $st } else { [long]0 }
+            }
+            if (-not $grouped.ContainsKey($sName)) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            } elseif ($sTime -gt $grouped[$sName].Time) {
+                $grouped[$sName] = @{ Session = $s; Time = $sTime }
+            }
+        }
+
+        foreach ($entry in $grouped.Values) {
+            $s = $entry.Session
+            $sessionId = Get-ObjectIdentity -InputObject $s
+            if (-not $script:SeenSessions.Add($sessionId)) { continue }
+            $report = Build-JobReport -Session $s -JobType 'RepositoryOffload' -Source 'Get-VBRRepositoryExtentSyncSession'
+            Write-DebugMessage ('[Main] Repo offload report: name={0} result={1}' -f $report.job_name, $report.result)
+            [void]$allReports.Add($report)
+        }
+    } catch {
+        Write-Warning ('Unable to enumerate repository offload sessions: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Get-VBRRepositoryExtentSyncSession threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRRepositoryExtentSyncSession not available. Skipping.'
+    Write-DebugMessage '[Main] Get-VBRRepositoryExtentSyncSession cmdlet not found.'
+}
+
+# ---------------------------------------------------------------------------
+# Phase 7 — Defined Repository baseline (text mode only)
+#   Collects repository utilisation and stores it in $definedRepositorySection
+#   so it can be included in the human-readable report body.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 7 — Defined Repository baseline (repository utilisation).'
+Write-DebugMessage '[Main] Phase 7 — Defined Repository baseline.'
+if (-not $Json) {
+    try {
+        $definedRepositorySection = New-DefinedRepositorySectionText
+        Write-DebugMessage ('[Main] Defined Repository section ready, {0} char(s).' -f $definedRepositorySection.Length)
+    } catch {
+        Write-Warning ('Defined Repository baseline failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Defined Repository baseline failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $definedRepositorySection = New-DefinedRepositoryPlaceholderSection -Message '(repository utilisation unavailable)'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 8 — VBR Licensing (text mode only)
+#   Collects license information and stores it in $licensingSection so it can
+#   be included in the human-readable report body after the repository section.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 8 — VBR Licensing (license information).'
+Write-DebugMessage '[Main] Phase 8 — VBR Licensing.'
+if (-not $Json) {
+    try {
+        $licensingSection = New-VBRLicensingSectionText
+        Write-DebugMessage ('[Main] Licensing section ready, {0} char(s).' -f $licensingSection.Length)
+    } catch {
+        Write-Warning ('VBR Licensing phase failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] VBR Licensing phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $licensingSection = ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 9 — Backup Versions (text mode only)
+#   Counts the number of backup versions per machine in each repository and
+#   stores the result in $backupVersionsSection so it can be included in the
+#   human-readable report body after the licensing section.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 9 — Backup Versions (versions per machine per repository).'
+Write-DebugMessage '[Main] Phase 9 — Backup Versions.'
+if (-not $Json) {
+    try {
+        $backupVersionsSection = New-BackupVersionsSectionText
+        Write-DebugMessage ('[Main] Backup Versions section ready, {0} char(s).' -f $backupVersionsSection.Length)
+    } catch {
+        Write-Warning ('Backup Versions phase failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] Backup Versions phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $backupVersionsSection = ''
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Phase 10 — SOBR Offloads (text mode only)
+#   Collects all SOBR archive/capacity-tier offload sessions within the window
+#   and stores the result in $sobrOffloadSection for inclusion in the report.
+#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 10 — SOBR Offloads (archive/offload sessions).'
+Write-DebugMessage '[Main] Phase 10 — SOBR Offloads.'
+if (-not $Json) {
+    try {
+        $sobrOffloadSection = New-SobrOffloadSectionText
+        Write-DebugMessage ('[Main] SOBR Offloads section ready, {0} char(s).' -f $sobrOffloadSection.Length)
+    } catch {
+        Write-Warning ('SOBR Offloads phase failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] SOBR Offloads phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $sobrOffloadSection = ''
     }
 }
 
@@ -5155,7 +4954,8 @@ $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
     -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection `
-    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection
+    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection `
+    -SobrOffloadSection $sobrOffloadSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
