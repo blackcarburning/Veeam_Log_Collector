@@ -3960,7 +3960,9 @@ function New-SobrOffloadSectionText {
             # Attempt to refresh session state; fall back to original on error.
             $Session = $OriginalSession
             try {
-                $Refreshed = Get-VBRSession -Session $OriginalSession -ErrorAction Stop
+                $Refreshed = @(Get-VBRSession -Session $OriginalSession -ErrorAction Stop) |
+                    Where-Object { $null -ne $_ } |
+                    Select-Object -First 1
                 if ($null -ne $Refreshed) {
                     $Session = $Refreshed
                 }
@@ -3990,7 +3992,8 @@ function New-SobrOffloadSectionText {
             }
 
             $Tasks = @(
-                Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue
+                Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue |
+                    Where-Object { $null -ne $_ }
             )
 
             $Transfer = Get-P10TaskTransferInformation -Tasks $Tasks
@@ -4015,6 +4018,29 @@ function New-SobrOffloadSectionText {
             }
 
             $Progress = Get-P10SessionProgressPercent -Session $Session
+            $Errors = ''
+
+            try {
+                $Errors = [string](Get-LastErrorText -Session $Session)
+                if ($null -eq $Errors) {
+                    $Errors = ''
+                } else {
+                    $Errors = $Errors.Trim()
+                }
+            } catch {
+                $Errors = ''
+                Write-DebugMessage ('[New-SobrOffloadSectionText] Error text retrieval failed for "{0}": {1}' -f [string]$Session.Name, $_.Exception.Message)
+                Write-DebugMessage ('[New-SobrOffloadSectionText] Error text retrieval details:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+            }
+
+            Write-DebugMessage ('[New-SobrOffloadSectionText] Session "{0}" state="{1}" tasks={2} transfer.found={3} transfer.bytes="{4}" transfer.measure="{5}" progress="{6}"' -f `
+                [string]$Session.Name,
+                [string]$Session.State,
+                $Tasks.Count,
+                ($null -ne $Transfer.Bytes),
+                $Transfer.Bytes,
+                [string]$Transfer.Measure,
+                $(if ($null -ne $Progress) { $Progress } else { '<null>' }))
 
             $reportRows.Add(
                 [PSCustomObject]@{
@@ -4030,6 +4056,7 @@ function New-SobrOffloadSectionText {
                     DataMoved   = Format-P10ByteSize -Bytes $Transfer.Bytes
                     Measure     = $Transfer.Measure
                     Tasks       = $Tasks.Count
+                    Errors      = $Errors
                 }
             )
         }
@@ -4051,6 +4078,19 @@ function New-SobrOffloadSectionText {
 
             foreach ($tl in ($tableText -split '\r?\n')) {
                 [void]$lines.Add($tl)
+            }
+
+            $errorRows = @(
+                $reportRows |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Errors) }
+            )
+
+            if ($errorRows.Count -gt 0) {
+                [void]$lines.Add('Errors:')
+                foreach ($errorRow in $errorRows) {
+                    $errorText = ([string]$errorRow.Errors -replace '\r?\n', ' | ').Trim()
+                    [void]$lines.Add(('  {0}: {1}' -f [string]$errorRow.SOBROffload, $errorText))
+                }
             }
         }
 
