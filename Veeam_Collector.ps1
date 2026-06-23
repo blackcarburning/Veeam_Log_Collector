@@ -4561,6 +4561,524 @@ if (-not $Json) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Phase 10 — Working SOBR offloads (live ArchiveBackup sessions)
+#   Reports currently-running SOBR capacity/archive-tier offload sessions with
+#   state, start time, elapsed runtime, progress %, data moved, and task count.
+#   Optional per-task detail table is gated behind $P10ShowTaskDetails.
+#   This block is self-contained: it defines its own helpers (P10-prefixed) so
+#   it does not collide with the collector's existing functions.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 10 — Working SOBR offloads (live ArchiveBackup sessions).'
+Write-DebugMessage '[Main] Phase 10 — Working SOBR offloads.'
+
+# Set to $true to show the individual tasks below the summary.
+$P10ShowTaskDetails = $false
+
+# ============================================================================
+# Phase 10 Helpers
+# ============================================================================
+
+function Get-P10PropertyPathValue {
+    param (
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$Paths
+    )
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    foreach ($Path in $Paths) {
+        $Value = $InputObject
+        $Found = $true
+
+        foreach ($Part in ($Path -split '\.')) {
+            if ($null -eq $Value) {
+                $Found = $false
+                break
+            }
+
+            $Property = $Value.PSObject.Properties[$Part]
+
+            if ($null -eq $Property) {
+                $Found = $false
+                break
+            }
+
+            $Value = $Property.Value
+        }
+
+        if ($Found -and $null -ne $Value) {
+            return $Value
+        }
+    }
+
+    return $null
+}
+
+
+function Get-P10FirstNumericValue {
+    param (
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$Paths
+    )
+
+    foreach ($Path in $Paths) {
+        $Value = Get-P10PropertyPathValue `
+            -InputObject $InputObject `
+            -Paths @($Path)
+
+        if ($null -eq $Value) {
+            continue
+        }
+
+        # Handle size objects that expose a Bytes property.
+        foreach ($ByteProperty in @(
+            'Bytes'
+            'InBytes'
+            'Value'
+        )) {
+            $Property = $Value.PSObject.Properties[$ByteProperty]
+
+            if (
+                $null -ne $Property -and
+                $null -ne $Property.Value
+            ) {
+                [double]$Number = 0.0
+
+                if (
+                    [double]::TryParse(
+                        [string]$Property.Value,
+                        [ref]$Number
+                    )
+                ) {
+                    return [PSCustomObject]@{
+                        Found = $true
+                        Value = $Number
+                        Path  = "$Path.$ByteProperty"
+                    }
+                }
+            }
+        }
+
+        [double]$Number = 0.0
+
+        if (
+            [double]::TryParse(
+                [string]$Value,
+                [ref]$Number
+            )
+        ) {
+            return [PSCustomObject]@{
+                Found = $true
+                Value = $Number
+                Path  = $Path
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Found = $false
+        Value = $null
+        Path  = $null
+    }
+}
+
+
+function Format-P10ByteSize {
+    param (
+        [AllowNull()]
+        [object]$Bytes
+    )
+
+    if ($null -eq $Bytes) {
+        return 'N/A'
+    }
+
+    [double]$Value = [double]$Bytes
+
+    if ($Value -ge [double]1PB) {
+        return '{0:N2} PiB' -f ($Value / [double]1PB)
+    }
+
+    if ($Value -ge [double]1TB) {
+        return '{0:N2} TiB' -f ($Value / [double]1TB)
+    }
+
+    if ($Value -ge [double]1GB) {
+        return '{0:N2} GiB' -f ($Value / [double]1GB)
+    }
+
+    if ($Value -ge [double]1MB) {
+        return '{0:N2} MiB' -f ($Value / [double]1MB)
+    }
+
+    if ($Value -ge [double]1KB) {
+        return '{0:N2} KiB' -f ($Value / [double]1KB)
+    }
+
+    return '{0:N0} B' -f $Value
+}
+
+
+function Format-P10RunTime {
+    param (
+        [Parameter(Mandatory)]
+        [timespan]$Duration
+    )
+
+    if ($Duration.Days -gt 0) {
+        return '{0}d {1:00}:{2:00}:{3:00}' -f `
+            $Duration.Days,
+            $Duration.Hours,
+            $Duration.Minutes,
+            $Duration.Seconds
+    }
+
+    return '{0:00}:{1:00}:{2:00}' -f `
+        [math]::Floor($Duration.TotalHours),
+        $Duration.Minutes,
+        $Duration.Seconds
+}
+
+
+function Get-P10SessionProgressPercent {
+    param (
+        [Parameter(Mandatory)]
+        [object]$Session
+    )
+
+    $Result = Get-P10FirstNumericValue `
+        -InputObject $Session `
+        -Paths @(
+            'Progress'
+            'Progress.Percent'
+            'Progress.Percents'
+            'Info.Progress.Percent'
+            'Info.Progress.Percents'
+        )
+
+    if (-not $Result.Found) {
+        return $null
+    }
+
+    [int]$Percent = [math]::Round($Result.Value)
+
+    if ($Percent -lt 0) {
+        $Percent = 0
+    }
+
+    if ($Percent -gt 100) {
+        $Percent = 100
+    }
+
+    return $Percent
+}
+
+
+function Get-P10TaskTransferInformation {
+    param (
+        [Parameter(Mandatory)]
+        [object[]]$Tasks
+    )
+
+    [double]$TransferredTotal = 0.0
+    [double]$ProcessedTotal   = 0.0
+
+    $TransferredFound = $false
+    $ProcessedFound   = $false
+
+    foreach ($Task in $Tasks) {
+        # Veeam has historically exposed the property as TransferedSize
+        # with one "r". Check both spellings and both common object paths.
+        $Transferred = Get-P10FirstNumericValue `
+            -InputObject $Task `
+            -Paths @(
+                'Progress.TransferedSize'
+                'Progress.TransferredSize'
+                'Info.Progress.TransferedSize'
+                'Info.Progress.TransferredSize'
+                'TransferedSize'
+                'TransferredSize'
+            )
+
+        if ($Transferred.Found) {
+            $TransferredTotal += [double]$Transferred.Value
+            $TransferredFound = $true
+        }
+
+        $Processed = Get-P10FirstNumericValue `
+            -InputObject $Task `
+            -Paths @(
+                'Progress.ProcessedSize'
+                'Info.Progress.ProcessedSize'
+                'ProcessedSize'
+            )
+
+        if ($Processed.Found) {
+            $ProcessedTotal += [double]$Processed.Value
+            $ProcessedFound = $true
+        }
+    }
+
+    if ($TransferredFound) {
+        return [PSCustomObject]@{
+            Bytes   = $TransferredTotal
+            Measure = 'Transferred'
+        }
+    }
+
+    if ($ProcessedFound) {
+        return [PSCustomObject]@{
+            Bytes   = $ProcessedTotal
+            Measure = 'Processed fallback'
+        }
+    }
+
+    return [PSCustomObject]@{
+        Bytes   = $null
+        Measure = 'Unavailable'
+    }
+}
+
+
+# ============================================================================
+# Find active SOBR offload sessions
+# ============================================================================
+
+$P10ActiveStates = @(
+    'Starting'
+    'Working'
+    'Stopping'
+    'Pausing'
+    'Resuming'
+    'Idle'
+    'Postprocessing'
+    'WaitingRepository'
+    'Pending'
+)
+
+$P10Sessions = @(
+    Get-VBRSession `
+        -Type ArchiveBackup `
+        -ErrorAction SilentlyContinue |
+        Where-Object {
+            [string]$_.State -in $P10ActiveStates
+        }
+)
+
+if ($P10Sessions.Count -eq 0) {
+    Write-Host 'No SOBR offloads are currently running.'
+}
+else {
+
+    # ============================================================================
+    # Build report
+    # ============================================================================
+
+    $P10Report = [System.Collections.Generic.List[object]]::new()
+    $P10TaskReport = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($OriginalSession in $P10Sessions) {
+        # Refresh the session so its state and progress are current.
+        try {
+            $Session = Get-VBRSession `
+                -Session $OriginalSession `
+                -ErrorAction Stop
+        }
+        catch {
+            $Session = $OriginalSession
+        }
+
+        if ([string]$Session.State -notin $P10ActiveStates) {
+            continue
+        }
+
+        $StartTime = Get-P10PropertyPathValue `
+            -InputObject $Session `
+            -Paths @(
+                'CreationTime'
+                'StartTime'
+                'CreationTimeLocal'
+                'Info.CreationTime'
+            )
+
+        try {
+            $StartTime = [datetime]$StartTime
+        }
+        catch {
+            $StartTime = $null
+        }
+
+        $RunTime = if ($StartTime) {
+            (Get-Date) - $StartTime
+        }
+        else {
+            [timespan]::Zero
+        }
+
+        $Tasks = @(
+            Get-VBRTaskSession `
+                -Session $Session `
+                -ErrorAction SilentlyContinue
+        )
+
+        $Transfer = Get-P10TaskTransferInformation -Tasks $Tasks
+
+        # Some builds expose transfer information at session level instead.
+        if ($null -eq $Transfer.Bytes) {
+            $SessionTransfer = Get-P10FirstNumericValue `
+                -InputObject $Session `
+                -Paths @(
+                    'Info.Progress.TransferedSize'
+                    'Info.Progress.TransferredSize'
+                    'Progress.TransferedSize'
+                    'Progress.TransferredSize'
+                )
+
+            if ($SessionTransfer.Found) {
+                $Transfer = [PSCustomObject]@{
+                    Bytes   = [double]$SessionTransfer.Value
+                    Measure = 'Session transferred'
+                }
+            }
+        }
+
+        $Progress = Get-P10SessionProgressPercent -Session $Session
+
+        $P10Report.Add(
+            [PSCustomObject]@{
+                SOBROffload = [string]$Session.Name
+                State       = [string]$Session.State
+                Started     = if ($StartTime) {
+                    $StartTime.ToString('dd/MM/yyyy HH:mm')
+                }
+                else {
+                    'Unknown'
+                }
+                Running     = Format-P10RunTime -Duration $RunTime
+                Progress    = if ($null -ne $Progress) {
+                    "$Progress%"
+                }
+                else {
+                    'N/A'
+                }
+                DataMoved   = Format-P10ByteSize -Bytes $Transfer.Bytes
+                Measure     = $Transfer.Measure
+                Tasks       = $Tasks.Count
+            }
+        )
+
+        if ($P10ShowTaskDetails) {
+            foreach ($Task in $Tasks) {
+                $TaskTransfer = Get-P10FirstNumericValue `
+                    -InputObject $Task `
+                    -Paths @(
+                        'Progress.TransferedSize'
+                        'Progress.TransferredSize'
+                        'Info.Progress.TransferedSize'
+                        'Info.Progress.TransferredSize'
+                    )
+
+                $TaskProcessed = Get-P10FirstNumericValue `
+                    -InputObject $Task `
+                    -Paths @(
+                        'Progress.ProcessedSize'
+                        'Info.Progress.ProcessedSize'
+                    )
+
+                $TaskStart = Get-P10PropertyPathValue `
+                    -InputObject $Task `
+                    -Paths @(
+                        'Progress.StartTime'
+                        'Info.Progress.StartTime'
+                        'CreationTime'
+                    )
+
+                try {
+                    $TaskStart = [datetime]$TaskStart
+                }
+                catch {
+                    $TaskStart = $null
+                }
+
+                $P10TaskReport.Add(
+                    [PSCustomObject]@{
+                        SOBROffload = [string]$Session.Name
+                        Task        = [string]$Task.Name
+                        Status      = [string]$Task.Status
+                        Started     = if ($TaskStart) {
+                            $TaskStart.ToString('dd/MM/yyyy HH:mm')
+                        }
+                        else {
+                            'Unknown'
+                        }
+                        Transferred = if ($TaskTransfer.Found) {
+                            Format-P10ByteSize $TaskTransfer.Value
+                        }
+                        else {
+                            'N/A'
+                        }
+                        Processed   = if ($TaskProcessed.Found) {
+                            Format-P10ByteSize $TaskProcessed.Value
+                        }
+                        else {
+                            'N/A'
+                        }
+                    }
+                )
+            }
+        }
+    }
+
+
+    # ============================================================================
+    # Display
+    # ============================================================================
+
+    if ($P10Report.Count -eq 0) {
+        Write-Host 'No SOBR offloads are currently running.'
+    }
+    else {
+
+        Write-Host "`nRUNNING SOBR OFFLOADS" -ForegroundColor Cyan
+
+        $P10Report |
+            Sort-Object SOBROffload |
+            Format-Table `
+                @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=36},
+                @{Label='State';        Expression={$_.State};       Width=17},
+                @{Label='Started';      Expression={$_.Started};     Width=16},
+                @{Label='Running';      Expression={$_.Running};     Width=13},
+                @{Label='Progress';     Expression={$_.Progress};    Width=8},
+                @{Label='Data moved';   Expression={$_.DataMoved};   Width=12},
+                @{Label='Measure';      Expression={$_.Measure};     Width=18},
+                @{Label='Tasks';        Expression={$_.Tasks};       Width=5}
+
+
+        if ($P10ShowTaskDetails -and $P10TaskReport.Count -gt 0) {
+            Write-Host "`nOFFLOAD TASK DETAILS" -ForegroundColor Cyan
+
+            $P10TaskReport |
+                Sort-Object SOBROffload, Task |
+                Format-Table `
+                    @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=30},
+                    @{Label='Task';         Expression={$_.Task};        Width=38},
+                    @{Label='Status';       Expression={$_.Status};      Width=11},
+                    @{Label='Started';      Expression={$_.Started};     Width=16},
+                    @{Label='Transferred';  Expression={$_.Transferred}; Width=12},
+                    @{Label='Processed';    Expression={$_.Processed};   Width=12}
+        }
+    }
+}
+
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
 
