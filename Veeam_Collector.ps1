@@ -3813,28 +3813,81 @@ function Get-P10SessionProgressPercent {
     $Result = Get-P10FirstNumericValue `
         -InputObject $Session `
         -Paths @(
-            'Progress'
-            'Progress.Percent'
             'Progress.Percents'
-            'Info.Progress.Percent'
+            'Progress.Percent'
             'Info.Progress.Percents'
+            'Info.Progress.Percent'
         )
 
-    if (-not $Result.Found) {
-        return $null
+    if ($Result.Found) {
+        [int]$Percent = [math]::Round($Result.Value)
+
+        if ($Percent -lt 0) {
+            $Percent = 0
+        }
+
+        if ($Percent -gt 100) {
+            $Percent = 100
+        }
+
+        Write-DebugMessage ('[Get-P10SessionProgressPercent] percent-field path={0} value={1} -> {2}%' -f `
+            [string]$Result.Path,
+            $Result.Value,
+            $Percent)
+
+        return $Percent
     }
 
-    [int]$Percent = [math]::Round($Result.Value)
+    $Transferred = Get-P10FirstNumericValue `
+        -InputObject $Session `
+        -Paths @(
+            'Info.Progress.TransferedSize'
+            'Info.Progress.TransferredSize'
+            'Progress.TransferedSize'
+            'Progress.TransferredSize'
+        )
 
-    if ($Percent -lt 0) {
-        $Percent = 0
+    $Total = Get-P10FirstNumericValue `
+        -InputObject $Session `
+        -Paths @(
+            'Progress.TotalSize'
+            'Info.Progress.TotalSize'
+            'Progress.TargetSize'
+            'Info.Progress.TargetSize'
+            'Progress.ProcessedTotalSize'
+            'Info.Progress.ProcessedTotalSize'
+        )
+
+    if ($Transferred.Found -and $Total.Found -and ([double]$Total.Value -gt 0.0)) {
+        [double]$ComputedPercent = ([double]$Transferred.Value / [double]$Total.Value) * 100.0
+        [int]$Percent = [math]::Round($ComputedPercent)
+
+        if ($Percent -lt 0) {
+            $Percent = 0
+        }
+
+        if ($Percent -gt 100) {
+            $Percent = 100
+        }
+
+        Write-DebugMessage ('[Get-P10SessionProgressPercent] computed transferred-path={0} total-path={1} transferred={2} total={3} -> {4}%' -f `
+            [string]$Transferred.Path,
+            [string]$Total.Path,
+            $Transferred.Value,
+            $Total.Value,
+            $Percent)
+
+        return $Percent
     }
 
-    if ($Percent -gt 100) {
-        $Percent = 100
-    }
+    Write-DebugMessage ('[Get-P10SessionProgressPercent] no progress available -> null (transferred.found={0} path={1}; total.found={2} path={3} value={4})' -f `
+        $Transferred.Found,
+        [string]$Transferred.Path,
+        $Total.Found,
+        [string]$Total.Path,
+        $(if ($Total.Found) { $Total.Value } else { '<null>' }))
 
-    return $Percent
+    return $null
 }
 
 
