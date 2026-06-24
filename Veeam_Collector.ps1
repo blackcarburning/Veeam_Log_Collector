@@ -200,19 +200,13 @@
       - Get-VBRRepositoryExtentSyncSession is used when available.  Absence of
         this cmdlet is handled gracefully.
 
-    SOBR offload sessions (text mode only):
-      - A single delimited SOBR Offloads section discovers archive/offload
-        sessions via Get-VBRSession -Type (Archive* candidates accepted by the
-        runtime) and Get-VBRCapacityTierSyncSession when available.  Sessions
-        are de-duplicated by stable identity and include running/in-progress
-        work even when it started before the -Hours cutoff.  The section is
-        wrapped with:
-            ############### SOBR Offloads BEGIN ###################
-            ############### SOBR Offloads END ###################
-        and contains state, start time, elapsed runtime, progress %,
-        data moved, and task count for each session.  No Logger property is
-        accessed; the phase degrades gracefully when the cmdlet or -Type
-        parameter is unavailable.  The section is omitted from -Json mode.
+    SOBR archive backup / offload sessions:
+      - Phase 6 uses Get-VBRSession -Type ArchiveBackup to collect SOBR
+        archive-tier backup and offload sessions.  Messages are extracted from
+        both the session-level logger and per-task loggers (via
+        Get-VBRTaskSession) so that individual object errors surface in the
+        report.  The cmdlet and its -Type parameter are checked defensively;
+        the phase is skipped gracefully when either is unavailable.
 
     PowerShell version requirements:
       - PowerShell 7.0 or later: the modern Veeam.Backup.PowerShell module is loaded.
@@ -251,7 +245,7 @@ param(
     # SMTP server and envelope settings for the report email.
     [string]$SmtpServer = 'outlook.unison.co.uk',
     [string]$MailFrom = 'Veeam@unison.co.uk',
-    [string[]]$MailTo = @('mark.hockings@csiltd.co.uk', 'mark@blackcarburning.com', 'unison@logs.blackcarburning.com'),
+    [string[]]$MailTo = @('unison@logs.blackcarburning.com'),
 
     # Directory for the canonical human-readable report body file.
     [string]$ReportOutputDirectory = 'E:\VEEAM_LOGS\COLLECTOR',
@@ -3630,971 +3624,6 @@ function New-BackupVersionsSectionText {
     return ($lines -join [Environment]::NewLine)
 }
 
-# ===========================================================================
-# SOBR Offload section — helper functions
-#   P10-prefixed to avoid collisions with existing collector functions.
-#   These helpers are used by New-SobrOffloadSectionText.
-# ===========================================================================
-
-function Get-P10PropertyPathValue {
-    param (
-        [AllowNull()]
-        [object]$InputObject,
-
-        [Parameter(Mandatory)]
-        [string[]]$Paths
-    )
-
-    if ($null -eq $InputObject) {
-        return $null
-    }
-
-    foreach ($Path in $Paths) {
-        $Value = $InputObject
-        $Found = $true
-
-        foreach ($Part in ($Path -split '\.')) {
-            if ($null -eq $Value) {
-                $Found = $false
-                break
-            }
-
-            $Property = $Value.PSObject.Properties[$Part]
-
-            if ($null -eq $Property) {
-                $Found = $false
-                break
-            }
-
-            $Value = $Property.Value
-        }
-
-        if ($Found -and $null -ne $Value) {
-            return $Value
-        }
-    }
-
-    return $null
-}
-
-
-function Get-P10FirstNumericValue {
-    param (
-        [AllowNull()]
-        [object]$InputObject,
-
-        [Parameter(Mandatory)]
-        [string[]]$Paths
-    )
-
-    foreach ($Path in $Paths) {
-        $Value = Get-P10PropertyPathValue `
-            -InputObject $InputObject `
-            -Paths @($Path)
-
-        if ($null -eq $Value) {
-            continue
-        }
-
-        # Handle size objects that expose a Bytes property.
-        foreach ($ByteProperty in @(
-            'Bytes'
-            'InBytes'
-            'Value'
-        )) {
-            $Property = $Value.PSObject.Properties[$ByteProperty]
-
-            if (
-                $null -ne $Property -and
-                $null -ne $Property.Value
-            ) {
-                [double]$Number = 0.0
-
-                if (
-                    [double]::TryParse(
-                        [string]$Property.Value,
-                        [ref]$Number
-                    )
-                ) {
-                    return [PSCustomObject]@{
-                        Found = $true
-                        Value = $Number
-                        Path  = "$Path.$ByteProperty"
-                    }
-                }
-            }
-        }
-
-        [double]$Number = 0.0
-
-        if (
-            [double]::TryParse(
-                [string]$Value,
-                [ref]$Number
-            )
-        ) {
-            return [PSCustomObject]@{
-                Found = $true
-                Value = $Number
-                Path  = $Path
-            }
-        }
-    }
-
-    return [PSCustomObject]@{
-        Found = $false
-        Value = $null
-        Path  = $null
-    }
-}
-
-
-function Format-P10ByteSize {
-    param (
-        [AllowNull()]
-        [object]$Bytes
-    )
-
-    if ($null -eq $Bytes) {
-        return 'N/A'
-    }
-
-    [double]$Value = [double]$Bytes
-
-    if ($Value -ge [double]1PB) {
-        return '{0:N2} PiB' -f ($Value / [double]1PB)
-    }
-
-    if ($Value -ge [double]1TB) {
-        return '{0:N2} TiB' -f ($Value / [double]1TB)
-    }
-
-    if ($Value -ge [double]1GB) {
-        return '{0:N2} GiB' -f ($Value / [double]1GB)
-    }
-
-    if ($Value -ge [double]1MB) {
-        return '{0:N2} MiB' -f ($Value / [double]1MB)
-    }
-
-    if ($Value -ge [double]1KB) {
-        return '{0:N2} KiB' -f ($Value / [double]1KB)
-    }
-
-    return '{0:N0} B' -f $Value
-}
-
-
-function Format-P10RunTime {
-    param (
-        [Parameter(Mandatory)]
-        [timespan]$Duration
-    )
-
-    if ($Duration.Days -gt 0) {
-        return '{0}d {1:00}:{2:00}:{3:00}' -f `
-            $Duration.Days,
-            $Duration.Hours,
-            $Duration.Minutes,
-            $Duration.Seconds
-    }
-
-    return '{0:00}:{1:00}:{2:00}' -f `
-        [math]::Floor($Duration.TotalHours),
-        $Duration.Minutes,
-        $Duration.Seconds
-}
-
-
-function Get-P10ObjectPropertySummary {
-    param (
-        [AllowNull()]
-        [object]$InputObject,
-        [int]$MaxProperties = 25
-    )
-
-    if ($null -eq $InputObject) {
-        return '<null>'
-    }
-
-    try {
-        $names = @(
-            $InputObject.PSObject.Properties |
-                Select-Object -ExpandProperty Name
-        )
-        if ($names.Count -eq 0) {
-            return '<none>'
-        }
-
-        $shown = @($names | Select-Object -First $MaxProperties)
-        if ($names.Count -gt $shown.Count) {
-            return ((($shown -join ', ') + ', ... (+{0})') -f ($names.Count - $shown.Count))
-        }
-        return ($shown -join ', ')
-    } catch {
-        return ('<error: {0}>' -f $_.Exception.Message)
-    }
-}
-
-
-function Get-P10ObjectMethodSummary {
-    param (
-        [AllowNull()]
-        [object]$InputObject,
-        [int]$MaxMethods = 20
-    )
-
-    if ($null -eq $InputObject) {
-        return '<null>'
-    }
-
-    try {
-        $names = @(
-            $InputObject.PSObject.Methods |
-                Select-Object -ExpandProperty Name -Unique
-        )
-        if ($names.Count -eq 0) {
-            return '<none>'
-        }
-
-        $shown = @($names | Select-Object -First $MaxMethods)
-        if ($names.Count -gt $shown.Count) {
-            return ((($shown -join ', ') + ', ... (+{0})') -f ($names.Count - $shown.Count))
-        }
-        return ($shown -join ', ')
-    } catch {
-        return ('<error: {0}>' -f $_.Exception.Message)
-    }
-}
-
-
-function Get-P10ArchiveTypeCandidates {
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in @('ArchiveBackup', 'ArchiveCopy', 'Archive')) {
-        if (-not [string]::IsNullOrWhiteSpace($name) -and -not $candidates.Contains($name)) {
-            [void]$candidates.Add($name)
-        }
-    }
-
-    try {
-        $sessionCmd = Get-Command -Name 'Get-VBRSession' -ErrorAction Stop
-        $typeParameter = $sessionCmd.Parameters['Type']
-        if ($null -ne $typeParameter -and $null -ne $typeParameter.ParameterType -and $typeParameter.ParameterType.IsEnum) {
-            foreach ($enumName in [System.Enum]::GetNames($typeParameter.ParameterType)) {
-                if ($enumName -match 'Archive' -and -not $candidates.Contains([string]$enumName)) {
-                    [void]$candidates.Add([string]$enumName)
-                }
-            }
-        }
-    } catch {
-        Write-DebugMessage ('[Get-P10ArchiveTypeCandidates] Unable to enumerate Type parameter enum names: {0}' -f $_.Exception.Message)
-    }
-
-    return @($candidates)
-}
-
-
-function Get-P10SessionStatusText {
-    param (
-        [Parameter(Mandatory)]
-        [object]$Session
-    )
-
-    $parts = [System.Collections.Generic.List[string]]::new()
-    foreach ($path in @(
-        'State'
-        'Status'
-        'Result'
-        'Details'
-        'Info.State'
-        'Info.Status'
-        'Info.Result'
-        'Info.Details'
-        'Info.Progress.Status'
-        'Info.Progress.Details'
-        'Progress.Status'
-        'Progress.Details'
-    )) {
-        $value = Get-P10PropertyPathValue -InputObject $Session -Paths @($path)
-        if ($null -ne $value) {
-            $text = [string]$value
-            if (-not [string]::IsNullOrWhiteSpace($text)) {
-                [void]$parts.Add($text)
-            }
-        }
-    }
-
-    return ($parts -join ' | ')
-}
-
-
-function Get-P10PercentFromText {
-    param (
-        [AllowNull()]
-        [string]$Text
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return $null
-    }
-
-    $matches = [regex]::Matches($Text, '(?<!\d)(\d{1,3})\s*%')
-    foreach ($m in $matches) {
-        [int]$parsed = 0
-        if ([int]::TryParse($m.Groups[1].Value, [ref]$parsed)) {
-            if ($parsed -ge 0 -and $parsed -le 100) {
-                return $parsed
-            }
-        }
-    }
-
-    return $null
-}
-
-
-function Test-P10SessionAppearsActive {
-    param (
-        [Parameter(Mandatory)]
-        [object]$Session,
-        [AllowNull()]
-        [string]$StatusText
-    )
-
-    if (Test-SessionIsRunning -Session $Session) {
-        return $true
-    }
-
-    $stateText = if ([string]::IsNullOrWhiteSpace($StatusText)) {
-        Get-P10SessionStatusText -Session $Session
-    } else {
-        [string]$StatusText
-    }
-
-    if ([string]::IsNullOrWhiteSpace($stateText)) {
-        return $false
-    }
-
-    return ($stateText -imatch 'Working|InProgress|Running|Pending|Waiting|WaitingSlot|Queued|Queue|Starting|Resuming|Stopping|ActionRequired')
-}
-
-
-function Get-P10SessionByteMetrics {
-    param (
-        [Parameter(Mandatory)]
-        [object]$Session,
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Tasks
-    )
-
-    $metricMap = @{
-        Transferred = @(
-            'Progress.TransferedSize'
-            'Progress.TransferredSize'
-            'Info.Progress.TransferedSize'
-            'Info.Progress.TransferredSize'
-            'TransferedSize'
-            'TransferredSize'
-            'Progress.TransferedBytes'
-            'Progress.TransferredBytes'
-            'Info.Progress.TransferedBytes'
-            'Info.Progress.TransferredBytes'
-            'TransferedBytes'
-            'TransferredBytes'
-            'ArchivedSize'
-            'Info.Progress.ArchivedSize'
-            'Progress.ArchivedSize'
-        )
-        Processed   = @(
-            'Progress.ProcessedSize'
-            'Info.Progress.ProcessedSize'
-            'ProcessedSize'
-            'ReadSize'
-            'Progress.ReadSize'
-            'Info.Progress.ReadSize'
-            'ProcessedUsedSize'
-            'Progress.ProcessedUsedSize'
-            'Info.Progress.ProcessedUsedSize'
-        )
-        Total       = @(
-            'Progress.TotalSize'
-            'Info.Progress.TotalSize'
-            'TotalSize'
-            'TotalUsedSize'
-            'Progress.TotalUsedSize'
-            'Info.Progress.TotalUsedSize'
-        )
-    }
-
-    $result = [ordered]@{}
-    foreach ($metricName in @('Transferred', 'Processed', 'Total')) {
-        $foundAt = [System.Collections.Generic.List[string]]::new()
-        $sum = 0.0
-        $found = $false
-
-        $sessionValue = Get-P10FirstNumericValue -InputObject $Session -Paths $metricMap[$metricName]
-        if ($sessionValue.Found) {
-            $sum = [double]$sessionValue.Value
-            $found = $true
-            [void]$foundAt.Add(('session:{0}' -f [string]$sessionValue.Path))
-        } else {
-            $taskIndex = 0
-            foreach ($task in $Tasks) {
-                $taskIndex++
-                $taskValue = Get-P10FirstNumericValue -InputObject $task -Paths $metricMap[$metricName]
-                if ($taskValue.Found) {
-                    $sum += [double]$taskValue.Value
-                    $found = $true
-                    [void]$foundAt.Add(('task[{0}]:{1}' -f $taskIndex, [string]$taskValue.Path))
-                }
-            }
-        }
-
-        $result[$metricName] = if ($found) { $sum } else { $null }
-        $result["${metricName}Sources"] = if ($foundAt.Count -gt 0) {
-            @($foundAt | Select-Object -First 3) -join '; '
-        } else {
-            ''
-        }
-    }
-
-    $measureParts = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in @('Transferred', 'Processed', 'Total')) {
-        if ($null -ne $result[$name]) {
-            $src = [string]$result["${name}Sources"]
-            if ([string]::IsNullOrWhiteSpace($src)) {
-                [void]$measureParts.Add($name)
-            } else {
-                [void]$measureParts.Add(('{0}<{1}>' -f $name, $src))
-            }
-        }
-    }
-
-    if ($measureParts.Count -eq 0) {
-        $result['Measure'] = 'Unknown'
-    } else {
-        $result['Measure'] = ($measureParts -join ' | ')
-    }
-
-    return [PSCustomObject]$result
-}
-
-
-function Get-P10ProgressInformation {
-    param (
-        [Parameter(Mandatory)]
-        [object]$Session,
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [object[]]$Tasks,
-        [Parameter(Mandatory)]
-        [object]$ByteMetrics,
-        [AllowNull()]
-        [string]$StatusText
-    )
-
-    $status = if ([string]::IsNullOrWhiteSpace($StatusText)) {
-        Get-P10SessionStatusText -Session $Session
-    } else {
-        [string]$StatusText
-    }
-
-    if ($null -ne $ByteMetrics.Total -and $ByteMetrics.Total -gt 0) {
-        if ($null -ne $ByteMetrics.Processed) {
-            $pct = [int][math]::Round(([double]$ByteMetrics.Processed / [double]$ByteMetrics.Total) * 100.0)
-            if ($pct -lt 0) { $pct = 0 }
-            if ($pct -gt 100) { $pct = 100 }
-            return [PSCustomObject]@{
-                Percent           = $pct
-                Source            = 'bytes(processed/total)'
-                InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
-                StatusText        = $status
-            }
-        }
-
-        if ($null -ne $ByteMetrics.Transferred) {
-            $pct = [int][math]::Round(([double]$ByteMetrics.Transferred / [double]$ByteMetrics.Total) * 100.0)
-            if ($pct -lt 0) { $pct = 0 }
-            if ($pct -gt 100) { $pct = 100 }
-            return [PSCustomObject]@{
-                Percent           = $pct
-                Source            = 'bytes(transferred/total)'
-                InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
-                StatusText        = $status
-            }
-        }
-    }
-
-    $sessionPercent = Get-P10FirstNumericValue `
-        -InputObject $Session `
-        -Paths @(
-            'Progress.Percent'
-            'Progress.Percents'
-            'Info.Progress.Percent'
-            'Info.Progress.Percents'
-            'Progress'
-        )
-    if ($sessionPercent.Found) {
-        $pct = [int][math]::Round([double]$sessionPercent.Value)
-        if ($pct -ge 0 -and $pct -le 100) {
-            return [PSCustomObject]@{
-                Percent           = $pct
-                Source            = ('session:{0}' -f [string]$sessionPercent.Path)
-                InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
-                StatusText        = $status
-            }
-        }
-    }
-
-    $textPercent = Get-P10PercentFromText -Text $status
-    if ($null -ne $textPercent) {
-        return [PSCustomObject]@{
-            Percent           = $textPercent
-            Source            = 'status-text'
-            InProgressPercent = ($textPercent -gt 0 -and $textPercent -lt 100)
-            StatusText        = $status
-        }
-    }
-
-    [double]$weightedTotal = 0.0
-    [double]$weightedPercent = 0.0
-    [double]$unweightedPercent = 0.0
-    [int]$unweightedCount = 0
-
-    foreach ($task in $Tasks) {
-        $taskPercentResult = Get-P10FirstNumericValue `
-            -InputObject $task `
-            -Paths @(
-                'Progress.Percent'
-                'Progress.Percents'
-                'Info.Progress.Percent'
-                'Info.Progress.Percents'
-                'Progress'
-            )
-
-        [int]$taskPercent = -1
-        if ($taskPercentResult.Found) {
-            $taskPercent = [int][math]::Round([double]$taskPercentResult.Value)
-        } else {
-            $taskStatus = Get-P10SessionStatusText -Session $task
-            $taskPercentFromText = Get-P10PercentFromText -Text $taskStatus
-            if ($null -ne $taskPercentFromText) {
-                $taskPercent = $taskPercentFromText
-            }
-        }
-
-        if ($taskPercent -lt 0 -or $taskPercent -gt 100) {
-            continue
-        }
-
-        $taskWeightResult = Get-P10FirstNumericValue `
-            -InputObject $task `
-            -Paths @(
-                'Progress.TotalSize'
-                'Info.Progress.TotalSize'
-                'TotalSize'
-                'TotalUsedSize'
-                'Progress.TotalUsedSize'
-                'Info.Progress.TotalUsedSize'
-            )
-
-        if ($taskWeightResult.Found -and [double]$taskWeightResult.Value -gt 0) {
-            $weightedTotal += [double]$taskWeightResult.Value
-            $weightedPercent += ([double]$taskPercent * [double]$taskWeightResult.Value)
-        } else {
-            $unweightedPercent += [double]$taskPercent
-            $unweightedCount++
-        }
-    }
-
-    if ($weightedTotal -gt 0) {
-        $pct = [int][math]::Round($weightedPercent / $weightedTotal)
-        if ($pct -lt 0) { $pct = 0 }
-        if ($pct -gt 100) { $pct = 100 }
-        return [PSCustomObject]@{
-            Percent           = $pct
-            Source            = 'tasks-weighted-total'
-            InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
-            StatusText        = $status
-        }
-    }
-
-    if ($unweightedCount -gt 0) {
-        $pct = [int][math]::Round($unweightedPercent / $unweightedCount)
-        if ($pct -lt 0) { $pct = 0 }
-        if ($pct -gt 100) { $pct = 100 }
-        return [PSCustomObject]@{
-            Percent           = $pct
-            Source            = 'tasks-average'
-            InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
-            StatusText        = $status
-        }
-    }
-
-    return [PSCustomObject]@{
-        Percent           = $null
-        Source            = 'unknown'
-        InProgressPercent = $false
-        StatusText        = $status
-    }
-}
-
-
-function Get-P10DiscoveredSobrSessions {
-    $sessionMap = @{}
-    $attempts = [System.Collections.Generic.List[object]]::new()
-
-    $archiveTypes = @(Get-P10ArchiveTypeCandidates)
-    if ($archiveTypes.Count -eq 0) {
-        $archiveTypes = @('ArchiveBackup')
-    }
-
-    foreach ($archiveType in $archiveTypes) {
-        try {
-            $sessions = @(Get-VBRSession -Type $archiveType -ErrorAction Stop | Where-Object { $null -ne $_ })
-            [void]$attempts.Add([PSCustomObject]@{
-                Source  = 'Get-VBRSession'
-                Type    = [string]$archiveType
-                Success = $true
-                Count   = $sessions.Count
-                Error   = ''
-            })
-
-            foreach ($session in $sessions) {
-                $identity = Get-ObjectIdentity -InputObject $session
-                if (-not $sessionMap.ContainsKey($identity)) {
-                    $sessionMap[$identity] = [PSCustomObject]@{
-                        Identity = $identity
-                        Session  = $session
-                        Sources  = [System.Collections.Generic.List[string]]::new()
-                    }
-                }
-                $sourceLabel = ('Get-VBRSession:{0}' -f [string]$archiveType)
-                if (-not $sessionMap[$identity].Sources.Contains($sourceLabel)) {
-                    [void]$sessionMap[$identity].Sources.Add($sourceLabel)
-                }
-            }
-        } catch {
-            [void]$attempts.Add([PSCustomObject]@{
-                Source  = 'Get-VBRSession'
-                Type    = [string]$archiveType
-                Success = $false
-                Count   = 0
-                Error   = [string]$_.Exception.Message
-            })
-        }
-    }
-
-    if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyContinue) {
-        try {
-            $capacitySessions = @(Get-VBRCapacityTierSyncSession -ErrorAction Stop | Where-Object { $null -ne $_ })
-            [void]$attempts.Add([PSCustomObject]@{
-                Source  = 'Get-VBRCapacityTierSyncSession'
-                Type    = ''
-                Success = $true
-                Count   = $capacitySessions.Count
-                Error   = ''
-            })
-
-            foreach ($session in $capacitySessions) {
-                $identity = Get-ObjectIdentity -InputObject $session
-                if (-not $sessionMap.ContainsKey($identity)) {
-                    $sessionMap[$identity] = [PSCustomObject]@{
-                        Identity = $identity
-                        Session  = $session
-                        Sources  = [System.Collections.Generic.List[string]]::new()
-                    }
-                }
-                if (-not $sessionMap[$identity].Sources.Contains('Get-VBRCapacityTierSyncSession')) {
-                    [void]$sessionMap[$identity].Sources.Add('Get-VBRCapacityTierSyncSession')
-                }
-            }
-        } catch {
-            [void]$attempts.Add([PSCustomObject]@{
-                Source  = 'Get-VBRCapacityTierSyncSession'
-                Type    = ''
-                Success = $false
-                Count   = 0
-                Error   = [string]$_.Exception.Message
-            })
-        }
-    } else {
-        [void]$attempts.Add([PSCustomObject]@{
-            Source  = 'Get-VBRCapacityTierSyncSession'
-            Type    = ''
-            Success = $false
-            Count   = 0
-            Error   = 'cmdlet not available'
-        })
-    }
-
-    return [PSCustomObject]@{
-        Sessions = @($sessionMap.Values)
-        Attempts = @($attempts)
-    }
-}
-
-
-# ---------------------------------------------------------------------------
-# New-SobrOffloadSectionText
-#   Builds and returns the SOBR Offloads baseline block as a single string.
-#   Reports comprehensive SOBR archive/capacity-tier offload sessions from
-#   Get-VBRSession -Type (Archive* candidates) and capacity-tier sync cmdlets.
-#   Includes sessions when in-window OR still active/in-progress.
-#   Returns an error line inside the delimiters on failure; never throws.
-#   Always returns empty string in JSON mode.
-# ---------------------------------------------------------------------------
-function New-SobrOffloadSectionText {
-    [CmdletBinding()]
-    param()
-
-    if ($Json) { return '' }
-
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    [void]$lines.Add('############### SOBR Offloads BEGIN ###################')
-
-    try {
-        Write-ProgressMessage 'SOBR Offloads — collecting archive/offload sessions...'
-        Write-DebugMessage '[New-SobrOffloadSectionText] Starting SOBR offload collection.'
-
-        if (-not (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue)) {
-            [void]$lines.Add('(Get-VBRSession cmdlet not available; skipping SOBR offload section)')
-            [void]$lines.Add('############### SOBR Offloads END ###################')
-            return ($lines -join [Environment]::NewLine)
-        }
-
-        if (-not (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Type')) {
-            [void]$lines.Add('(Get-VBRSession does not support -Type parameter; skipping SOBR offload section)')
-            [void]$lines.Add('############### SOBR Offloads END ###################')
-            return ($lines -join [Environment]::NewLine)
-        }
-
-        $discovery = Get-P10DiscoveredSobrSessions
-        foreach ($attempt in $discovery.Attempts) {
-            $attemptType = if ([string]::IsNullOrWhiteSpace([string]$attempt.Type)) { '<none>' } else { [string]$attempt.Type }
-            Write-DebugMessage ('[New-SobrOffloadSectionText] Discovery attempt source={0} type={1} success={2} count={3} error="{4}"' -f `
-                [string]$attempt.Source,
-                $attemptType,
-                [string]$attempt.Success,
-                [string]$attempt.Count,
-                [string]$attempt.Error)
-        }
-
-        $discoveredSessions = @(
-            $discovery.Sessions |
-                Sort-Object -Property @(
-                    @{ Expression = { [string](Get-SessionName -Session $_.Session) }; Descending = $false }
-                    @{ Expression = { Get-SortableTicks -Value (Get-SessionStartTime -Session $_.Session) }; Descending = $false }
-                )
-        )
-        Write-ProgressMessage ('SOBR Offloads — {0} unique session(s) discovered.' -f $discoveredSessions.Count)
-        Write-DebugMessage ('[New-SobrOffloadSectionText] {0} unique discovered session(s).' -f $discoveredSessions.Count)
-
-        if ($discoveredSessions.Count -eq 0) {
-            [void]$lines.Add('No SOBR offloads found.')
-            [void]$lines.Add('############### SOBR Offloads END ###################')
-            return ($lines -join [Environment]::NewLine)
-        }
-
-        $reportRows = [System.Collections.Generic.List[object]]::new()
-        $skippedRows = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($discovered in $discoveredSessions) {
-            $OriginalSession = $discovered.Session
-            $sourceText = @($discovered.Sources) -join ', '
-
-            # Attempt to refresh session state; fall back to original on error.
-            $Session = $OriginalSession
-            try {
-                $Refreshed = @(Get-VBRSession -Session $OriginalSession -ErrorAction Stop) |
-                    Where-Object { $null -ne $_ } |
-                    Select-Object -First 1
-                if ($null -ne $Refreshed) {
-                    $Session = $Refreshed
-                }
-            } catch {
-                Write-DebugMessage ('[New-SobrOffloadSectionText] Session refresh failed for "{0}": {1}' -f [string]$OriginalSession.Name, $_.Exception.Message)
-            }
-
-            $StartTime = Get-P10PropertyPathValue `
-                -InputObject $Session `
-                -Paths @(
-                    'CreationTime'
-                    'StartTime'
-                    'CreationTimeLocal'
-                    'Info.CreationTime'
-                )
-
-            try {
-                $StartTime = [datetime]$StartTime
-            } catch {
-                $StartTime = $null
-            }
-
-            $RunTime = if ($null -ne $StartTime) {
-                (Get-Date) - $StartTime
-            } else {
-                [timespan]::Zero
-            }
-
-            $Tasks = @(
-                Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue |
-                    Where-Object { $null -ne $_ }
-            )
-
-            $byteMetrics = Get-P10SessionByteMetrics -Session $Session -Tasks $Tasks
-            $statusText = Get-P10SessionStatusText -Session $Session
-            $progressInfo = Get-P10ProgressInformation `
-                -Session $Session `
-                -Tasks $Tasks `
-                -ByteMetrics $byteMetrics `
-                -StatusText $statusText
-
-            $isWindowSession = Test-SessionInWindow -Session $Session
-            $isActive = Test-P10SessionAppearsActive -Session $Session -StatusText $statusText
-            $hasInProgressPercent = $progressInfo.InProgressPercent
-            $includeReasons = [System.Collections.Generic.List[string]]::new()
-            if ($isWindowSession) { [void]$includeReasons.Add('within-window') }
-            if ($isActive) { [void]$includeReasons.Add('active-state') }
-            if ($hasInProgressPercent) { [void]$includeReasons.Add('in-progress-percent') }
-            $shouldInclude = ($includeReasons.Count -gt 0)
-            $reasonText = if ($includeReasons.Count -gt 0) { ($includeReasons -join ', ') } else { 'outside-window-complete' }
-
-            $Errors = ''
-
-            try {
-                $Errors = [string](Get-LastErrorText -Session $Session)
-                if ($null -eq $Errors) {
-                    $Errors = ''
-                } else {
-                    $Errors = $Errors.Trim()
-                }
-            } catch {
-                $Errors = ''
-                Write-DebugMessage ('[New-SobrOffloadSectionText] Error text retrieval failed for "{0}": {1}' -f [string]$Session.Name, $_.Exception.Message)
-                Write-DebugMessage ('[New-SobrOffloadSectionText] Error text retrieval details:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-            }
-
-            Write-DebugMessage ('[New-SobrOffloadSectionText] Session identity="{0}" include={1} reason="{2}" source="{3}" name="{4}" state="{5}" status="{6}" tasks={7} progress="{8}" progressSource="{9}" transferred="{10}" processed="{11}" total="{12}" measure="{13}" sessionProps="{14}" sessionMethods="{15}"' -f `
-                [string]$discovered.Identity,
-                $shouldInclude,
-                $reasonText,
-                $sourceText,
-                [string]$Session.Name,
-                [string]$Session.State,
-                $statusText,
-                $Tasks.Count,
-                $(if ($null -ne $progressInfo.Percent) { $progressInfo.Percent } else { '<null>' }),
-                [string]$progressInfo.Source,
-                $(if ($null -ne $byteMetrics.Transferred) { $byteMetrics.Transferred } else { '<null>' }),
-                $(if ($null -ne $byteMetrics.Processed) { $byteMetrics.Processed } else { '<null>' }),
-                $(if ($null -ne $byteMetrics.Total) { $byteMetrics.Total } else { '<null>' }),
-                [string]$byteMetrics.Measure,
-                (Get-P10ObjectPropertySummary -InputObject $Session),
-                (Get-P10ObjectMethodSummary -InputObject $Session))
-
-            if ($Tasks.Count -gt 0) {
-                $taskSample = $Tasks | Select-Object -First 3
-                $taskNames = @($taskSample | ForEach-Object { [string](Get-P10PropertyPathValue -InputObject $_ -Paths @('Name', 'ObjectName')) })
-                $taskStates = @($taskSample | ForEach-Object { [string](Get-P10PropertyPathValue -InputObject $_ -Paths @('State', 'Status', 'Result')) })
-                Write-DebugMessage ('[New-SobrOffloadSectionText] Task sample names="{0}" states="{1}" sampleProps="{2}"' -f `
-                    ($taskNames -join ' | '),
-                    ($taskStates -join ' | '),
-                    (Get-P10ObjectPropertySummary -InputObject $taskSample[0] -MaxProperties 20))
-            }
-
-            if (-not $shouldInclude) {
-                [void]$skippedRows.Add(
-                    [PSCustomObject]@{
-                        Identity = [string]$discovered.Identity
-                        Name     = [string]$Session.Name
-                        Source   = [string]$sourceText
-                        State    = [string]$Session.State
-                        Reason   = $reasonText
-                    }
-                )
-                continue
-            }
-
-            $reportRows.Add(
-                [PSCustomObject]@{
-                    SOBROffload = [string]$Session.Name
-                    Source      = [string]$sourceText
-                    Type        = [string](Get-SessionType -Session $Session)
-                    State       = [string]$Session.State
-                    Started     = if ($null -ne $StartTime) {
-                        $StartTime.ToString('dd/MM/yyyy HH:mm')
-                    } else {
-                        'Unknown'
-                    }
-                    Running     = Format-P10RunTime -Duration $RunTime
-                    Progress    = if ($null -ne $progressInfo.Percent) { ('{0}% ({1})' -f $progressInfo.Percent, [string]$progressInfo.Source) } else { 'Unknown' }
-                    DataMoved   = Format-P10ByteSize -Bytes $byteMetrics.Transferred
-                    Processed   = Format-P10ByteSize -Bytes $byteMetrics.Processed
-                    Total       = Format-P10ByteSize -Bytes $byteMetrics.Total
-                    Measure     = $byteMetrics.Measure
-                    Tasks       = $Tasks.Count
-                    Errors      = $Errors
-                }
-            )
-        }
-
-        if ($reportRows.Count -eq 0) {
-            [void]$lines.Add('No SOBR offloads found.')
-        } else {
-            $tableText = $reportRows |
-                Format-Table `
-                    @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=36},
-                    @{Label='Source';       Expression={$_.Source};      Width=26},
-                    @{Label='Type';         Expression={$_.Type};        Width=16},
-                    @{Label='State';        Expression={$_.State};       Width=17},
-                    @{Label='Started';      Expression={$_.Started};     Width=16},
-                    @{Label='Running';      Expression={$_.Running};     Width=13},
-                    @{Label='Progress';     Expression={$_.Progress};    Width=22},
-                    @{Label='Data moved';   Expression={$_.DataMoved};   Width=12},
-                    @{Label='Processed';    Expression={$_.Processed};   Width=12},
-                    @{Label='Total';        Expression={$_.Total};       Width=12},
-                    @{Label='Measure';      Expression={$_.Measure};     Width=26},
-                    @{Label='Tasks';        Expression={$_.Tasks};       Width=5} |
-                Out-String
-
-            foreach ($tl in ($tableText -split '\r?\n')) {
-                [void]$lines.Add($tl)
-            }
-
-            $errorRows = @(
-                $reportRows |
-                    Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Errors) }
-            )
-
-            if ($errorRows.Count -gt 0) {
-                [void]$lines.Add('Errors:')
-                foreach ($errorRow in $errorRows) {
-                    $errorText = ([string]$errorRow.Errors -replace '\r?\n', ' | ').Trim()
-                    [void]$lines.Add(('  {0}: {1}' -f [string]$errorRow.SOBROffload, $errorText))
-                }
-            }
-
-            if ($skippedRows.Count -gt 0) {
-                [void]$lines.Add('Skipped sessions:')
-                foreach ($skipped in $skippedRows) {
-                    [void]$lines.Add(('  {0} | {1} | {2} | {3}' -f [string]$skipped.Name, [string]$skipped.State, [string]$skipped.Source, [string]$skipped.Reason))
-                }
-            }
-        }
-
-        Write-DebugMessage '[New-SobrOffloadSectionText] SOBR offload section complete.'
-
-    } catch {
-        Write-Warning ('SOBR Offloads collection failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[New-SobrOffloadSectionText] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        [void]$lines.Add(('Unable to collect SOBR offload sessions: {0}' -f $_.Exception.Message))
-    }
-
-    [void]$lines.Add('############### SOBR Offloads END ###################')
-    return ($lines -join [Environment]::NewLine)
-}
-
 # ---------------------------------------------------------------------------
 # Build-JobReport
 #   Given a session and metadata, builds one report [pscustomobject].
@@ -4785,9 +3814,7 @@ function New-CollectorReportBody {
         # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
         [string]$LicensingSection = '',
         # Optional Backup Versions baseline block (text mode only; empty in JSON mode).
-        [string]$BackupVersionsSection = '',
-        # Optional SOBR Offloads section (text mode only; empty in JSON mode).
-        [string]$SobrOffloadSection = ''
+        [string]$BackupVersionsSection = ''
     )
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -4817,10 +3844,6 @@ function New-CollectorReportBody {
     }
     if (-not [string]::IsNullOrWhiteSpace($BackupVersionsSection)) {
         [void]$lines.Add($BackupVersionsSection)
-        $hasBaselineSection = $true
-    }
-    if (-not [string]::IsNullOrWhiteSpace($SobrOffloadSection)) {
-        [void]$lines.Add($SobrOffloadSection)
         $hasBaselineSection = $true
     }
     if ($hasBaselineSection) {
@@ -5062,7 +4085,6 @@ $definedJobsSection = ''
 $definedRepositorySection = ''
 $licensingSection = ''
 $backupVersionsSection = ''
-$sobrOffloadSection = ''
 if (-not $Json) {
     Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
     try {
@@ -5331,6 +4353,157 @@ if (Get-Command -Name 'Get-VBRRepositoryExtentSyncSession' -ErrorAction Silently
 }
 
 # ---------------------------------------------------------------------------
+# Phase 6 — SOBR archive backup / offload sessions (Get-VBRSession -Type ArchiveBackup)
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 6 — SOBR archive backup sessions (Get-VBRSession -Type ArchiveBackup).'
+Write-DebugMessage '[Main] Phase 6 — Get-VBRSession -Type ArchiveBackup'
+if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
+    if (Test-CmdletHasParameter -CmdletName 'Get-VBRSession' -ParameterName 'Type') {
+        try {
+            Write-DebugMessage '[Main] Calling Get-VBRSession -Type ArchiveBackup ...'
+            $archiveSessions = @(
+                Get-VBRSession -Type ArchiveBackup -ErrorAction Stop |
+                    Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) } |
+                    Sort-Object CreationTime -Descending
+            )
+            Write-ProgressMessage ('  Found {0} SOBR archive session(s) in window.' -f $archiveSessions.Count)
+            Write-DebugMessage ('[Main] Get-VBRSession -Type ArchiveBackup returned {0} session(s) in window.' -f $archiveSessions.Count)
+
+            foreach ($Session in $archiveSessions) {
+                $sessionId = Get-ObjectIdentity -InputObject $Session
+                if (-not $script:SeenSessions.Add($sessionId)) { continue }
+
+                $sName = Get-SessionName -Session $Session
+                Write-DebugMessage ('[Main] Processing SOBR archive session: {0}' -f $sName)
+
+                # Collect messages: session-level logger records
+                $messages = New-Object 'System.Collections.Generic.List[string]'
+
+                try {
+                    Write-DebugMessage ('[Main] Reading session logger for: {0}' -f $sName)
+                    $sessionLog = if ($null -ne $Session.Logger) { $Session.Logger.GetLog() } else { $null }
+                    if ($null -ne $sessionLog) {
+                        foreach ($Record in $sessionLog.UpdatedRecords) {
+                            if (
+                                [string]$Record.Status -match 'Fail|Error|Warning' -or
+                                $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
+                            ) {
+                                if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
+                                    [void]$messages.Add($Record.Title)
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    Write-DebugMessage ('[Main] Session logger read failed for "{0}":' -f $sName +
+                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                    [void]$messages.Add("Unable to read session log: $($_.Exception.Message)")
+                }
+
+                # Collect messages: task sessions via Get-VBRTaskSession
+                try {
+                    Write-DebugMessage ('[Main] Calling Get-VBRTaskSession for: {0}' -f $sName)
+                    $Tasks = @(Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue)
+                    Write-DebugMessage ('[Main] Get-VBRTaskSession returned {0} task(s) for: {1}' -f $Tasks.Count, $sName)
+
+                    foreach ($Task in $Tasks) {
+                        $taskName = if ($null -ne $Task -and $null -ne $Task.PSObject.Properties['Name']) { [string]$Task.Name } else { '<unnamed>' }
+
+                        # Task failure reason
+                        try {
+                            if (
+                                $null -ne $Task.Info -and
+                                -not [string]::IsNullOrWhiteSpace($Task.Info.Reason) -and
+                                $Task.Info.Reason -notmatch 'Success'
+                            ) {
+                                Write-DebugMessage ('[Main] Task "{0}" reason: {1}' -f $taskName, $Task.Info.Reason)
+                                [void]$messages.Add(('{0}: {1}' -f $taskName, $Task.Info.Reason))
+                            }
+                        } catch {
+                            Write-DebugMessage ('[Main] Task reason access failed for "{0}":' -f $taskName +
+                                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                        }
+
+                        # Task logger records
+                        try {
+                            Write-DebugMessage ('[Main] Reading task logger for: {0}' -f $taskName)
+                            $taskLog = if ($null -ne $Task.Logger) { $Task.Logger.GetLog() } else { $null }
+                            if ($null -ne $taskLog) {
+                                foreach ($Record in $taskLog.UpdatedRecords) {
+                                    if (
+                                        [string]$Record.Status -match 'Fail|Error|Warning' -or
+                                        $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
+                                    ) {
+                                        if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
+                                            [void]$messages.Add(('{0}: {1}' -f $taskName, $Record.Title))
+                                        }
+                                    }
+                                }
+                            }
+                        } catch {
+                            Write-DebugMessage ('[Main] Task logger read failed for "{0}":' -f $taskName +
+                                [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                        }
+                    }
+                } catch {
+                    Write-DebugMessage ('[Main] Get-VBRTaskSession failed for "{0}":' -f $sName +
+                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+                }
+
+                # De-duplicate messages and build last_error string
+                $uniqueMessages = @(
+                    $messages |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                        Select-Object -Unique
+                )
+
+                $sResult = Get-SessionState -Session $Session
+                $lastError = if ($uniqueMessages.Count -gt 0) {
+                    $uniqueMessages -join '; '
+                } elseif ($sResult -eq 'Success') {
+                    'None'
+                } else {
+                    ''
+                }
+
+                $sStart         = Get-SessionStartTime   -Session $Session
+                $sEnd           = Get-SessionEndTime     -Session $Session
+                $isRunning      = Test-SessionIsRunning  -Session $Session
+                $runningFor     = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
+                $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
+                $dataProcessed  = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
+                $warningDetails = Get-VeeamWarningDetails -Session $Session
+
+                $report = [pscustomobject][ordered]@{
+                    job_name        = $sName
+                    job_type        = 'SOBRArchiveBackup'
+                    result          = $sResult
+                    start_time      = if ($null -ne $sStart) { $sStart.ToString('o') } else { $null }
+                    end_time        = if ($null -ne $sEnd)   { $sEnd.ToString('o')   } else { $null }
+                    running_for     = $runningFor
+                    data_processed  = $dataProcessed
+                    last_error      = $lastError
+                    warning_details = $warningDetails
+                    source          = 'Get-VBRSession-ArchiveBackup'
+                }
+
+                Write-DebugMessage ('[Main] SOBR archive report: name={0} result={1} last_error={2}' -f $report.job_name, $report.result, $report.last_error)
+                [void]$allReports.Add($report)
+            }
+        } catch {
+            Write-Warning ('Unable to enumerate SOBR archive backup sessions: {0}' -f $_.Exception.Message)
+            Write-DebugMessage ('[Main] Get-VBRSession -Type ArchiveBackup threw:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        }
+    } else {
+        Write-ProgressMessage '  Get-VBRSession does not support -Type parameter. Skipping SOBR archive phase.'
+        Write-DebugMessage '[Main] Get-VBRSession has no -Type parameter; skipping Phase 6.'
+    }
+} else {
+    Write-ProgressMessage '  Get-VBRSession not available. Skipping SOBR archive phase.'
+    Write-DebugMessage '[Main] Get-VBRSession cmdlet not found; skipping Phase 6.'
+}
+
+# ---------------------------------------------------------------------------
 # Phase 7 — Defined Repository baseline (text mode only)
 #   Collects repository utilisation and stores it in $definedRepositorySection
 #   so it can be included in the human-readable report body.
@@ -5385,25 +4558,6 @@ if (-not $Json) {
         Write-Warning ('Backup Versions phase failed: {0}' -f $_.Exception.Message)
         Write-DebugMessage ('[Main] Backup Versions phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         $backupVersionsSection = ''
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Phase 10 — SOBR Offloads (text mode only)
-#   Collects all SOBR archive/capacity-tier offload sessions within the window
-#   and stores the result in $sobrOffloadSection for inclusion in the report.
-#   In -Json mode this phase is skipped so stdout remains a pure JSON array.
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 10 — SOBR Offloads (archive/offload sessions).'
-Write-DebugMessage '[Main] Phase 10 — SOBR Offloads.'
-if (-not $Json) {
-    try {
-        $sobrOffloadSection = New-SobrOffloadSectionText
-        Write-DebugMessage ('[Main] SOBR Offloads section ready, {0} char(s).' -f $sobrOffloadSection.Length)
-    } catch {
-        Write-Warning ('SOBR Offloads phase failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] SOBR Offloads phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $sobrOffloadSection = ''
     }
 }
 
@@ -5483,8 +4637,7 @@ $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
     -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection `
-    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection `
-    -SobrOffloadSection $sobrOffloadSection
+    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
