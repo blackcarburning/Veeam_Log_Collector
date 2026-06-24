@@ -201,9 +201,11 @@
         this cmdlet is handled gracefully.
 
     SOBR offload sessions (text mode only):
-      - A single delimited SOBR Offloads section uses Get-VBRSession -Type
-        ArchiveBackup to report all archive/capacity-tier offload sessions in
-        the window (running sessions are always included).  The section is
+      - A single delimited SOBR Offloads section discovers archive/offload
+        sessions via Get-VBRSession -Type (Archive* candidates accepted by the
+        runtime) and Get-VBRCapacityTierSyncSession when available.  Sessions
+        are de-duplicated by stable identity and include running/in-progress
+        work even when it started before the -Hours cutoff.  The section is
         wrapped with:
             ############### SOBR Offloads BEGIN ###################
             ############### SOBR Offloads END ###################
@@ -3804,104 +3806,529 @@ function Format-P10RunTime {
 }
 
 
-function Get-P10SessionProgressPercent {
+function Get-P10ObjectPropertySummary {
+    param (
+        [AllowNull()]
+        [object]$InputObject,
+        [int]$MaxProperties = 25
+    )
+
+    if ($null -eq $InputObject) {
+        return '<null>'
+    }
+
+    try {
+        $names = @(
+            $InputObject.PSObject.Properties |
+                Select-Object -ExpandProperty Name
+        )
+        if ($names.Count -eq 0) {
+            return '<none>'
+        }
+
+        $shown = @($names | Select-Object -First $MaxProperties)
+        if ($names.Count -gt $shown.Count) {
+            return ((($shown -join ', ') + ', ... (+{0})') -f ($names.Count - $shown.Count))
+        }
+        return ($shown -join ', ')
+    } catch {
+        return ('<error: {0}>' -f $_.Exception.Message)
+    }
+}
+
+
+function Get-P10ObjectMethodSummary {
+    param (
+        [AllowNull()]
+        [object]$InputObject,
+        [int]$MaxMethods = 20
+    )
+
+    if ($null -eq $InputObject) {
+        return '<null>'
+    }
+
+    try {
+        $names = @(
+            $InputObject.PSObject.Methods |
+                Select-Object -ExpandProperty Name -Unique
+        )
+        if ($names.Count -eq 0) {
+            return '<none>'
+        }
+
+        $shown = @($names | Select-Object -First $MaxMethods)
+        if ($names.Count -gt $shown.Count) {
+            return ((($shown -join ', ') + ', ... (+{0})') -f ($names.Count - $shown.Count))
+        }
+        return ($shown -join ', ')
+    } catch {
+        return ('<error: {0}>' -f $_.Exception.Message)
+    }
+}
+
+
+function Get-P10ArchiveTypeCandidates {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in @('ArchiveBackup', 'ArchiveCopy', 'Archive')) {
+        if (-not [string]::IsNullOrWhiteSpace($name) -and -not $candidates.Contains($name)) {
+            [void]$candidates.Add($name)
+        }
+    }
+
+    try {
+        $sessionCmd = Get-Command -Name 'Get-VBRSession' -ErrorAction Stop
+        $typeParameter = $sessionCmd.Parameters['Type']
+        if ($null -ne $typeParameter -and $null -ne $typeParameter.ParameterType -and $typeParameter.ParameterType.IsEnum) {
+            foreach ($enumName in [System.Enum]::GetNames($typeParameter.ParameterType)) {
+                if ($enumName -match 'Archive' -and -not $candidates.Contains([string]$enumName)) {
+                    [void]$candidates.Add([string]$enumName)
+                }
+            }
+        }
+    } catch {
+        Write-DebugMessage ('[Get-P10ArchiveTypeCandidates] Unable to enumerate Type parameter enum names: {0}' -f $_.Exception.Message)
+    }
+
+    return @($candidates)
+}
+
+
+function Get-P10SessionStatusText {
     param (
         [Parameter(Mandatory)]
         [object]$Session
     )
 
-    $Result = Get-P10FirstNumericValue `
-        -InputObject $Session `
-        -Paths @(
-            'Progress'
-            'Progress.Percent'
-            'Progress.Percents'
-            'Info.Progress.Percent'
-            'Info.Progress.Percents'
-        )
-
-    if (-not $Result.Found) {
-        Write-DebugMessage '[Get-P10SessionProgressPercent] no numeric progress found -> null'
-        return $null
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @(
+        'State'
+        'Status'
+        'Result'
+        'Details'
+        'Info.State'
+        'Info.Status'
+        'Info.Result'
+        'Info.Details'
+        'Info.Progress.Status'
+        'Info.Progress.Details'
+        'Progress.Status'
+        'Progress.Details'
+    )) {
+        $value = Get-P10PropertyPathValue -InputObject $Session -Paths @($path)
+        if ($null -ne $value) {
+            $text = [string]$value
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                [void]$parts.Add($text)
+            }
+        }
     }
 
-    [int]$Percent = [math]::Round($Result.Value)
-
-    if ($Percent -lt 0) {
-        $Percent = 0
-    }
-
-    if ($Percent -gt 100) {
-        $Percent = 100
-    }
-
-    Write-DebugMessage ('[Get-P10SessionProgressPercent] path={0} value={1} -> {2}%' -f [string]$Result.Path, $Result.Value, $Percent)
-    return $Percent
+    return ($parts -join ' | ')
 }
 
 
-function Get-P10TaskTransferInformation {
+function Get-P10PercentFromText {
     param (
+        [AllowNull()]
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $null
+    }
+
+    $matches = [regex]::Matches($Text, '(?<!\d)(\d{1,3})\s*%')
+    foreach ($m in $matches) {
+        [int]$parsed = 0
+        if ([int]::TryParse($m.Groups[1].Value, [ref]$parsed)) {
+            if ($parsed -ge 0 -and $parsed -le 100) {
+                return $parsed
+            }
+        }
+    }
+
+    return $null
+}
+
+
+function Test-P10SessionAppearsActive {
+    param (
+        [Parameter(Mandatory)]
+        [object]$Session,
+        [AllowNull()]
+        [string]$StatusText
+    )
+
+    if (Test-SessionIsRunning -Session $Session) {
+        return $true
+    }
+
+    $stateText = if ([string]::IsNullOrWhiteSpace($StatusText)) {
+        Get-P10SessionStatusText -Session $Session
+    } else {
+        [string]$StatusText
+    }
+
+    if ([string]::IsNullOrWhiteSpace($stateText)) {
+        return $false
+    }
+
+    return ($stateText -imatch 'Working|InProgress|Running|Pending|Waiting|WaitingSlot|Queued|Queue|Starting|Resuming|Stopping|ActionRequired')
+}
+
+
+function Get-P10SessionByteMetrics {
+    param (
+        [Parameter(Mandatory)]
+        [object]$Session,
         [Parameter(Mandatory)]
         [object[]]$Tasks
     )
 
-    [double]$TransferredTotal = 0.0
-    [double]$ProcessedTotal   = 0.0
+    $metricMap = @{
+        Transferred = @(
+            'Progress.TransferedSize'
+            'Progress.TransferredSize'
+            'Info.Progress.TransferedSize'
+            'Info.Progress.TransferredSize'
+            'TransferedSize'
+            'TransferredSize'
+            'Progress.TransferedBytes'
+            'Progress.TransferredBytes'
+            'Info.Progress.TransferedBytes'
+            'Info.Progress.TransferredBytes'
+            'TransferedBytes'
+            'TransferredBytes'
+            'ArchivedSize'
+            'Info.Progress.ArchivedSize'
+            'Progress.ArchivedSize'
+        )
+        Processed   = @(
+            'Progress.ProcessedSize'
+            'Info.Progress.ProcessedSize'
+            'ProcessedSize'
+            'ReadSize'
+            'Progress.ReadSize'
+            'Info.Progress.ReadSize'
+            'ProcessedUsedSize'
+            'Progress.ProcessedUsedSize'
+            'Info.Progress.ProcessedUsedSize'
+        )
+        Total       = @(
+            'Progress.TotalSize'
+            'Info.Progress.TotalSize'
+            'TotalSize'
+            'TotalUsedSize'
+            'Progress.TotalUsedSize'
+            'Info.Progress.TotalUsedSize'
+        )
+    }
 
-    $TransferredFound = $false
-    $ProcessedFound   = $false
+    $result = [ordered]@{}
+    foreach ($metricName in @('Transferred', 'Processed', 'Total')) {
+        $foundAt = [System.Collections.Generic.List[string]]::new()
+        $sum = 0.0
+        $found = $false
 
-    foreach ($Task in $Tasks) {
-        # Veeam has historically exposed the property as TransferedSize
-        # with one "r". Check both spellings and both common object paths.
-        $Transferred = Get-P10FirstNumericValue `
-            -InputObject $Task `
-            -Paths @(
-                'Progress.TransferedSize'
-                'Progress.TransferredSize'
-                'Info.Progress.TransferedSize'
-                'Info.Progress.TransferredSize'
-                'TransferedSize'
-                'TransferredSize'
-            )
-
-        if ($Transferred.Found) {
-            $TransferredTotal += [double]$Transferred.Value
-            $TransferredFound = $true
+        $sessionValue = Get-P10FirstNumericValue -InputObject $Session -Paths $metricMap[$metricName]
+        if ($sessionValue.Found) {
+            $sum = [double]$sessionValue.Value
+            $found = $true
+            [void]$foundAt.Add(('session:{0}' -f [string]$sessionValue.Path))
+        } else {
+            $taskIndex = 0
+            foreach ($task in $Tasks) {
+                $taskIndex++
+                $taskValue = Get-P10FirstNumericValue -InputObject $task -Paths $metricMap[$metricName]
+                if ($taskValue.Found) {
+                    $sum += [double]$taskValue.Value
+                    $found = $true
+                    [void]$foundAt.Add(('task[{0}]:{1}' -f $taskIndex, [string]$taskValue.Path))
+                }
+            }
         }
 
-        $Processed = Get-P10FirstNumericValue `
-            -InputObject $Task `
-            -Paths @(
-                'Progress.ProcessedSize'
-                'Info.Progress.ProcessedSize'
-                'ProcessedSize'
-            )
-
-        if ($Processed.Found) {
-            $ProcessedTotal += [double]$Processed.Value
-            $ProcessedFound = $true
+        $result[$metricName] = if ($found) { $sum } else { $null }
+        $result["${metricName}Sources"] = if ($foundAt.Count -gt 0) {
+            @($foundAt | Select-Object -First 3) -join '; '
+        } else {
+            ''
         }
     }
 
-    if ($TransferredFound) {
-        return [PSCustomObject]@{
-            Bytes   = $TransferredTotal
-            Measure = 'Transferred'
+    $measureParts = [System.Collections.Generic.List[string]]::new()
+    foreach ($name in @('Transferred', 'Processed', 'Total')) {
+        if ($null -ne $result[$name]) {
+            $src = [string]$result["${name}Sources"]
+            if ([string]::IsNullOrWhiteSpace($src)) {
+                [void]$measureParts.Add($name)
+            } else {
+                [void]$measureParts.Add(('{0}<{1}>' -f $name, $src))
+            }
         }
     }
 
-    if ($ProcessedFound) {
+    if ($measureParts.Count -eq 0) {
+        $result['Measure'] = 'Unknown'
+    } else {
+        $result['Measure'] = ($measureParts -join ' | ')
+    }
+
+    return [PSCustomObject]$result
+}
+
+
+function Get-P10ProgressInformation {
+    param (
+        [Parameter(Mandatory)]
+        [object]$Session,
+        [Parameter(Mandatory)]
+        [object[]]$Tasks,
+        [Parameter(Mandatory)]
+        [object]$ByteMetrics,
+        [AllowNull()]
+        [string]$StatusText
+    )
+
+    $status = if ([string]::IsNullOrWhiteSpace($StatusText)) {
+        Get-P10SessionStatusText -Session $Session
+    } else {
+        [string]$StatusText
+    }
+
+    if ($null -ne $ByteMetrics.Total -and $ByteMetrics.Total -gt 0) {
+        if ($null -ne $ByteMetrics.Processed) {
+            $pct = [int][math]::Round(([double]$ByteMetrics.Processed / [double]$ByteMetrics.Total) * 100.0)
+            if ($pct -lt 0) { $pct = 0 }
+            if ($pct -gt 100) { $pct = 100 }
+            return [PSCustomObject]@{
+                Percent           = $pct
+                Source            = 'bytes(processed/total)'
+                InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
+                StatusText        = $status
+            }
+        }
+
+        if ($null -ne $ByteMetrics.Transferred) {
+            $pct = [int][math]::Round(([double]$ByteMetrics.Transferred / [double]$ByteMetrics.Total) * 100.0)
+            if ($pct -lt 0) { $pct = 0 }
+            if ($pct -gt 100) { $pct = 100 }
+            return [PSCustomObject]@{
+                Percent           = $pct
+                Source            = 'bytes(transferred/total)'
+                InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
+                StatusText        = $status
+            }
+        }
+    }
+
+    $sessionPercent = Get-P10FirstNumericValue `
+        -InputObject $Session `
+        -Paths @(
+            'Progress.Percent'
+            'Progress.Percents'
+            'Info.Progress.Percent'
+            'Info.Progress.Percents'
+            'Progress'
+        )
+    if ($sessionPercent.Found) {
+        $pct = [int][math]::Round([double]$sessionPercent.Value)
+        if ($pct -ge 0 -and $pct -le 100) {
+            return [PSCustomObject]@{
+                Percent           = $pct
+                Source            = ('session:{0}' -f [string]$sessionPercent.Path)
+                InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
+                StatusText        = $status
+            }
+        }
+    }
+
+    $textPercent = Get-P10PercentFromText -Text $status
+    if ($null -ne $textPercent) {
         return [PSCustomObject]@{
-            Bytes   = $ProcessedTotal
-            Measure = 'Processed fallback'
+            Percent           = $textPercent
+            Source            = 'status-text'
+            InProgressPercent = ($textPercent -gt 0 -and $textPercent -lt 100)
+            StatusText        = $status
+        }
+    }
+
+    [double]$weightedTotal = 0.0
+    [double]$weightedPercent = 0.0
+    [double]$unweightedPercent = 0.0
+    [int]$unweightedCount = 0
+
+    foreach ($task in $Tasks) {
+        $taskPercentResult = Get-P10FirstNumericValue `
+            -InputObject $task `
+            -Paths @(
+                'Progress.Percent'
+                'Progress.Percents'
+                'Info.Progress.Percent'
+                'Info.Progress.Percents'
+                'Progress'
+            )
+
+        [int]$taskPercent = -1
+        if ($taskPercentResult.Found) {
+            $taskPercent = [int][math]::Round([double]$taskPercentResult.Value)
+        } else {
+            $taskStatus = Get-P10SessionStatusText -Session $task
+            $taskPercentFromText = Get-P10PercentFromText -Text $taskStatus
+            if ($null -ne $taskPercentFromText) {
+                $taskPercent = $taskPercentFromText
+            }
+        }
+
+        if ($taskPercent -lt 0 -or $taskPercent -gt 100) {
+            continue
+        }
+
+        $taskWeightResult = Get-P10FirstNumericValue `
+            -InputObject $task `
+            -Paths @(
+                'Progress.TotalSize'
+                'Info.Progress.TotalSize'
+                'TotalSize'
+                'TotalUsedSize'
+                'Progress.TotalUsedSize'
+                'Info.Progress.TotalUsedSize'
+            )
+
+        if ($taskWeightResult.Found -and [double]$taskWeightResult.Value -gt 0) {
+            $weightedTotal += [double]$taskWeightResult.Value
+            $weightedPercent += ([double]$taskPercent * [double]$taskWeightResult.Value)
+        } else {
+            $unweightedPercent += [double]$taskPercent
+            $unweightedCount++
+        }
+    }
+
+    if ($weightedTotal -gt 0) {
+        $pct = [int][math]::Round($weightedPercent / $weightedTotal)
+        if ($pct -lt 0) { $pct = 0 }
+        if ($pct -gt 100) { $pct = 100 }
+        return [PSCustomObject]@{
+            Percent           = $pct
+            Source            = 'tasks-weighted-total'
+            InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
+            StatusText        = $status
+        }
+    }
+
+    if ($unweightedCount -gt 0) {
+        $pct = [int][math]::Round($unweightedPercent / $unweightedCount)
+        if ($pct -lt 0) { $pct = 0 }
+        if ($pct -gt 100) { $pct = 100 }
+        return [PSCustomObject]@{
+            Percent           = $pct
+            Source            = 'tasks-average'
+            InProgressPercent = ($pct -gt 0 -and $pct -lt 100)
+            StatusText        = $status
         }
     }
 
     return [PSCustomObject]@{
-        Bytes   = $null
-        Measure = 'Unavailable'
+        Percent           = $null
+        Source            = 'unknown'
+        InProgressPercent = $false
+        StatusText        = $status
+    }
+}
+
+
+function Get-P10DiscoveredSobrSessions {
+    $sessionMap = @{}
+    $attempts = [System.Collections.Generic.List[object]]::new()
+
+    $archiveTypes = @(Get-P10ArchiveTypeCandidates)
+    if ($archiveTypes.Count -eq 0) {
+        $archiveTypes = @('ArchiveBackup')
+    }
+
+    foreach ($archiveType in $archiveTypes) {
+        try {
+            $sessions = @(Get-VBRSession -Type $archiveType -ErrorAction Stop | Where-Object { $null -ne $_ })
+            [void]$attempts.Add([PSCustomObject]@{
+                Source  = 'Get-VBRSession'
+                Type    = [string]$archiveType
+                Success = $true
+                Count   = $sessions.Count
+                Error   = ''
+            })
+
+            foreach ($session in $sessions) {
+                $identity = Get-ObjectIdentity -InputObject $session
+                if (-not $sessionMap.ContainsKey($identity)) {
+                    $sessionMap[$identity] = [PSCustomObject]@{
+                        Identity = $identity
+                        Session  = $session
+                        Sources  = [System.Collections.Generic.List[string]]::new()
+                    }
+                }
+                $sourceLabel = ('Get-VBRSession:{0}' -f [string]$archiveType)
+                if (-not $sessionMap[$identity].Sources.Contains($sourceLabel)) {
+                    [void]$sessionMap[$identity].Sources.Add($sourceLabel)
+                }
+            }
+        } catch {
+            [void]$attempts.Add([PSCustomObject]@{
+                Source  = 'Get-VBRSession'
+                Type    = [string]$archiveType
+                Success = $false
+                Count   = 0
+                Error   = [string]$_.Exception.Message
+            })
+        }
+    }
+
+    if (Get-Command -Name 'Get-VBRCapacityTierSyncSession' -ErrorAction SilentlyContinue) {
+        try {
+            $capacitySessions = @(Get-VBRCapacityTierSyncSession -ErrorAction Stop | Where-Object { $null -ne $_ })
+            [void]$attempts.Add([PSCustomObject]@{
+                Source  = 'Get-VBRCapacityTierSyncSession'
+                Type    = ''
+                Success = $true
+                Count   = $capacitySessions.Count
+                Error   = ''
+            })
+
+            foreach ($session in $capacitySessions) {
+                $identity = Get-ObjectIdentity -InputObject $session
+                if (-not $sessionMap.ContainsKey($identity)) {
+                    $sessionMap[$identity] = [PSCustomObject]@{
+                        Identity = $identity
+                        Session  = $session
+                        Sources  = [System.Collections.Generic.List[string]]::new()
+                    }
+                }
+                if (-not $sessionMap[$identity].Sources.Contains('Get-VBRCapacityTierSyncSession')) {
+                    [void]$sessionMap[$identity].Sources.Add('Get-VBRCapacityTierSyncSession')
+                }
+            }
+        } catch {
+            [void]$attempts.Add([PSCustomObject]@{
+                Source  = 'Get-VBRCapacityTierSyncSession'
+                Type    = ''
+                Success = $false
+                Count   = 0
+                Error   = [string]$_.Exception.Message
+            })
+        }
+    } else {
+        [void]$attempts.Add([PSCustomObject]@{
+            Source  = 'Get-VBRCapacityTierSyncSession'
+            Type    = ''
+            Success = $false
+            Count   = 0
+            Error   = 'cmdlet not available'
+        })
+    }
+
+    return [PSCustomObject]@{
+        Sessions = @($sessionMap.Values)
+        Attempts = @($attempts)
     }
 }
 
@@ -3909,8 +4336,9 @@ function Get-P10TaskTransferInformation {
 # ---------------------------------------------------------------------------
 # New-SobrOffloadSectionText
 #   Builds and returns the SOBR Offloads baseline block as a single string.
-#   Reports all SOBR archive/capacity-tier offload sessions within the time
-#   window (running sessions are always included).
+#   Reports comprehensive SOBR archive/capacity-tier offload sessions from
+#   Get-VBRSession -Type (Archive* candidates) and capacity-tier sync cmdlets.
+#   Includes sessions when in-window OR still active/in-progress.
 #   Returns an error line inside the delimiters on failure; never throws.
 #   Always returns empty string in JSON mode.
 # ---------------------------------------------------------------------------
@@ -3939,26 +4367,40 @@ function New-SobrOffloadSectionText {
             return ($lines -join [Environment]::NewLine)
         }
 
-        $sobrSessions = @(
-            Get-VBRSession -Type ArchiveBackup -ErrorAction Stop |
-                Where-Object { $null -ne $_ -and (Test-SessionInWindow -Session $_) } |
+        $discovery = Get-P10DiscoveredSobrSessions
+        foreach ($attempt in $discovery.Attempts) {
+            $attemptType = if ([string]::IsNullOrWhiteSpace([string]$attempt.Type)) { '<none>' } else { [string]$attempt.Type }
+            Write-DebugMessage ('[New-SobrOffloadSectionText] Discovery attempt source={0} type={1} success={2} count={3} error="{4}"' -f `
+                [string]$attempt.Source,
+                $attemptType,
+                [string]$attempt.Success,
+                [string]$attempt.Count,
+                [string]$attempt.Error)
+        }
+
+        $discoveredSessions = @(
+            $discovery.Sessions |
                 Sort-Object -Property @(
-                    @{ Expression = { [string]$_.Name }; Descending = $false }
+                    @{ Expression = { [string](Get-SessionName -Session $_.Session) }; Descending = $false }
+                    @{ Expression = { Get-SortableTicks -Value (Get-SessionStartTime -Session $_.Session) }; Descending = $false }
                 )
         )
+        Write-ProgressMessage ('SOBR Offloads — {0} unique session(s) discovered.' -f $discoveredSessions.Count)
+        Write-DebugMessage ('[New-SobrOffloadSectionText] {0} unique discovered session(s).' -f $discoveredSessions.Count)
 
-        Write-ProgressMessage ('SOBR Offloads — {0} session(s) found in window.' -f $sobrSessions.Count)
-        Write-DebugMessage ('[New-SobrOffloadSectionText] {0} session(s) in window.' -f $sobrSessions.Count)
-
-        if ($sobrSessions.Count -eq 0) {
+        if ($discoveredSessions.Count -eq 0) {
             [void]$lines.Add('No SOBR offloads found.')
             [void]$lines.Add('############### SOBR Offloads END ###################')
             return ($lines -join [Environment]::NewLine)
         }
 
         $reportRows = [System.Collections.Generic.List[object]]::new()
+        $skippedRows = [System.Collections.Generic.List[object]]::new()
 
-        foreach ($OriginalSession in $sobrSessions) {
+        foreach ($discovered in $discoveredSessions) {
+            $OriginalSession = $discovered.Session
+            $sourceText = @($discovered.Sources) -join ', '
+
             # Attempt to refresh session state; fall back to original on error.
             $Session = $OriginalSession
             try {
@@ -3998,28 +4440,24 @@ function New-SobrOffloadSectionText {
                     Where-Object { $null -ne $_ }
             )
 
-            $Transfer = Get-P10TaskTransferInformation -Tasks $Tasks
+            $byteMetrics = Get-P10SessionByteMetrics -Session $Session -Tasks $Tasks
+            $statusText = Get-P10SessionStatusText -Session $Session
+            $progressInfo = Get-P10ProgressInformation `
+                -Session $Session `
+                -Tasks $Tasks `
+                -ByteMetrics $byteMetrics `
+                -StatusText $statusText
 
-            # Some builds expose transfer information at session level instead.
-            if ($null -eq $Transfer.Bytes) {
-                $SessionTransfer = Get-P10FirstNumericValue `
-                    -InputObject $Session `
-                    -Paths @(
-                        'Info.Progress.TransferedSize'
-                        'Info.Progress.TransferredSize'
-                        'Progress.TransferedSize'
-                        'Progress.TransferredSize'
-                    )
+            $isWindowSession = Test-SessionInWindow -Session $Session
+            $isActive = Test-P10SessionAppearsActive -Session $Session -StatusText $statusText
+            $hasInProgressPercent = $progressInfo.InProgressPercent
+            $includeReasons = [System.Collections.Generic.List[string]]::new()
+            if ($isWindowSession) { [void]$includeReasons.Add('within-window') }
+            if ($isActive) { [void]$includeReasons.Add('active-state') }
+            if ($hasInProgressPercent) { [void]$includeReasons.Add('in-progress-percent') }
+            $shouldInclude = ($includeReasons.Count -gt 0)
+            $reasonText = if ($includeReasons.Count -gt 0) { ($includeReasons -join ', ') } else { 'outside-window-complete' }
 
-                if ($SessionTransfer.Found) {
-                    $Transfer = [PSCustomObject]@{
-                        Bytes   = [double]$SessionTransfer.Value
-                        Measure = 'Session transferred'
-                    }
-                }
-            }
-
-            $Progress = Get-P10SessionProgressPercent -Session $Session
             $Errors = ''
 
             try {
@@ -4035,18 +4473,52 @@ function New-SobrOffloadSectionText {
                 Write-DebugMessage ('[New-SobrOffloadSectionText] Error text retrieval details:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
             }
 
-            Write-DebugMessage ('[New-SobrOffloadSectionText] Session "{0}" state="{1}" tasks={2} transfer.found={3} transfer.bytes="{4}" transfer.measure="{5}" progress="{6}"' -f `
+            Write-DebugMessage ('[New-SobrOffloadSectionText] Session identity="{0}" include={1} reason="{2}" source="{3}" name="{4}" state="{5}" status="{6}" tasks={7} progress="{8}" progressSource="{9}" transferred="{10}" processed="{11}" total="{12}" measure="{13}" sessionProps="{14}" sessionMethods="{15}"' -f `
+                [string]$discovered.Identity,
+                $shouldInclude,
+                $reasonText,
+                $sourceText,
                 [string]$Session.Name,
                 [string]$Session.State,
+                $statusText,
                 $Tasks.Count,
-                ($null -ne $Transfer.Bytes),
-                $Transfer.Bytes,
-                [string]$Transfer.Measure,
-                $(if ($null -ne $Progress) { $Progress } else { '<null>' }))
+                $(if ($null -ne $progressInfo.Percent) { $progressInfo.Percent } else { '<null>' }),
+                [string]$progressInfo.Source,
+                $(if ($null -ne $byteMetrics.Transferred) { $byteMetrics.Transferred } else { '<null>' }),
+                $(if ($null -ne $byteMetrics.Processed) { $byteMetrics.Processed } else { '<null>' }),
+                $(if ($null -ne $byteMetrics.Total) { $byteMetrics.Total } else { '<null>' }),
+                [string]$byteMetrics.Measure,
+                (Get-P10ObjectPropertySummary -InputObject $Session),
+                (Get-P10ObjectMethodSummary -InputObject $Session))
+
+            if ($Tasks.Count -gt 0) {
+                $taskSample = $Tasks | Select-Object -First 3
+                $taskNames = @($taskSample | ForEach-Object { [string](Get-P10PropertyPathValue -InputObject $_ -Paths @('Name', 'ObjectName')) })
+                $taskStates = @($taskSample | ForEach-Object { [string](Get-P10PropertyPathValue -InputObject $_ -Paths @('State', 'Status', 'Result')) })
+                Write-DebugMessage ('[New-SobrOffloadSectionText] Task sample names="{0}" states="{1}" sampleProps="{2}"' -f `
+                    ($taskNames -join ' | '),
+                    ($taskStates -join ' | '),
+                    (Get-P10ObjectPropertySummary -InputObject $taskSample[0] -MaxProperties 20))
+            }
+
+            if (-not $shouldInclude) {
+                [void]$skippedRows.Add(
+                    [PSCustomObject]@{
+                        Identity = [string]$discovered.Identity
+                        Name     = [string]$Session.Name
+                        Source   = [string]$sourceText
+                        State    = [string]$Session.State
+                        Reason   = $reasonText
+                    }
+                )
+                continue
+            }
 
             $reportRows.Add(
                 [PSCustomObject]@{
                     SOBROffload = [string]$Session.Name
+                    Source      = [string]$sourceText
+                    Type        = [string](Get-SessionType -Session $Session)
                     State       = [string]$Session.State
                     Started     = if ($null -ne $StartTime) {
                         $StartTime.ToString('dd/MM/yyyy HH:mm')
@@ -4054,9 +4526,11 @@ function New-SobrOffloadSectionText {
                         'Unknown'
                     }
                     Running     = Format-P10RunTime -Duration $RunTime
-                    Progress    = if ($null -ne $Progress) { "$Progress%" } else { 'N/A' }
-                    DataMoved   = Format-P10ByteSize -Bytes $Transfer.Bytes
-                    Measure     = $Transfer.Measure
+                    Progress    = if ($null -ne $progressInfo.Percent) { ('{0}% ({1})' -f $progressInfo.Percent, [string]$progressInfo.Source) } else { 'Unknown' }
+                    DataMoved   = Format-P10ByteSize -Bytes $byteMetrics.Transferred
+                    Processed   = Format-P10ByteSize -Bytes $byteMetrics.Processed
+                    Total       = Format-P10ByteSize -Bytes $byteMetrics.Total
+                    Measure     = $byteMetrics.Measure
                     Tasks       = $Tasks.Count
                     Errors      = $Errors
                 }
@@ -4069,12 +4543,16 @@ function New-SobrOffloadSectionText {
             $tableText = $reportRows |
                 Format-Table `
                     @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=36},
+                    @{Label='Source';       Expression={$_.Source};      Width=26},
+                    @{Label='Type';         Expression={$_.Type};        Width=16},
                     @{Label='State';        Expression={$_.State};       Width=17},
                     @{Label='Started';      Expression={$_.Started};     Width=16},
                     @{Label='Running';      Expression={$_.Running};     Width=13},
-                    @{Label='Progress';     Expression={$_.Progress};    Width=8},
+                    @{Label='Progress';     Expression={$_.Progress};    Width=22},
                     @{Label='Data moved';   Expression={$_.DataMoved};   Width=12},
-                    @{Label='Measure';      Expression={$_.Measure};     Width=18},
+                    @{Label='Processed';    Expression={$_.Processed};   Width=12},
+                    @{Label='Total';        Expression={$_.Total};       Width=12},
+                    @{Label='Measure';      Expression={$_.Measure};     Width=26},
                     @{Label='Tasks';        Expression={$_.Tasks};       Width=5} |
                 Out-String
 
@@ -4092,6 +4570,13 @@ function New-SobrOffloadSectionText {
                 foreach ($errorRow in $errorRows) {
                     $errorText = ([string]$errorRow.Errors -replace '\r?\n', ' | ').Trim()
                     [void]$lines.Add(('  {0}: {1}' -f [string]$errorRow.SOBROffload, $errorText))
+                }
+            }
+
+            if ($skippedRows.Count -gt 0) {
+                [void]$lines.Add('Skipped sessions:')
+                foreach ($skipped in $skippedRows) {
+                    [void]$lines.Add(('  {0} | {1} | {2} | {3}' -f [string]$skipped.Name, [string]$skipped.State, [string]$skipped.Source, [string]$skipped.Reason))
                 }
             }
         }
