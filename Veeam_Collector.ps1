@@ -3983,6 +3983,7 @@ function Get-P10SessionByteMetrics {
         [Parameter(Mandatory)]
         [object]$Session,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [object[]]$Tasks
     )
 
@@ -4084,6 +4085,7 @@ function Get-P10ProgressInformation {
         [Parameter(Mandatory)]
         [object]$Session,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [object[]]$Tasks,
         [Parameter(Mandatory)]
         [object]$ByteMetrics,
