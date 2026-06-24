@@ -3625,6 +3625,321 @@ function New-BackupVersionsSectionText {
 }
 
 # ---------------------------------------------------------------------------
+# SOBR Offload Stats helpers (Phase 10)
+#   These functions replicate the reference implementation behavior exactly.
+# ---------------------------------------------------------------------------
+
+# Get-SOBRPropertyPathValue
+#   Traverses multiple dot-separated paths on an object and returns the first
+#   non-null value found.  Returns $null when nothing matches.
+function Get-SOBRPropertyPathValue {
+    [CmdletBinding()]
+    param (
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$Paths
+    )
+
+    if ($null -eq $InputObject) { return $null }
+
+    foreach ($Path in $Paths) {
+        $Value = $InputObject
+        $Found = $true
+
+        foreach ($Part in ($Path -split '\.')) {
+            if ($null -eq $Value) { $Found = $false; break }
+            $Property = $Value.PSObject.Properties[$Part]
+            if ($null -eq $Property) { $Found = $false; break }
+            $Value = $Property.Value
+        }
+
+        if ($Found -and $null -ne $Value) { return $Value }
+    }
+
+    return $null
+}
+
+# Get-SOBRFirstNumericValue
+#   Walks the supplied paths on InputObject and returns the first value that
+#   resolves to a numeric double.  Also handles size objects with Bytes/InBytes/
+#   Value sub-properties.  Returns a PSCustomObject with Found, Value, Path.
+function Get-SOBRFirstNumericValue {
+    [CmdletBinding()]
+    param (
+        [AllowNull()]
+        [object]$InputObject,
+
+        [Parameter(Mandatory)]
+        [string[]]$Paths
+    )
+
+    foreach ($Path in $Paths) {
+        $Value = Get-SOBRPropertyPathValue -InputObject $InputObject -Paths @($Path)
+        if ($null -eq $Value) { continue }
+
+        foreach ($ByteProperty in @('Bytes', 'InBytes', 'Value')) {
+            $Property = $Value.PSObject.Properties[$ByteProperty]
+            if ($null -ne $Property -and $null -ne $Property.Value) {
+                [double]$Number = 0.0
+                if ([double]::TryParse([string]$Property.Value, [ref]$Number)) {
+                    return [PSCustomObject]@{ Found = $true; Value = $Number; Path = "$Path.$ByteProperty" }
+                }
+            }
+        }
+
+        [double]$Number = 0.0
+        if ([double]::TryParse([string]$Value, [ref]$Number)) {
+            return [PSCustomObject]@{ Found = $true; Value = $Number; Path = $Path }
+        }
+    }
+
+    return [PSCustomObject]@{ Found = $false; Value = $null; Path = $null }
+}
+
+# Format-SOBRByteSize
+#   Formats a byte count as a human-readable IEC string (KiB/MiB/GiB/TiB/PiB).
+#   Returns 'N/A' for null input.
+function Format-SOBRByteSize {
+    [CmdletBinding()]
+    param (
+        [AllowNull()]
+        [object]$Bytes
+    )
+
+    if ($null -eq $Bytes) { return 'N/A' }
+
+    [double]$Value = [double]$Bytes
+
+    if ($Value -ge [double]1PB) { return ('{0:N2} PiB' -f ($Value / [double]1PB)) }
+    if ($Value -ge [double]1TB) { return ('{0:N2} TiB' -f ($Value / [double]1TB)) }
+    if ($Value -ge [double]1GB) { return ('{0:N2} GiB' -f ($Value / [double]1GB)) }
+    if ($Value -ge [double]1MB) { return ('{0:N2} MiB' -f ($Value / [double]1MB)) }
+    if ($Value -ge [double]1KB) { return ('{0:N2} KiB' -f ($Value / [double]1KB)) }
+
+    return ('{0:N0} B' -f $Value)
+}
+
+# Format-SOBRRunTime
+#   Formats a timespan as 'Nd HH:MM:SS' (when days > 0) or 'HH:MM:SS'.
+function Format-SOBRRunTime {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [timespan]$Duration
+    )
+
+    if ($Duration.Days -gt 0) {
+        return ('{0}d {1:00}:{2:00}:{3:00}' -f $Duration.Days, $Duration.Hours, $Duration.Minutes, $Duration.Seconds)
+    }
+
+    return ('{0:00}:{1:00}:{2:00}' -f [math]::Floor($Duration.TotalHours), $Duration.Minutes, $Duration.Seconds)
+}
+
+# Get-SOBRSessionProgressPercent
+#   Returns an integer 0-100 for the session's progress, or $null if unavailable.
+function Get-SOBRSessionProgressPercent {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [object]$Session
+    )
+
+    $Result = Get-SOBRFirstNumericValue -InputObject $Session -Paths @(
+        'Progress'
+        'Progress.Percent'
+        'Progress.Percents'
+        'Info.Progress.Percent'
+        'Info.Progress.Percents'
+    )
+
+    if (-not $Result.Found) { return $null }
+
+    [int]$Percent = [math]::Round($Result.Value)
+    if ($Percent -lt 0)   { $Percent = 0   }
+    if ($Percent -gt 100) { $Percent = 100 }
+
+    return $Percent
+}
+
+# Get-SOBRTaskTransferInformation
+#   Aggregates transferred/processed bytes across all tasks.
+#   Returns a PSCustomObject with Bytes (double or $null) and Measure (string).
+function Get-SOBRTaskTransferInformation {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Tasks
+    )
+
+    [double]$TransferredTotal = 0.0
+    [double]$ProcessedTotal   = 0.0
+    $TransferredFound = $false
+    $ProcessedFound   = $false
+
+    foreach ($Task in $Tasks) {
+        $Transferred = Get-SOBRFirstNumericValue -InputObject $Task -Paths @(
+            'Progress.TransferedSize'
+            'Progress.TransferredSize'
+            'Info.Progress.TransferedSize'
+            'Info.Progress.TransferredSize'
+            'TransferedSize'
+            'TransferredSize'
+        )
+        if ($Transferred.Found) {
+            $TransferredTotal += [double]$Transferred.Value
+            $TransferredFound = $true
+        }
+
+        $Processed = Get-SOBRFirstNumericValue -InputObject $Task -Paths @(
+            'Progress.ProcessedSize'
+            'Info.Progress.ProcessedSize'
+            'ProcessedSize'
+        )
+        if ($Processed.Found) {
+            $ProcessedTotal += [double]$Processed.Value
+            $ProcessedFound = $true
+        }
+    }
+
+    if ($TransferredFound) {
+        return [PSCustomObject]@{ Bytes = $TransferredTotal; Measure = 'Transferred' }
+    }
+    if ($ProcessedFound) {
+        return [PSCustomObject]@{ Bytes = $ProcessedTotal; Measure = 'Processed fallback' }
+    }
+
+    return [PSCustomObject]@{ Bytes = $null; Measure = 'Unavailable' }
+}
+
+# ---------------------------------------------------------------------------
+# New-SOBROffloadStatsSectionText
+#   Builds and returns the SOBR Offload Stats block as a single string.
+#   Shows currently active SOBR archive-backup/offload sessions with their
+#   state, progress, runtime, and data-moved statistics.
+#   Returns an empty string in JSON mode or when no sessions are active.
+#   Never throws.
+# ---------------------------------------------------------------------------
+function New-SOBROffloadStatsSectionText {
+    [CmdletBinding()]
+    param()
+
+    if ($Json) { return '' }
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    [void]$lines.Add('############### SOBR Offload Stats BEGIN ###################')
+
+    try {
+        Write-DebugMessage '[New-SOBROffloadStatsSectionText] Checking for active SOBR offload sessions.'
+
+        $ActiveStates = @(
+            'Starting', 'Working', 'Stopping', 'Pausing', 'Resuming',
+            'Idle', 'Postprocessing', 'WaitingRepository', 'Pending'
+        )
+
+        $Sessions = @()
+        if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
+            try {
+                $hasSupportedType = (Get-Command -Name 'Get-VBRSession').Parameters.ContainsKey('Type')
+                if ($hasSupportedType) {
+                    $Sessions = @(
+                        Get-VBRSession -Type ArchiveBackup -ErrorAction SilentlyContinue |
+                            Where-Object { [string]$_.State -in $ActiveStates }
+                    )
+                } else {
+                    Write-DebugMessage '[New-SOBROffloadStatsSectionText] Get-VBRSession has no -Type parameter; skipping.'
+                }
+            } catch {
+                Write-DebugMessage ('[New-SOBROffloadStatsSectionText] Get-VBRSession failed: {0}' -f $_.Exception.Message)
+            }
+        }
+
+        if ($Sessions.Count -eq 0) {
+            [void]$lines.Add('No SOBR offloads are currently running.')
+            [void]$lines.Add('############### SOBR Offload Stats END ###################')
+            return ($lines -join [Environment]::NewLine)
+        }
+
+        Write-DebugMessage ('[New-SOBROffloadStatsSectionText] Found {0} active SOBR offload session(s).' -f $Sessions.Count)
+
+        $Report = New-Object 'System.Collections.Generic.List[object]'
+
+        foreach ($OriginalSession in $Sessions) {
+            try {
+                $Session = Get-VBRSession -Session $OriginalSession -ErrorAction Stop
+            } catch {
+                $Session = $OriginalSession
+            }
+
+            if ([string]$Session.State -notin $ActiveStates) { continue }
+
+            $StartTime = Get-SOBRPropertyPathValue -InputObject $Session -Paths @(
+                'CreationTime', 'StartTime', 'CreationTimeLocal', 'Info.CreationTime'
+            )
+            try   { $StartTime = [datetime]$StartTime } catch { $StartTime = $null }
+
+            $RunTime = if ($null -ne $StartTime) { (Get-Date) - $StartTime } else { [timespan]::Zero }
+
+            $Tasks = @(Get-VBRTaskSession -Session $Session -ErrorAction SilentlyContinue)
+
+            $Transfer = Get-SOBRTaskTransferInformation -Tasks $Tasks
+
+            if ($null -eq $Transfer.Bytes) {
+                $SessionTransfer = Get-SOBRFirstNumericValue -InputObject $Session -Paths @(
+                    'Info.Progress.TransferedSize'
+                    'Info.Progress.TransferredSize'
+                    'Progress.TransferedSize'
+                    'Progress.TransferredSize'
+                )
+                if ($SessionTransfer.Found) {
+                    $Transfer = [PSCustomObject]@{ Bytes = [double]$SessionTransfer.Value; Measure = 'Session transferred' }
+                }
+            }
+
+            $Progress = Get-SOBRSessionProgressPercent -Session $Session
+
+            $Report.Add([PSCustomObject]@{
+                SOBROffload = [string]$Session.Name
+                State       = [string]$Session.State
+                Started     = if ($null -ne $StartTime) { $StartTime.ToString('dd/MM/yyyy HH:mm') } else { 'Unknown' }
+                Running     = Format-SOBRRunTime -Duration $RunTime
+                Progress    = if ($null -ne $Progress) { "$Progress%" } else { 'N/A' }
+                DataMoved   = Format-SOBRByteSize -Bytes $Transfer.Bytes
+                Measure     = $Transfer.Measure
+                Tasks       = $Tasks.Count
+            })
+        }
+
+        if ($Report.Count -eq 0) {
+            [void]$lines.Add('No SOBR offloads are currently running.')
+        } else {
+            $tableText = $Report |
+                Sort-Object SOBROffload |
+                Format-Table `
+                    @{Label='SOBR offload'; Expression={$_.SOBROffload}; Width=36},
+                    @{Label='State';        Expression={$_.State};       Width=17},
+                    @{Label='Started';      Expression={$_.Started};     Width=16},
+                    @{Label='Running';      Expression={$_.Running};     Width=13},
+                    @{Label='Progress';     Expression={$_.Progress};    Width=8},
+                    @{Label='Data moved';   Expression={$_.DataMoved};   Width=12},
+                    @{Label='Measure';      Expression={$_.Measure};     Width=18},
+                    @{Label='Tasks';        Expression={$_.Tasks};       Width=5} |
+                Out-String
+
+            [void]$lines.Add($tableText.TrimEnd())
+        }
+    } catch {
+        Write-DebugMessage ('[New-SOBROffloadStatsSectionText] Failed: {0}' -f $_.Exception.Message)
+        [void]$lines.Add(('(SOBR offload stats unavailable: {0})' -f $_.Exception.Message))
+    }
+
+    [void]$lines.Add('############### SOBR Offload Stats END ###################')
+    return ($lines -join [Environment]::NewLine)
+}
+
+# ---------------------------------------------------------------------------
 # Build-JobReport
 #   Given a session and metadata, builds one report [pscustomobject].
 # ---------------------------------------------------------------------------
@@ -3814,7 +4129,9 @@ function New-CollectorReportBody {
         # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
         [string]$LicensingSection = '',
         # Optional Backup Versions baseline block (text mode only; empty in JSON mode).
-        [string]$BackupVersionsSection = ''
+        [string]$BackupVersionsSection = '',
+        # Optional SOBR Offload Stats block (text mode only; empty in JSON mode).
+        [string]$SobrOffloadStatsSection = ''
     )
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
@@ -3844,6 +4161,10 @@ function New-CollectorReportBody {
     }
     if (-not [string]::IsNullOrWhiteSpace($BackupVersionsSection)) {
         [void]$lines.Add($BackupVersionsSection)
+        $hasBaselineSection = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SobrOffloadStatsSection)) {
+        [void]$lines.Add($SobrOffloadStatsSection)
         $hasBaselineSection = $true
     }
     if ($hasBaselineSection) {
@@ -4085,6 +4406,7 @@ $definedJobsSection = ''
 $definedRepositorySection = ''
 $licensingSection = ''
 $backupVersionsSection = ''
+$sobrOffloadStatsSection = ''
 if (-not $Json) {
     Write-DebugMessage '[Main] Building Defined Jobs baseline section.'
     try {
@@ -4561,6 +4883,25 @@ if (-not $Json) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Phase 10 — SOBR Offload Stats (text mode only)
+#   Finds currently active SOBR archive-backup/offload sessions and builds a
+#   human-readable summary table showing state, progress, runtime, and data
+#   moved.  Skipped in -Json mode so stdout remains a pure JSON array.
+# ---------------------------------------------------------------------------
+Write-ProgressMessage 'Phase 10 — SOBR Offload Stats (active offload sessions).'
+Write-DebugMessage '[Main] Phase 10 — SOBR Offload Stats.'
+if (-not $Json) {
+    try {
+        $sobrOffloadStatsSection = New-SOBROffloadStatsSectionText
+        Write-DebugMessage ('[Main] SOBR Offload Stats section ready, {0} char(s).' -f $sobrOffloadStatsSection.Length)
+    } catch {
+        Write-Warning ('SOBR Offload Stats phase failed: {0}' -f $_.Exception.Message)
+        Write-DebugMessage ('[Main] SOBR Offload Stats phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        $sobrOffloadStatsSection = ''
+    }
+}
+
 Write-ProgressMessage ('Enumeration complete. Total report entries before filtering: {0}.' -f $allReports.Count)
 Write-DebugMessage ('[Main] Enumeration complete. Total entries: {0}' -f $allReports.Count)
 
@@ -4637,7 +4978,8 @@ $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
     -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection `
-    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection
+    -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection `
+    -SobrOffloadStatsSection $sobrOffloadStatsSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
 
 # ---------------------------------------------------------------------------
