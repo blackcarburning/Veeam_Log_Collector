@@ -97,8 +97,9 @@
     Prefix used for report email subjects.  Default: Veeam Collector Report.
 
 .PARAMETER SubjectMode
-    Email subject format.  Neutral omits Failed/Warning counters from the
-    subject; Counters appends them for operators who explicitly want that.
+    Compatibility option for older scheduled tasks.  Email subjects no longer
+    append Failed/Warning counters; both Neutral and Counters produce a neutral
+    subject.
 
 .PARAMETER SmtpServer
     SMTP server used for the post-run report email.  Default:
@@ -167,7 +168,8 @@
 .EXAMPLE
     .\Veeam_Collector.ps1 -SubjectMode Counters
 
-    Uses the legacy email subject format that appends Failed/Warning counters.
+    Accepted for compatibility with older scheduled tasks.  The email subject
+    remains neutral and does not append Failed/Warning counters.
 
 .NOTES
     Usage notes:
@@ -194,8 +196,8 @@
       - In -Json mode, report-file writing, email delivery, and retention cleanup
         are skipped by default to keep automation side-effect free.  Use
         -WriteReportInJson and/or -EmailInJson to opt back in.
-      - Email subjects are neutral by default.  Use -SubjectMode Counters only
-        when Failed/Warning subject counters are explicitly required.
+      - Email subjects are always neutral.  -SubjectMode Counters is accepted
+        for compatibility but no longer appends Failed/Warning counters.
 
     Defined Jobs baseline (text mode only):
       - In normal text mode the report opens with a Defined Jobs section showing
@@ -289,7 +291,7 @@ param(
     # In JSON mode, opt back into sending the human-readable report email.
     [switch]$EmailInJson,
 
-    # Email subject controls. Neutral mode avoids status counters in subjects.
+    # Email subject controls. SubjectMode is retained for scheduler compatibility.
     [string]$SubjectPrefix = 'Veeam Collector Report',
     [ValidateSet('Neutral', 'Counters')]
     [string]$SubjectMode = 'Neutral',
@@ -4190,7 +4192,7 @@ function New-CollectorReportBody {
     $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
 
     [void]$lines.Add('============================================================')
-    [void]$lines.Add('Veeam Last-Error Report')
+    [void]$lines.Add('Veeam Collector Report')
     [void]$lines.Add(('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
     [void]$lines.Add(('Host       : {0}' -f (Get-CollectorHostName)))
     [void]$lines.Add(('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion))
@@ -4313,13 +4315,11 @@ function Get-CollectorMailSubject {
     )
 
     $prefix = if ([string]::IsNullOrWhiteSpace($SubjectPrefix)) { 'Veeam Collector Report' } else { $SubjectPrefix.Trim() }
-    $subject = ('{0} - {1}' -f $prefix, (Get-CollectorHostName))
-
-    if ($SubjectMode -eq 'Counters') {
-        $subject = ('{0} - Failed: {1} Warning: {2}' -f $subject, $FailedCount, $WarnCount)
+    if ($prefix -ieq 'Veeam Last-Error Report') {
+        $prefix = 'Veeam Collector Report'
     }
 
-    return $subject
+    return ('{0} - {1}' -f $prefix, (Get-CollectorHostName))
 }
 
 # ---------------------------------------------------------------------------
@@ -4455,7 +4455,7 @@ trap {
     break
 }
 
-Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
+Write-ProgressMessage ('Veeam Collector Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
     -f $Hours, $script:StartTime, $script:EndTime)
 
 Import-VeeamPowerShell

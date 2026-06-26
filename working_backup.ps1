@@ -4138,7 +4138,7 @@ function New-CollectorReportBody {
     $ed = if ($PSVersionTable.PSEdition) { $PSVersionTable.PSEdition } else { 'Desktop' }
 
     [void]$lines.Add('============================================================')
-    [void]$lines.Add('Veeam Last-Error Report')
+    [void]$lines.Add('Veeam Collector Report')
     [void]$lines.Add(('Window     : last {0} hour(s)  ({1:o} to {2:o})' -f $Hours, $script:StartTime, $script:EndTime))
     [void]$lines.Add(('Host       : {0}' -f (Get-CollectorHostName)))
     [void]$lines.Add(('PowerShell : {0} {1}' -f $ed, $PSVersionTable.PSVersion))
@@ -4260,7 +4260,7 @@ function Get-CollectorMailSubject {
         [Parameter(Mandatory)] [int]$WarnCount
     )
 
-    return ('Veeam Last-Error Report - {0} - Failed: {1} Warning: {2}' -f (Get-CollectorHostName), $FailedCount, $WarnCount)
+    return ('Veeam Collector Report - {0}' -f (Get-CollectorHostName))
 }
 
 # ---------------------------------------------------------------------------
@@ -4391,7 +4391,7 @@ trap {
     break
 }
 
-Write-ProgressMessage ('Veeam Last-Error Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
+Write-ProgressMessage ('Veeam Collector Report starting. Window: last {0} hour(s) ({1:o} to {2:o}).' `
     -f $Hours, $script:StartTime, $script:EndTime)
 
 Import-VeeamPowerShell
@@ -4782,8 +4782,6 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
                 $sResult = Get-SessionState -Session $Session
                 $lastError = if ($uniqueMessages.Count -gt 0) {
                     $uniqueMessages -join '; '
-                } elseif ($sResult -eq 'Success') {
-                    'None'
                 } else {
                     ''
                 }
