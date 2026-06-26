@@ -54,7 +54,9 @@
 
 .PARAMETER Json
     When set, emit results as a single JSON array on stdout.  Progress/status
-    messages are sent to the Warning stream so stdout stays valid JSON.
+    messages are sent to the Warning stream so stdout stays valid JSON.  JSON
+    mode does not write report files or send email unless -WriteReportInJson or
+    -EmailInJson is set.
 
 .PARAMETER OnlyFailures
     When set, only include jobs whose most recent session result is Failed,
@@ -79,6 +81,25 @@
     When set, skip sending the post-run email.  Report-body file writing and
     retention cleanup still run unless they fail independently.
 
+.PARAMETER NoSideEffects
+    When set, skip report-file writing, email delivery, and retention cleanup.
+    Console/JSON output is still produced.
+
+.PARAMETER WriteReportInJson
+    When used with -Json, still write the canonical human-readable report body
+    to -ReportOutputDirectory.  Ignored outside JSON mode.
+
+.PARAMETER EmailInJson
+    When used with -Json, still send the canonical human-readable report body by
+    email.  Ignored outside JSON mode.
+
+.PARAMETER SubjectPrefix
+    Prefix used for report email subjects.  Default: Veeam Collector Report.
+
+.PARAMETER SubjectMode
+    Email subject format.  Neutral omits Failed/Warning counters from the
+    subject; Counters appends them for operators who explicitly want that.
+
 .PARAMETER SmtpServer
     SMTP server used for the post-run report email.  Default:
     outlook.unison.co.uk
@@ -89,7 +110,7 @@
 
 .PARAMETER MailTo
     Recipient list for the post-run report email.  Defaults to
-    mark.hockings@csiltd.co.uk and mark@blackcarburning.com
+    unison@logs.blackcarburning.com
 
 .PARAMETER ReportOutputDirectory
     Directory where the human-readable report body is written after successful
@@ -115,7 +136,8 @@
     .\Veeam_Collector.ps1 -Json
 
     Emits a JSON array on stdout suitable for piping to an LLM or jq.
-    Progress messages appear on the Warning stream only.
+    Progress messages appear on the Warning stream only.  Report-file writing,
+    email delivery, and retention cleanup are skipped by default.
 
 .EXAMPLE
     .\Veeam_Collector.ps1 -CollectorDebug -DebugLogPath C:\Temp\veeam-collector-debug.log
@@ -137,6 +159,16 @@
     Generates the normal report, writes the canonical human-readable report body
     to disk, skips email delivery, and still applies retention cleanup.
 
+.EXAMPLE
+    .\Veeam_Collector.ps1 -Json -WriteReportInJson -EmailInJson
+
+    Emits JSON while also writing and emailing the human-readable report body.
+
+.EXAMPLE
+    .\Veeam_Collector.ps1 -SubjectMode Counters
+
+    Uses the legacy email subject format that appends Failed/Warning counters.
+
 .NOTES
     Usage notes:
       - Run this script with PowerShell 7 on a Veeam Backup & Replication server
@@ -155,9 +187,15 @@
       - Running offload sessions include elapsed runtime (`running_for`) and
         processed data (`data_processed`) when exposed by Veeam.
       - Running sessions are never hidden by -OnlyFailures.
-      - After the report is built, the same human-readable body is written to
-        E:\VEEAM_LOGS\COLLECTOR by default, emailed by default, and old
-        collector-created files in that directory are removed after 7 days.
+      - In normal text mode, after the report is built, the same human-readable
+        body is written to E:\VEEAM_LOGS\COLLECTOR by default, emailed by
+        default, and old collector-created files in that directory are removed
+        after 7 days.
+      - In -Json mode, report-file writing, email delivery, and retention cleanup
+        are skipped by default to keep automation side-effect free.  Use
+        -WriteReportInJson and/or -EmailInJson to opt back in.
+      - Email subjects are neutral by default.  Use -SubjectMode Counters only
+        when Failed/Warning subject counters are explicitly required.
 
     Defined Jobs baseline (text mode only):
       - In normal text mode the report opens with a Defined Jobs section showing
@@ -241,6 +279,20 @@ param(
 
     # Disable the default post-run email delivery.
     [switch]$DisableEmail,
+
+    # Disable report-file writing, email delivery, and retention cleanup.
+    [switch]$NoSideEffects,
+
+    # In JSON mode, opt back into writing the human-readable report file.
+    [switch]$WriteReportInJson,
+
+    # In JSON mode, opt back into sending the human-readable report email.
+    [switch]$EmailInJson,
+
+    # Email subject controls. Neutral mode avoids status counters in subjects.
+    [string]$SubjectPrefix = 'Veeam Collector Report',
+    [ValidateSet('Neutral', 'Counters')]
+    [string]$SubjectMode = 'Neutral',
 
     # SMTP server and envelope settings for the report email.
     [string]$SmtpServer = 'outlook.unison.co.uk',
@@ -364,8 +416,8 @@ function Write-EnvironmentDiagnostics {
     Write-DebugMessage ('  ScriptPath     : {0}' -f $(if ($PSCommandPath) { $PSCommandPath } else { '<interactive>' }))
     Write-DebugMessage ('  Arguments      : Hours={0}  Json={1}  OnlyFailures={2}  CollectorDebug={3}  DebugLogPath={4}' `
         -f $Hours, $Json.IsPresent, $OnlyFailures.IsPresent, $CollectorDebug.IsPresent, $DebugLogPath)
-    Write-DebugMessage ('  ReportOutput   : DisableEmail={0}  SmtpServer={1}  MailFrom={2}  MailTo={3}  ReportOutputDirectory={4}  RetentionDays={5}' `
-        -f $DisableEmail.IsPresent, $SmtpServer, $MailFrom, ($MailTo -join ', '), $ReportOutputDirectory, $RetentionDays)
+    Write-DebugMessage ('  ReportOutput   : DisableEmail={0}  NoSideEffects={1}  WriteReportInJson={2}  EmailInJson={3}  SubjectPrefix={4}  SubjectMode={5}  SmtpServer={6}  MailFrom={7}  MailTo={8}  ReportOutputDirectory={9}  RetentionDays={10}' `
+        -f $DisableEmail.IsPresent, $NoSideEffects.IsPresent, $WriteReportInJson.IsPresent, $EmailInJson.IsPresent, $SubjectPrefix, $SubjectMode, $SmtpServer, $MailFrom, ($MailTo -join ', '), $ReportOutputDirectory, $RetentionDays)
     Write-DebugMessage ('  TimeWindow     : {0:o}  to  {1:o}  ({2} hour(s))' -f $script:StartTime, $script:EndTime, $Hours)
     Write-DebugMessage ('  Host           : {0}' -f $env:COMPUTERNAME)
     Write-DebugMessage ('  User           : {0}' -f [System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
@@ -4260,7 +4312,14 @@ function Get-CollectorMailSubject {
         [Parameter(Mandatory)] [int]$WarnCount
     )
 
-    return ('Veeam Last-Error Report - {0} - Failed: {1} Warning: {2}' -f (Get-CollectorHostName), $FailedCount, $WarnCount)
+    $prefix = if ([string]::IsNullOrWhiteSpace($SubjectPrefix)) { 'Veeam Collector Report' } else { $SubjectPrefix.Trim() }
+    $subject = ('{0} - {1}' -f $prefix, (Get-CollectorHostName))
+
+    if ($SubjectMode -eq 'Counters') {
+        $subject = ('{0} - Failed: {1} Warning: {2}' -f $subject, $FailedCount, $WarnCount)
+    }
+
+    return $subject
 }
 
 # ---------------------------------------------------------------------------
@@ -4383,10 +4442,15 @@ function Remove-OldCollectorFiles {
 trap {
     $fatalMsg = '[FATAL] Veeam_Collector.ps1 terminated with an unhandled error.'
     Write-Warning $fatalMsg
-    # Use Write-DebugMessage for the detail record; it handles both Warning stream
-    # and file append in one place.  The plain Write-Warning above always fires so
-    # callers see the FATAL line even when -CollectorDebug is not set.
-    Write-DebugMessage ('FATAL error detail:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+    $fatalDetail = Format-ErrorRecord -ErrorRecord $_
+    Write-Warning ('FATAL error detail:' + [Environment]::NewLine + $fatalDetail)
+    if ($script:CollectorDebugEnabled -and $null -ne $script:DebugLogFile) {
+        try {
+            Add-Content -LiteralPath $script:DebugLogFile -Value ('FATAL error detail:' + [Environment]::NewLine + $fatalDetail) -Encoding UTF8
+        } catch {
+            # Keep fatal handling focused on surfacing the original error.
+        }
+    }
     $host.SetShouldExit(1)
     break
 }
@@ -4782,8 +4846,6 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
                 $sResult = Get-SessionState -Session $Session
                 $lastError = if ($uniqueMessages.Count -gt 0) {
                     $uniqueMessages -join '; '
-                } elseif ($sResult -eq 'Success') {
-                    'None'
                 } else {
                     ''
                 }
@@ -4994,10 +5056,29 @@ if ($Json) {
     Write-Output $reportBody
 }
 
-$null = Write-CollectorReportBodyToDisk -Body $reportBody
-$mailSubject = Get-CollectorMailSubject -FailedCount $failedCount -WarnCount $warnCount
-$null = Send-CollectorReportEmail -Body $reportBody -Subject $mailSubject
-Remove-OldCollectorFiles
+$shouldWriteReport = (-not $NoSideEffects) -and ((-not $Json) -or $WriteReportInJson)
+$shouldSendEmail   = (-not $NoSideEffects) -and (-not $DisableEmail) -and ((-not $Json) -or $EmailInJson)
+
+if ($shouldWriteReport) {
+    $null = Write-CollectorReportBodyToDisk -Body $reportBody
+} else {
+    Write-ProgressMessage 'Report file write skipped.'
+}
+
+if ($shouldSendEmail) {
+    $mailSubject = Get-CollectorMailSubject -FailedCount $failedCount -WarnCount $warnCount
+    $null = Send-CollectorReportEmail -Body $reportBody -Subject $mailSubject
+} elseif ($DisableEmail) {
+    Write-ProgressMessage 'Email delivery disabled by -DisableEmail.'
+} else {
+    Write-ProgressMessage 'Email delivery skipped.'
+}
+
+if ($shouldWriteReport) {
+    Remove-OldCollectorFiles
+} else {
+    Write-ProgressMessage 'Retention cleanup skipped.'
+}
 
 Write-DebugMessage '[Main] Script completed successfully.'
 if ($script:CollectorDebugEnabled -and $null -ne $script:DebugLogFile) {

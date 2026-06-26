@@ -21,7 +21,7 @@ Repository                     Tier             Parent               Status     
 ############### Defined Repository END ###################
 ```
 
-The Defined Jobs and Defined Repository blocks are **omitted in `-Json` mode** so that stdout remains a pure JSON array.
+The Defined Jobs and Defined Repository blocks are **omitted in `-Json` mode** so that stdout remains a pure JSON array. JSON mode also skips report-file writing, email delivery, and retention cleanup by default; use `-WriteReportInJson` or `-EmailInJson` to opt those side effects back in.
 
 Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available. If dedicated housekeeping session cmdlets are unavailable, the script also uses a `Get-VBRSession` fallback pass to discover relevant offload/repository/configuration sessions.
 
@@ -44,8 +44,17 @@ For in-progress offload sessions, the report includes how long the session has b
 .\Veeam_Collector.ps1 -Hours 48 -OnlyFailures
 
 # Emit JSON (parseable by ConvertFrom-Json / jq); progress goes to Warning stream
-# The Defined Jobs text block is skipped so stdout stays valid JSON
+# Side effects are skipped by default so stdout stays valid JSON
 .\Veeam_Collector.ps1 -Json
+
+# Emit JSON but still write/email the human-readable report
+.\Veeam_Collector.ps1 -Json -WriteReportInJson -EmailInJson
+
+# Produce console output only: no report file, email, or retention cleanup
+.\Veeam_Collector.ps1 -NoSideEffects
+
+# Include summary counters in the email subject when explicitly needed
+.\Veeam_Collector.ps1 -SubjectMode Counters
 ```
 
 ## Parameters
@@ -53,8 +62,21 @@ For in-progress offload sessions, the report includes how long the session has b
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `-Hours` | int | 24 | Time window in hours (1–8760). Sessions outside this window are ignored. |
-| `-Json` | switch | — | Emit a JSON array on stdout. Progress messages go to the Warning stream. |
+| `-Json` | switch | — | Emit a JSON array on stdout. Progress messages go to the Warning stream. Report writing and email are skipped unless explicitly enabled. |
 | `-OnlyFailures` | switch | — | Only include jobs with a Failed, Warning, Error, or Stopped last session; currently running sessions are always included. |
+| `-CollectorDebug` | switch | — | Enable detailed diagnostic logging to Warning stream and optionally a debug log file. |
+| `-DebugLogPath` | string | empty | Optional debug log path used with `-CollectorDebug`. |
+| `-DisableEmail` | switch | — | Skip post-run email delivery. |
+| `-NoSideEffects` | switch | — | Skip report-file writing, email delivery, and retention cleanup. |
+| `-WriteReportInJson` | switch | — | In JSON mode, opt back into writing the human-readable report body to disk. |
+| `-EmailInJson` | switch | — | In JSON mode, opt back into sending the human-readable report body by email. |
+| `-SubjectPrefix` | string | `Veeam Collector Report` | Prefix used for report email subjects. |
+| `-SubjectMode` | `Neutral`/`Counters` | `Neutral` | `Neutral` omits Failed/Warning counters from the subject; `Counters` appends them. |
+| `-SmtpServer` | string | `outlook.unison.co.uk` | SMTP server used for report email. |
+| `-MailFrom` | string | `Veeam@unison.co.uk` | From address used for report email. |
+| `-MailTo` | string[] | `unison@logs.blackcarburning.com` | Recipient list for report email. |
+| `-ReportOutputDirectory` | string | `E:\VEEAM_LOGS\COLLECTOR` | Directory where report files are written. |
+| `-RetentionDays` | int | 7 | Remove old collector-created report/debug files older than this many days. |
 
 ## Output
 
@@ -72,6 +94,24 @@ For in-progress offload sessions, the report includes how long the session has b
 Output is sorted: Failed jobs first, then Warning, then others; within each group sorted by end time (most recent first).
 
 A summary line is printed at the end (to Warning stream in `-Json` mode): jobs scanned, failed, warning, success, and how many had error text.
+
+## Email and file side effects
+
+Normal text mode writes the canonical human-readable report body to `-ReportOutputDirectory`, sends it by email, and then removes old collector-created files according to `-RetentionDays`.
+
+JSON mode is intended for automation and parsing, so it produces JSON on stdout and skips file writing, email delivery, and retention cleanup unless `-WriteReportInJson` or `-EmailInJson` is supplied.
+
+Email subjects are neutral by default:
+
+```
+Veeam Collector Report - VBR-SERVER
+```
+
+Use `-SubjectMode Counters` only when a consuming system is known to treat subject counters as display text rather than status:
+
+```
+Veeam Collector Report - VBR-SERVER - Failed: 1 Warning: 2
+```
 
 ## Defined Jobs baseline
 
