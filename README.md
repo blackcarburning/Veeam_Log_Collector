@@ -53,7 +53,7 @@ For in-progress offload sessions, the report includes how long the session has b
 # Produce console output only: no report file, email, or retention cleanup
 .\Veeam_Collector.ps1 -NoSideEffects
 
-# Include summary counters in the email subject when explicitly needed
+# Accepted for older scheduled tasks; still produces a neutral subject
 .\Veeam_Collector.ps1 -SubjectMode Counters
 ```
 
@@ -71,7 +71,7 @@ For in-progress offload sessions, the report includes how long the session has b
 | `-WriteReportInJson` | switch | — | In JSON mode, opt back into writing the human-readable report body to disk. |
 | `-EmailInJson` | switch | — | In JSON mode, opt back into sending the human-readable report body by email. |
 | `-SubjectPrefix` | string | `Veeam Collector Report` | Prefix used for report email subjects. |
-| `-SubjectMode` | `Neutral`/`Counters` | `Neutral` | `Neutral` omits Failed/Warning counters from the subject; `Counters` appends them. |
+| `-SubjectMode` | `Neutral`/`Counters` | `Neutral` | Compatibility option. Both values now produce a neutral subject without Failed/Warning counters. |
 | `-SmtpServer` | string | `outlook.unison.co.uk` | SMTP server used for report email. |
 | `-MailFrom` | string | `Veeam@unison.co.uk` | From address used for report email. |
 | `-MailTo` | string[] | `unison@logs.blackcarburning.com` | Recipient list for report email. |
@@ -107,10 +107,10 @@ Email subjects are neutral by default:
 Veeam Collector Report - VBR-SERVER
 ```
 
-Use `-SubjectMode Counters` only when a consuming system is known to treat subject counters as display text rather than status:
+`-SubjectMode Counters` is accepted for compatibility with older scheduled tasks, but it no longer appends Failed/Warning counters:
 
 ```
-Veeam Collector Report - VBR-SERVER - Failed: 1 Warning: 2
+Veeam Collector Report - VBR-SERVER
 ```
 
 ## Defined Jobs baseline
