@@ -1,3 +1,10 @@
+###############################################################################
+# OPENCLAW AUTHORED VERSION
+# Veeam Log Collector maintained by OpenClaw for blackcarburning.
+# Expected email subject: "Veeam Collector Report - <HOST>" (no status counters).
+# If this banner is missing, you are not running the OpenClaw-maintained script.
+###############################################################################
+
 <#
 .SYNOPSIS
     Reports the last error text from the most recent session for every Veeam
