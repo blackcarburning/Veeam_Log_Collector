@@ -193,8 +193,8 @@
         to the Warning stream and optionally to -DebugLogPath, never to stdout.
       - The script also attempts to extract deeper per-task warning details from
         task sessions and logger records (without creating log bundles).
-      - Running offload sessions include elapsed runtime (`running_for`) and
-        processed data (`data_processed`) when exposed by Veeam.
+      - Session reports include elapsed runtime (`running_for`) and processed
+        data (`data_processed`) when exposed by Veeam.
       - Running sessions are never hidden by -OnlyFailures.
       - In normal text mode, after the report is built, the same human-readable
         body is written to E:\VEEAM_LOGS\COLLECTOR by default, emailed by
@@ -875,22 +875,30 @@ function Format-RunningDuration {
 }
 
 # ---------------------------------------------------------------------------
-# Get-SessionRunningDuration
-#   Returns formatted running duration for in-progress sessions.
+# Get-SessionElapsedDuration
+#   Returns formatted elapsed duration for a session.
+#   For completed sessions this is end-start; for running sessions it is now-start.
 # ---------------------------------------------------------------------------
-function Get-SessionRunningDuration {
+function Get-SessionElapsedDuration {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [object]$Session)
 
     try {
-        if (-not (Test-SessionIsRunning -Session $Session)) { return '' }
-
         $start = Get-SessionStartTime -Session $Session
         if ($null -eq $start) { return '' }
 
-        return (Format-RunningDuration -StartTime $start)
+        $end = Get-SessionEndTime -Session $Session
+        $duration = if ($null -ne $end) { $end - $start } else { (Get-Date) - $start }
+
+        if ($duration.TotalSeconds -lt 0) { return '' }
+
+        if ($duration.Days -gt 0) {
+            return ('{0}d {1:00}:{2:00}:{3:00}' -f $duration.Days, $duration.Hours, $duration.Minutes, $duration.Seconds)
+        }
+
+        return ('{0:00}:{1:00}:{2:00}' -f [math]::Floor($duration.TotalHours), $duration.Minutes, $duration.Seconds)
     } catch {
-        Write-DebugMessage ('[Get-SessionRunningDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        Write-DebugMessage ('[Get-SessionElapsedDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         return ''
     }
 }
@@ -4337,10 +4345,9 @@ function Build-JobReport {
     $result  = Get-SessionState    -Session $Session
     $start   = Get-SessionStartTime -Session $Session
     $end     = Get-SessionEndTime   -Session $Session
-    $isRunning = Test-SessionIsRunning -Session $Session
-    $runningFor = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
-    $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
-    $dataProcessed = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
+    $runningFor = Get-SessionElapsedDuration -Session $Session
+    $processedBytes = Get-SessionProcessedBytes -Session $Session
+    $dataProcessed = if ($null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
     $lastErr = Get-LastErrorText    -Session $Session
     $warningDetails = Get-VeeamWarningDetails -Session $Session
 
@@ -4562,6 +4569,10 @@ function New-CollectorReportBody {
             [void]$lines.Add(('Job      : {0}' -f $r.job_name))
             [void]$lines.Add(('Type     : {0}' -f $r.job_type))
             [void]$lines.Add(('Result   : {0}' -f $r.result))
+            $startTime = Get-PropertyValue -InputObject $r -Names @('start_time')
+            if (-not [string]::IsNullOrWhiteSpace([string]$startTime)) {
+                [void]$lines.Add(('Start Time : {0}' -f $startTime))
+            }
             [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
 
             $runningFor = Get-PropertyValue -InputObject $r -Names @('running_for')
@@ -5178,10 +5189,9 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
 
                 $sStart         = Get-SessionStartTime   -Session $Session
                 $sEnd           = Get-SessionEndTime     -Session $Session
-                $isRunning      = Test-SessionIsRunning  -Session $Session
-                $runningFor     = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
-                $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
-                $dataProcessed  = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
+                $runningFor     = Get-SessionElapsedDuration -Session $Session
+                $processedBytes = Get-SessionProcessedBytes -Session $Session
+                $dataProcessed  = if ($null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
                 $warningDetails = Get-VeeamWarningDetails -Session $Session
 
                 $report = [pscustomobject][ordered]@{
