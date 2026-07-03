@@ -5102,25 +5102,29 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
                 # Collect messages: session-level logger records
                 $messages = New-Object 'System.Collections.Generic.List[string]'
 
-                try {
-                    Write-DebugMessage ('[Main] Reading session logger for: {0}' -f $sName)
-                    $sessionLog = if ($null -ne $Session.Logger) { $Session.Logger.GetLog() } else { $null }
-                    if ($null -ne $sessionLog) {
-                        foreach ($Record in $sessionLog.UpdatedRecords) {
-                            if (
-                                [string]$Record.Status -match 'Fail|Error|Warning' -or
-                                $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
-                            ) {
-                                if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
-                                    [void]$messages.Add($Record.Title)
+                $loggerProp = $Session.PSObject.Properties['Logger']
+                if ($null -ne $loggerProp -and $null -ne $loggerProp.Value) {
+                    try {
+                        Write-DebugMessage ('[Main] Reading session logger for: {0}' -f $sName)
+                        $sessionLog = $loggerProp.Value.GetLog()
+                        if ($null -ne $sessionLog) {
+                            foreach ($Record in $sessionLog.UpdatedRecords) {
+                                if (
+                                    [string]$Record.Status -match 'Fail|Error|Warning' -or
+                                    $Record.Title -match '(?i)failed|error|exception|warning|timed out|unavailable'
+                                ) {
+                                    if (-not [string]::IsNullOrWhiteSpace($Record.Title)) {
+                                        [void]$messages.Add($Record.Title)
+                                    }
                                 }
                             }
                         }
+                    } catch {
+                        Write-DebugMessage ('[Main] Session logger read failed for "{0}":' -f $sName +
+                            [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
                     }
-                } catch {
-                    Write-DebugMessage ('[Main] Session logger read failed for "{0}":' -f $sName +
-                        [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-                    [void]$messages.Add("Unable to read session log: $($_.Exception.Message)")
+                } else {
+                    Write-DebugMessage ('[Main] Session has no Logger property; skipping session logger for: {0}' -f $sName)
                 }
 
                 # Collect messages: task sessions via Get-VBRTaskSession
