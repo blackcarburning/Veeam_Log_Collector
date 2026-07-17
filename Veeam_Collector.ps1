@@ -48,17 +48,8 @@
         ############### Defined Repository END ###################
 
     That repository block lists repository, tier, parent, status, total, used,
-    free, and used-percent values.  It is followed by a structured
-    **Capacity Tier Utilisation** snapshot, delimited by:
-
-        ############### Capacity Tier Utilisation BEGIN ###################
-        ...
-        ############### Capacity Tier Utilisation END ###################
-
-    The capacity-tier block is JSON inside the text report and records the
-    current per-SOBR capacity extent used/free/limit figures for downstream
-    costing and trend collection.  These text blocks are omitted from JSON
-    (-Json) mode so that stdout remains a pure JSON array.
+    free, and used-percent values.  Both text blocks are omitted from JSON (-Json)
+    mode so that stdout remains a pure JSON array.
 
     Progress messages are printed throughout.  In default (human-readable) mode
     they go to the console (Write-Host).  In -Json mode they go to the Warning
@@ -119,11 +110,11 @@
 
 .PARAMETER SmtpServer
     SMTP server used for the post-run report email.  Default:
-    outlook.unison.co.uk
+    smtp.office365.com
 
 .PARAMETER MailFrom
     From address used for the post-run report email.  Default:
-    Veeam@unison.co.uk
+    claw@blackcarburning.com
 
 .PARAMETER MailTo
     Recipient list for the post-run report email.  Defaults to
@@ -202,8 +193,8 @@
         to the Warning stream and optionally to -DebugLogPath, never to stdout.
       - The script also attempts to extract deeper per-task warning details from
         task sessions and logger records (without creating log bundles).
-      - Running offload sessions include elapsed runtime (`running_for`) and
-        processed data (`data_processed`) when exposed by Veeam.
+      - Session reports include elapsed runtime (`running_for`) and processed
+        data (`data_processed`) when exposed by Veeam.
       - Running sessions are never hidden by -OnlyFailures.
       - In normal text mode, after the report is built, the same human-readable
         body is written to E:\VEEAM_LOGS\COLLECTOR by default, emailed by
@@ -238,11 +229,6 @@
       - The block is omitted from -Json mode; stdout remains a pure JSON array.
       - If repository collection fails, a placeholder block is emitted and the
         rest of the report continues normally.
-      - A Capacity Tier Utilisation JSON snapshot follows the repository block
-        in normal text mode. It is delimited with:
-            ############### Capacity Tier Utilisation BEGIN ###################
-            ############### Capacity Tier Utilisation END ###################
-        and is omitted from -Json mode.
 
     Computer/agent backup jobs:
       - Get-VBRComputerBackupJob is used when available so that Get-VBRJob is not
@@ -318,8 +304,8 @@ param(
     [string]$SubjectMode = 'Neutral',
 
     # SMTP server and envelope settings for the report email.
-    [string]$SmtpServer = 'outlook.unison.co.uk',
-    [string]$MailFrom = 'Veeam@unison.co.uk',
+    [string]$SmtpServer = 'smtp.office365.com',
+    [string]$MailFrom = 'claw@blackcarburning.com',
     [string[]]$MailTo = @('unison@logs.blackcarburning.com'),
 
     # Directory for the canonical human-readable report body file.
@@ -889,22 +875,30 @@ function Format-RunningDuration {
 }
 
 # ---------------------------------------------------------------------------
-# Get-SessionRunningDuration
-#   Returns formatted running duration for in-progress sessions.
+# Get-SessionElapsedDuration
+#   Returns formatted elapsed duration for a session.
+#   For completed sessions this is end-start; for running sessions it is now-start.
 # ---------------------------------------------------------------------------
-function Get-SessionRunningDuration {
+function Get-SessionElapsedDuration {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [object]$Session)
 
     try {
-        if (-not (Test-SessionIsRunning -Session $Session)) { return '' }
-
         $start = Get-SessionStartTime -Session $Session
         if ($null -eq $start) { return '' }
 
-        return (Format-RunningDuration -StartTime $start)
+        $end = Get-SessionEndTime -Session $Session
+        $duration = if ($null -ne $end) { $end - $start } else { (Get-Date) - $start }
+
+        if ($duration.TotalSeconds -lt 0) { return '' }
+
+        if ($duration.Days -gt 0) {
+            return ('{0}d {1:00}:{2:00}:{3:00}' -f $duration.Days, $duration.Hours, $duration.Minutes, $duration.Seconds)
+        }
+
+        return ('{0:00}:{1:00}:{2:00}' -f [math]::Floor($duration.TotalHours), $duration.Minutes, $duration.Seconds)
     } catch {
-        Write-DebugMessage ('[Get-SessionRunningDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        Write-DebugMessage ('[Get-SessionElapsedDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         return ''
     }
 }
@@ -2450,241 +2444,6 @@ function New-DRRepositoryRow {
     }
 }
 
-function ConvertTo-CTRoundedUnit {
-    [CmdletBinding()]
-    param(
-        [object]$Bytes,
-        [double]$Divisor
-    )
-
-    $value = ConvertTo-DRBytes -Value $Bytes
-    if ($null -eq $value -or $Divisor -le 0) { return $null }
-    return [Math]::Round(([double]$value / $Divisor), 4)
-}
-
-function ConvertTo-CTUsedPercentNumber {
-    [CmdletBinding()]
-    param(
-        [object]$TotalBytes,
-        [object]$UsedBytes
-    )
-
-    $total = ConvertTo-DRBytes -Value $TotalBytes
-    $used  = ConvertTo-DRBytes -Value $UsedBytes
-    if ($null -eq $total -or $null -eq $used -or $total -le 0) { return $null }
-    return [Math]::Round((([double]$used / [double]$total) * 100), 4)
-}
-
-function New-CTSpaceObject {
-    [CmdletBinding()]
-    param(
-        [object]$TotalBytes,
-        [object]$UsedBytes,
-        [object]$FreeBytes
-    )
-
-    $total = ConvertTo-DRBytes -Value $TotalBytes
-    $used  = ConvertTo-DRBytes -Value $UsedBytes
-    $free  = ConvertTo-DRBytes -Value $FreeBytes
-
-    return [pscustomobject][ordered]@{
-        total_bytes = $total
-        used_bytes  = $used
-        free_bytes  = $free
-        total_gib   = ConvertTo-CTRoundedUnit -Bytes $total -Divisor ([Math]::Pow(1024, 3))
-        used_gib    = ConvertTo-CTRoundedUnit -Bytes $used  -Divisor ([Math]::Pow(1024, 3))
-        free_gib    = ConvertTo-CTRoundedUnit -Bytes $free  -Divisor ([Math]::Pow(1024, 3))
-        total_tib   = ConvertTo-CTRoundedUnit -Bytes $total -Divisor ([Math]::Pow(1024, 4))
-        used_tib    = ConvertTo-CTRoundedUnit -Bytes $used  -Divisor ([Math]::Pow(1024, 4))
-        free_tib    = ConvertTo-CTRoundedUnit -Bytes $free  -Divisor ([Math]::Pow(1024, 4))
-        used_pct    = ConvertTo-CTUsedPercentNumber -TotalBytes $total -UsedBytes $used
-        total       = Format-DRByteSize -Bytes $total
-        used        = Format-DRByteSize -Bytes $used
-        free        = Format-DRByteSize -Bytes $free
-    }
-}
-
-function New-CTCapacityExtentRow {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)] [object]$Sobr,
-        [Parameter(Mandatory)] [object]$CapacityExtent,
-        [Parameter(Mandatory)] [object]$CapacityRepository,
-        [Parameter(Mandatory)] [hashtable]$Space,
-        [Parameter(Mandatory)] [string]$CapturedAt
-    )
-
-    $sobrName = Get-DRRepositoryName -Repository $Sobr
-    $capName = Get-DRRepositoryName -Repository $CapacityRepository
-
-    return [pscustomobject][ordered]@{
-        sobr_name              = $sobrName
-        sobr_id                = Get-DRRepositoryKey -Repository $Sobr
-        capacity_extent_name   = $capName
-        capacity_extent_id     = Get-DRRepositoryKey -Repository $CapacityRepository
-        capacity_extent_status = Get-DRRepositoryStatus -Repository $CapacityRepository
-        object_storage_path    = Get-DRRepositoryLocation -Repository $CapacityRepository
-        sampled_at             = $CapturedAt
-        tier                   = 'Capacity'
-        source_cmdlet          = 'Get-VBRCapacityExtent'
-        space                  = New-CTSpaceObject -TotalBytes $Space.TotalBytes -UsedBytes $Space.UsedBytes -FreeBytes $Space.FreeBytes
-        raw_capacity_extent_id = Get-DRRepositoryKey -Repository $CapacityExtent
-    }
-}
-
-function New-CTSobRTotals {
-    [CmdletBinding()]
-    param([object[]]$Rows)
-
-    $totals = @{}
-    foreach ($row in @($Rows)) {
-        $sobrName = [string]$row.sobr_name
-        if ([string]::IsNullOrWhiteSpace($sobrName)) { $sobrName = '<unknown>' }
-        if (-not $totals.ContainsKey($sobrName)) {
-            $totals[$sobrName] = [ordered]@{
-                sobr_name = $sobrName
-                extent_count = 0
-                total_bytes = $null
-                used_bytes = $null
-                free_bytes = $null
-                missing_total_count = 0
-                missing_used_count = 0
-                missing_free_count = 0
-            }
-        }
-
-        $entry = $totals[$sobrName]
-        $entry['extent_count'] = [int]$entry['extent_count'] + 1
-
-        $total = ConvertTo-DRBytes -Value $row.space.total_bytes
-        $used  = ConvertTo-DRBytes -Value $row.space.used_bytes
-        $free  = ConvertTo-DRBytes -Value $row.space.free_bytes
-
-        if ($null -eq $total) {
-            $entry['missing_total_count'] = [int]$entry['missing_total_count'] + 1
-        } else {
-            if ($null -eq $entry['total_bytes']) { $entry['total_bytes'] = [double]0 }
-            $entry['total_bytes'] = [double]$entry['total_bytes'] + $total
-        }
-
-        if ($null -eq $used) {
-            $entry['missing_used_count'] = [int]$entry['missing_used_count'] + 1
-        } else {
-            if ($null -eq $entry['used_bytes']) { $entry['used_bytes'] = [double]0 }
-            $entry['used_bytes'] = [double]$entry['used_bytes'] + $used
-        }
-
-        if ($null -eq $free) {
-            $entry['missing_free_count'] = [int]$entry['missing_free_count'] + 1
-        } else {
-            if ($null -eq $entry['free_bytes']) { $entry['free_bytes'] = [double]0 }
-            $entry['free_bytes'] = [double]$entry['free_bytes'] + $free
-        }
-    }
-
-    $result = foreach ($entry in $totals.Values) {
-        [pscustomobject][ordered]@{
-            sobr_name = $entry['sobr_name']
-            extent_count = $entry['extent_count']
-            missing_total_count = $entry['missing_total_count']
-            missing_used_count = $entry['missing_used_count']
-            missing_free_count = $entry['missing_free_count']
-            space = New-CTSpaceObject -TotalBytes $entry['total_bytes'] -UsedBytes $entry['used_bytes'] -FreeBytes $entry['free_bytes']
-        }
-    }
-
-    return @($result | Sort-Object -Property sobr_name)
-}
-
-function New-CapacityTierUtilisationSnapshot {
-    [CmdletBinding()]
-    param()
-
-    $capturedAt = (Get-Date).ToString('o')
-    $rows = New-Object 'System.Collections.Generic.List[object]'
-    $errors = New-Object 'System.Collections.Generic.List[string]'
-
-    if (-not (Get-Command -Name 'Get-VBRBackupRepository' -ErrorAction SilentlyContinue)) {
-        [void]$errors.Add('Get-VBRBackupRepository cmdlet not available')
-    }
-    if (-not (Get-Command -Name 'Get-VBRCapacityExtent' -ErrorAction SilentlyContinue)) {
-        [void]$errors.Add('Get-VBRCapacityExtent cmdlet not available')
-    }
-
-    if ($errors.Count -eq 0) {
-        $sobrList = @()
-        try {
-            $sobrList = @(Get-VBRBackupRepository -ScaleOut -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-        } catch {
-            [void]$errors.Add(('Get-VBRBackupRepository -ScaleOut failed: {0}' -f $_.Exception.Message))
-            $sobrList = @()
-        }
-
-        foreach ($sobr in $sobrList) {
-            $sobrName = Get-DRRepositoryName -Repository $sobr
-            $capExtents = @()
-            try {
-                $capExtents = @(Get-VBRCapacityExtent -Repository $sobr -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-            } catch {
-                [void]$errors.Add(('Get-VBRCapacityExtent failed for SOBR "{0}": {1}' -f $sobrName, $_.Exception.Message))
-                $capExtents = @()
-            }
-
-            foreach ($cap in $capExtents) {
-                try {
-                    $capRepo = Get-DRPropertyPathValue -Object $cap -Path 'Repository'
-                    if ($null -eq $capRepo) { $capRepo = $cap }
-                    $capSpace = Get-DRObjectRepositorySpace -Repository $capRepo
-                    [void]$rows.Add((New-CTCapacityExtentRow -Sobr $sobr -CapacityExtent $cap -CapacityRepository $capRepo -Space $capSpace -CapturedAt $capturedAt))
-                } catch {
-                    [void]$errors.Add(('Capacity extent row build failed for SOBR "{0}": {1}' -f $sobrName, $_.Exception.Message))
-                }
-            }
-        }
-    }
-
-    $sortedRows = @($rows | Sort-Object -Property sobr_name, capacity_extent_name)
-    return [pscustomobject][ordered]@{
-        schema_version = 'capacity-tier-utilisation-v1'
-        captured_at = $capturedAt
-        host = Get-CollectorHostName
-        source = [pscustomobject][ordered]@{
-            kind = 'powershell'
-            cmdlets = @('Get-VBRBackupRepository -ScaleOut', 'Get-VBRCapacityExtent')
-            note = 'Per-SOBR capacity extent utilisation for costing and trend collection.'
-        }
-        row_count = $sortedRows.Count
-        rows = $sortedRows
-        totals_by_sobr = New-CTSobRTotals -Rows $sortedRows
-        errors = @($errors)
-    }
-}
-
-function New-CapacityTierUtilisationSectionText {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)] [object]$Snapshot)
-
-    if ($Json) { return '' }
-
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    [void]$lines.Add('############### Capacity Tier Utilisation BEGIN ###################')
-    try {
-        [void]$lines.Add((ConvertTo-Json -InputObject $Snapshot -Depth 10))
-    } catch {
-        $fallback = [pscustomobject][ordered]@{
-            schema_version = 'capacity-tier-utilisation-v1'
-            error = ('JSON serialization failed: {0}' -f $_.Exception.Message)
-        }
-        try {
-            [void]$lines.Add((ConvertTo-Json -InputObject $fallback -Depth 4))
-        } catch {
-            [void]$lines.Add('{"schema_version":"capacity-tier-utilisation-v1","error":"JSON serialization failed"}')
-        }
-    }
-    [void]$lines.Add('############### Capacity Tier Utilisation END ###################')
-    return ($lines -join [Environment]::NewLine)
-}
-
 function Format-DRFixedWidth {
     [CmdletBinding()]
     param(
@@ -3002,7 +2761,7 @@ function New-VBRLicensingSectionText {
     [void]$lines.Add('############### VBR Licensing BEGIN ###################')
 
     try {
-        Write-ProgressMessage 'Phase 9 — Collecting VBR licensing information...'
+        Write-ProgressMessage 'Phase 8 — Collecting VBR licensing information...'
         Write-DebugMessage '[New-VBRLicensingSectionText] Starting VBR licensing collection.'
 
         if (-not (Get-Command -Name 'Get-VBRInstalledLicense' -ErrorAction SilentlyContinue)) {
@@ -3363,7 +3122,7 @@ function New-BackupVersionsSectionText {
     [void]$lines.Add('############### Backup Versions BEGIN ###################')
 
     try {
-        Write-ProgressMessage 'Phase 10 — Collecting restore-point counts for all backup jobs...'
+        Write-ProgressMessage 'Phase 9 — Collecting restore-point counts for all backup jobs...'
         Write-DebugMessage '[New-BackupVersionsSectionText] Starting all-job restore-point collection.'
 
         # Local helper functions are deliberately prefixed to avoid colliding
@@ -3556,7 +3315,7 @@ function New-BackupVersionsSectionText {
             }
         }
 
-        Write-ProgressMessage 'Phase 10 — Reading Veeam backup records...'
+        Write-ProgressMessage 'Phase 9 — Reading Veeam backup records...'
 
         $InitialBackups = @(
             Get-VBRBackup -ErrorAction Stop
@@ -3733,7 +3492,7 @@ function New-BackupVersionsSectionText {
         )
 
         if ($CapacityCmdletsAvailable) {
-            Write-ProgressMessage 'Phase 10 — Reading Capacity-tier catalogue...'
+            Write-ProgressMessage 'Phase 9 — Reading Capacity-tier catalogue...'
 
             try {
                 $AllCapacityBackups = @(
@@ -3768,7 +3527,7 @@ function New-BackupVersionsSectionText {
             $PointPrefix = if ($JobId) { $JobId } else { $Scope.Key }
 
             Write-ProgressMessage (
-                'Phase 10 — Job {0}/{1}: {2}' -f
+                'Phase 9 — Job {0}/{1}: {2}' -f
                     $JobNumber,
                     $Scopes.Count,
                     $JobName
@@ -4254,7 +4013,7 @@ function New-BackupVersionsSectionText {
 
 
 # ---------------------------------------------------------------------------
-# SOBR Offload Stats helpers (Phase 11)
+# SOBR Offload Stats helpers (Phase 10)
 #   These functions replicate the reference implementation behavior exactly.
 # ---------------------------------------------------------------------------
 
@@ -4586,10 +4345,9 @@ function Build-JobReport {
     $result  = Get-SessionState    -Session $Session
     $start   = Get-SessionStartTime -Session $Session
     $end     = Get-SessionEndTime   -Session $Session
-    $isRunning = Test-SessionIsRunning -Session $Session
-    $runningFor = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
-    $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
-    $dataProcessed = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
+    $runningFor = Get-SessionElapsedDuration -Session $Session
+    $processedBytes = Get-SessionProcessedBytes -Session $Session
+    $dataProcessed = if ($null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
     $lastErr = Get-LastErrorText    -Session $Session
     $warningDetails = Get-VeeamWarningDetails -Session $Session
 
@@ -4755,8 +4513,6 @@ function New-CollectorReportBody {
         [string]$DefinedJobsSection = '',
         # Optional Defined Repository baseline block (text mode only; empty in JSON mode).
         [string]$DefinedRepositorySection = '',
-        # Optional Capacity Tier Utilisation snapshot block (text mode only; empty in JSON mode).
-        [string]$CapacityTierUtilisationSection = '',
         # Optional VBR Licensing baseline block (text mode only; empty in JSON mode).
         [string]$LicensingSection = '',
         # Optional Backup Versions baseline block (text mode only; empty in JSON mode).
@@ -4786,10 +4542,6 @@ function New-CollectorReportBody {
         [void]$lines.Add($DefinedRepositorySection)
         $hasBaselineSection = $true
     }
-    if (-not [string]::IsNullOrWhiteSpace($CapacityTierUtilisationSection)) {
-        [void]$lines.Add($CapacityTierUtilisationSection)
-        $hasBaselineSection = $true
-    }
     if (-not [string]::IsNullOrWhiteSpace($LicensingSection)) {
         [void]$lines.Add($LicensingSection)
         $hasBaselineSection = $true
@@ -4817,6 +4569,10 @@ function New-CollectorReportBody {
             [void]$lines.Add(('Job      : {0}' -f $r.job_name))
             [void]$lines.Add(('Type     : {0}' -f $r.job_type))
             [void]$lines.Add(('Result   : {0}' -f $r.result))
+            $startTime = Get-PropertyValue -InputObject $r -Names @('start_time')
+            if (-not [string]::IsNullOrWhiteSpace([string]$startTime)) {
+                [void]$lines.Add(('Start Time : {0}' -f $startTime))
+            }
             [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
 
             $runningFor = Get-PropertyValue -InputObject $r -Names @('running_for')
@@ -5049,7 +4805,6 @@ Write-EnvironmentDiagnostics
 # ---------------------------------------------------------------------------
 $definedJobsSection = ''
 $definedRepositorySection = ''
-$capacityTierUtilisationSection = ''
 $licensingSection = ''
 $backupVersionsSection = ''
 $sobrOffloadStatsSection = ''
@@ -5434,10 +5189,9 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
 
                 $sStart         = Get-SessionStartTime   -Session $Session
                 $sEnd           = Get-SessionEndTime     -Session $Session
-                $isRunning      = Test-SessionIsRunning  -Session $Session
-                $runningFor     = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
-                $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
-                $dataProcessed  = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
+                $runningFor     = Get-SessionElapsedDuration -Session $Session
+                $processedBytes = Get-SessionProcessedBytes -Session $Session
+                $dataProcessed  = if ($null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
                 $warningDetails = Get-VeeamWarningDetails -Session $Session
 
                 $report = [pscustomobject][ordered]@{
@@ -5489,34 +5243,13 @@ if (-not $Json) {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 8 — Capacity Tier Utilisation snapshot (text mode only)
-#   Collects per-SOBR capacity extent usage as structured JSON for downstream
-#   costing and trend collection. Skipped in -Json mode so stdout remains a
-#   pure JSON array.
-# ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 8 — Capacity Tier Utilisation snapshot.'
-Write-DebugMessage '[Main] Phase 8 — Capacity Tier Utilisation snapshot.'
-if (-not $Json) {
-    try {
-        $capacityTierUtilisationSnapshot = New-CapacityTierUtilisationSnapshot
-        $capacityTierUtilisationSection = New-CapacityTierUtilisationSectionText -Snapshot $capacityTierUtilisationSnapshot
-        Write-DebugMessage ('[Main] Capacity Tier Utilisation section ready, {0} row(s), {1} char(s).' `
-            -f $capacityTierUtilisationSnapshot.row_count, $capacityTierUtilisationSection.Length)
-    } catch {
-        Write-Warning ('Capacity Tier Utilisation phase failed: {0}' -f $_.Exception.Message)
-        Write-DebugMessage ('[Main] Capacity Tier Utilisation phase failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
-        $capacityTierUtilisationSection = ''
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Phase 9 — VBR Licensing (text mode only)
+# Phase 8 — VBR Licensing (text mode only)
 #   Collects license information and stores it in $licensingSection so it can
 #   be included in the human-readable report body after the repository section.
 #   In -Json mode this phase is skipped so stdout remains a pure JSON array.
 # ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 9 — VBR Licensing (license information).'
-Write-DebugMessage '[Main] Phase 9 — VBR Licensing.'
+Write-ProgressMessage 'Phase 8 — VBR Licensing (license information).'
+Write-DebugMessage '[Main] Phase 8 — VBR Licensing.'
 if (-not $Json) {
     try {
         $licensingSection = New-VBRLicensingSectionText
@@ -5529,14 +5262,14 @@ if (-not $Json) {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 10 — Backup Versions (text mode only)
+# Phase 9 — Backup Versions (text mode only)
 #   Counts the number of backup versions per machine in each repository and
 #   stores the result in $backupVersionsSection so it can be included in the
 #   human-readable report body after the licensing section.
 #   In -Json mode this phase is skipped so stdout remains a pure JSON array.
 # ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 10 — Backup Versions (versions per machine per repository).'
-Write-DebugMessage '[Main] Phase 10 — Backup Versions.'
+Write-ProgressMessage 'Phase 9 — Backup Versions (versions per machine per repository).'
+Write-DebugMessage '[Main] Phase 9 — Backup Versions.'
 if (-not $Json) {
     try {
         $backupVersionsSection = New-BackupVersionsSectionText
@@ -5549,13 +5282,13 @@ if (-not $Json) {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 11 — SOBR Offload Stats (text mode only)
+# Phase 10 — SOBR Offload Stats (text mode only)
 #   Finds currently active SOBR archive-backup/offload sessions and builds a
 #   human-readable summary table showing state, progress, runtime, and data
 #   moved.  Skipped in -Json mode so stdout remains a pure JSON array.
 # ---------------------------------------------------------------------------
-Write-ProgressMessage 'Phase 11 — SOBR Offload Stats (active offload sessions).'
-Write-DebugMessage '[Main] Phase 11 — SOBR Offload Stats.'
+Write-ProgressMessage 'Phase 10 — SOBR Offload Stats (active offload sessions).'
+Write-DebugMessage '[Main] Phase 10 — SOBR Offload Stats.'
 if (-not $Json) {
     try {
         $sobrOffloadStatsSection = New-SOBROffloadStatsSectionText
@@ -5643,7 +5376,6 @@ $reportBody = New-CollectorReportBody -Reports $sorted `
     -TotalJobs $totalJobs -FailedCount $failedCount -WarnCount $warnCount `
     -SuccessCount $successCount -WithError $withError `
     -DefinedJobsSection $definedJobsSection -DefinedRepositorySection $definedRepositorySection `
-    -CapacityTierUtilisationSection $capacityTierUtilisationSection `
     -LicensingSection $licensingSection -BackupVersionsSection $backupVersionsSection `
     -SobrOffloadStatsSection $sobrOffloadStatsSection
 Write-DebugMessage ('[Main] Canonical report body length: {0} characters.' -f $reportBody.Length)
