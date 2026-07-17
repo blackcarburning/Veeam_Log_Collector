@@ -6,7 +6,7 @@ A focused PowerShell script that reports the **last error text** from the most r
 
 For every backup/replication/offload/housekeeping job it finds the **most recent session within the last N hours**, extracts the last error/warning text, and produces a compact, LLM-friendly report.  No log bundles are created — the output is small enough to paste directly into an LLM prompt or pipe to `jq`.
 
-In normal text mode the report begins with a **Defined Jobs baseline** section showing all currently defined backup jobs together with their schedule, enabled status, next scheduled run, last run time, and last result.  It is followed immediately by a **Defined Repository** utilisation block showing repository, tier, parent, status, total, used, free, and used-percent columns.  These sections give operators (and LLMs) immediate context for which jobs and repositories exist and their current baseline state.  The sections are clearly delimited:
+In normal text mode the report begins with a **Defined Jobs baseline** section showing all currently defined backup jobs together with their schedule, enabled status, next scheduled run, last run time, and last result.  It is followed by a **Defined Repository** utilisation block showing repository, tier, parent, status, total, used, free, and used-percent columns, then a structured **Capacity Tier Utilisation** JSON snapshot for per-SOBR capacity extent costing/trend collection.  These sections give operators (and LLMs) immediate context for which jobs and repositories exist and their current baseline state.  The sections are clearly delimited:
 
 ```
 ############### Defined Jobs BEGIN ###################
@@ -19,9 +19,15 @@ VMware_Daily_CATCHALL                  VM          Yes Daily 04:00        16/06/
 Repository                     Tier             Parent               Status       Total       Used        Free        Used %
 ...
 ############### Defined Repository END ###################
+############### Capacity Tier Utilisation BEGIN ###################
+{
+  "schema_version": "capacity-tier-utilisation-v1",
+  "rows": []
+}
+############### Capacity Tier Utilisation END ###################
 ```
 
-The Defined Jobs and Defined Repository blocks are **omitted in `-Json` mode** so that stdout remains a pure JSON array. JSON mode also skips report-file writing, email delivery, and retention cleanup by default; use `-WriteReportInJson` or `-EmailInJson` to opt those side effects back in.
+The Defined Jobs, Defined Repository, and Capacity Tier Utilisation blocks are **omitted in `-Json` mode** so that stdout remains a pure JSON array. JSON mode also skips report-file writing, email delivery, and retention cleanup by default; use `-WriteReportInJson` or `-EmailInJson` to opt those side effects back in.
 
 Housekeeping-style processes (configuration backup and repository offload/extent-sync sessions) are included when their Veeam PowerShell cmdlets are available. If dedicated housekeeping session cmdlets are unavailable, the script also uses a `Get-VBRSession` fallback pass to discover relevant offload/repository/configuration sessions.
 
@@ -80,7 +86,7 @@ For in-progress offload sessions, the report includes how long the session has b
 
 ## Output
 
-**Text mode** (default): the report starts with a Defined Jobs baseline table, followed by one concise block per job showing name, type, result, end time, and last error text (empty when successful).
+**Text mode** (default): the report starts with Defined Jobs and Defined Repository baseline tables, followed by a Capacity Tier Utilisation JSON block, then one concise block per job showing name, type, result, end time, and last error text (empty when successful).
 
 **JSON mode** (`-Json`): a single JSON array, one object per job, with fields:
 - `job_name`, `job_type`, `result`
