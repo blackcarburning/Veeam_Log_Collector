@@ -86,12 +86,13 @@ For in-progress offload sessions, the report includes how long the session has b
 
 ## Output
 
-**Text mode** (default): the report starts with Defined Jobs and Defined Repository baseline tables, followed by a Capacity Tier Utilisation JSON block, then one concise block per job showing name, type, result, end time, and last error text (empty when successful).
+**Text mode** (default): the report starts with Defined Jobs and Defined Repository baseline tables, followed by a Capacity Tier Utilisation JSON block, then one concise block per job showing name, type, result, start time, end time, duration, and last error text (empty when successful).
 
 **JSON mode** (`-Json`): a single JSON array, one object per job, with fields:
 - `job_name`, `job_type`, `result`
 - `start_time`, `end_time` (ISO 8601)
-- `running_for` (elapsed runtime for in-progress sessions; empty string otherwise)
+- `duration` (elapsed runtime; completed sessions use `end_time - start_time`, in-progress sessions use report time minus `start_time`)
+- `running_for` (elapsed runtime for in-progress sessions only; empty string otherwise)
 - `data_processed` (formatted processed bytes for in-progress sessions when available; empty string otherwise)
 - `last_error` (empty string when there is no error)
 - `warning_details` (deeper per-task/session warning text when available)

@@ -889,6 +889,36 @@ function Format-RunningDuration {
 }
 
 # ---------------------------------------------------------------------------
+# Get-SessionDuration
+#   Returns formatted elapsed duration for a session. Completed sessions use
+#   end-start; in-progress sessions use report-time-start.
+# ---------------------------------------------------------------------------
+function Get-SessionDuration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [object]$Session)
+
+    try {
+        $start = Get-SessionStartTime -Session $Session
+        if ($null -eq $start) { return '' }
+
+        $end = Get-SessionEndTime -Session $Session
+        $durationEnd = if ($null -ne $end) { $end } else { $script:EndTime }
+        $duration = $durationEnd - $start
+        if ($duration.Ticks -lt 0) { $duration = [timespan]::Zero }
+
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        if ($duration.Days -gt 0) {
+            return [string]::Format($culture, '{0}d {1:00}:{2:00}:{3:00}', $duration.Days, $duration.Hours, $duration.Minutes, $duration.Seconds)
+        }
+
+        return [string]::Format($culture, '{0:00}:{1:00}:{2:00}', [math]::Floor($duration.TotalHours), $duration.Minutes, $duration.Seconds)
+    } catch {
+        Write-DebugMessage ('[Get-SessionDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
+        return ''
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Get-SessionRunningDuration
 #   Returns formatted running duration for in-progress sessions.
 # ---------------------------------------------------------------------------
@@ -898,11 +928,7 @@ function Get-SessionRunningDuration {
 
     try {
         if (-not (Test-SessionIsRunning -Session $Session)) { return '' }
-
-        $start = Get-SessionStartTime -Session $Session
-        if ($null -eq $start) { return '' }
-
-        return (Format-RunningDuration -StartTime $start)
+        return (Get-SessionDuration -Session $Session)
     } catch {
         Write-DebugMessage ('[Get-SessionRunningDuration] Failed:' + [Environment]::NewLine + (Format-ErrorRecord -ErrorRecord $_))
         return ''
@@ -4587,7 +4613,8 @@ function Build-JobReport {
     $start   = Get-SessionStartTime -Session $Session
     $end     = Get-SessionEndTime   -Session $Session
     $isRunning = Test-SessionIsRunning -Session $Session
-    $runningFor = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
+    $duration = Get-SessionDuration -Session $Session
+    $runningFor = if ($isRunning) { $duration } else { '' }
     $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
     $dataProcessed = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
     $lastErr = Get-LastErrorText    -Session $Session
@@ -4599,6 +4626,7 @@ function Build-JobReport {
         result          = $result
         start_time      = if ($null -ne $start) { $start.ToString('o') } else { $null }
         end_time        = if ($null -ne $end)   { $end.ToString('o')   } else { $null }
+        duration        = $duration
         running_for     = $runningFor
         data_processed  = $dataProcessed
         last_error      = $lastErr
@@ -4817,7 +4845,16 @@ function New-CollectorReportBody {
             [void]$lines.Add(('Job      : {0}' -f $r.job_name))
             [void]$lines.Add(('Type     : {0}' -f $r.job_type))
             [void]$lines.Add(('Result   : {0}' -f $r.result))
+            $startTime = Get-PropertyValue -InputObject $r -Names @('start_time')
+            if (-not [string]::IsNullOrWhiteSpace([string]$startTime)) {
+                [void]$lines.Add(('Start Time : {0}' -f $startTime))
+            }
             [void]$lines.Add(('End Time : {0}' -f $(if ($null -ne $r.end_time) { $r.end_time } else { '(running/unknown)' })))
+
+            $duration = Get-PropertyValue -InputObject $r -Names @('duration', 'running_for')
+            if (-not [string]::IsNullOrWhiteSpace([string]$duration)) {
+                [void]$lines.Add(('Duration : {0}' -f $duration))
+            }
 
             $runningFor = Get-PropertyValue -InputObject $r -Names @('running_for')
             if (-not [string]::IsNullOrWhiteSpace([string]$runningFor)) {
@@ -5435,7 +5472,8 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
                 $sStart         = Get-SessionStartTime   -Session $Session
                 $sEnd           = Get-SessionEndTime     -Session $Session
                 $isRunning      = Test-SessionIsRunning  -Session $Session
-                $runningFor     = if ($isRunning) { Get-SessionRunningDuration -Session $Session } else { '' }
+                $duration       = Get-SessionDuration -Session $Session
+                $runningFor     = if ($isRunning) { $duration } else { '' }
                 $processedBytes = if ($isRunning) { Get-SessionProcessedBytes -Session $Session } else { $null }
                 $dataProcessed  = if ($isRunning -and $null -ne $processedBytes) { Format-DRByteSize -Bytes $processedBytes } else { '' }
                 $warningDetails = Get-VeeamWarningDetails -Session $Session
@@ -5446,6 +5484,7 @@ if (Get-Command -Name 'Get-VBRSession' -ErrorAction SilentlyContinue) {
                     result          = $sResult
                     start_time      = if ($null -ne $sStart) { $sStart.ToString('o') } else { $null }
                     end_time        = if ($null -ne $sEnd)   { $sEnd.ToString('o')   } else { $null }
+                    duration        = $duration
                     running_for     = $runningFor
                     data_processed  = $dataProcessed
                     last_error      = $lastError
